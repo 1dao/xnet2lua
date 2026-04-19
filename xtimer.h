@@ -27,25 +27,25 @@ void          xtimer_del(xtimerHandler handler);
 #include <windows.h>
 #include <time.h>
 
-static inline long64 time_clock_ms() {
-    static LARGE_INTEGER freq = {0};
+static inline uint64_t time_clock_ms() {
+    static LARGE_INTEGER freq = {{0,0}};
     if (freq.QuadPart == 0)
         QueryPerformanceFrequency(&freq);
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (long64)((counter.QuadPart) * 1000 / freq.QuadPart);
+    return (uint64_t)((counter.QuadPart) * 1000 / freq.QuadPart);
 }
 
-static inline long64 time_clock_us() {
-    static LARGE_INTEGER freq = {0};
+static inline uint64_t time_clock_us() {
+    static LARGE_INTEGER freq = {{0,0}};
     if (freq.QuadPart == 0)
         QueryPerformanceFrequency(&freq);
     LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
-    return (long64)((double)counter.QuadPart * 1000000.0 / freq.QuadPart);
+    return (uint64_t)((double)counter.QuadPart * 1000000.0 / freq.QuadPart);
 }
 
-static inline long64 time_day_us() {
+static inline uint64_t time_day_us() {
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
 
@@ -57,7 +57,7 @@ static inline long64 time_day_us() {
     return (uli.QuadPart / 10);
 }
 
-static inline long64 time_day_ms() {
+static inline uint64_t time_day_ms() {
     return time_day_us() / 1000;
 }
 #else
@@ -65,37 +65,37 @@ static inline long64 time_day_ms() {
 #include <time.h>
 #include <unistd.h>
 
-static inline long64 time_clock_ms() {
+static inline uint64_t time_clock_ms() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
-    return (long64)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static inline long64 time_clock_us() {
+static inline uint64_t time_clock_us() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
-    return (long64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static inline long64 time_day_us() {
+static inline uint64_t time_day_us() {
     struct timeval tv;
     gettimeofday(&tv, NULL);
 
-    return (long64)tv.tv_sec * 1000000LL + tv.tv_usec;
+    return (uint64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
 }
 
-static inline long64 time_day_ms() {
+static inline uint64_t time_day_ms() {
     return time_day_us() / 1000;
 }
 #endif
 
 // Keep backward compatibility
-static inline long64 time_get_ms() { return time_day_ms(); }
-static inline long64 time_get_us() { return time_day_us(); }
+static inline uint64_t time_get_ms() { return time_day_ms(); }
+static inline uint64_t time_get_us() { return time_day_us(); }
 
-static inline void time_get_dt(long64 millis, char out[24]) {
+static inline void time_get_dt(uint64_t millis, char out[24]) {
     // 转换为秒和毫秒
     time_t seconds = (time_t)(millis / 1000);
     int ms = (int)(millis % 1000);

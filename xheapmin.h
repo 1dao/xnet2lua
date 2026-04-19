@@ -9,12 +9,11 @@ extern "C" {
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
-
-typedef long long long64;
+#include <stdint.h>
 
 typedef struct xHeapMinNode {
     int heap_index;
-    long64 key;
+    uint64_t key;
 } xHeapMinNode;
 
 typedef int (*fnHeapMinComp)(xHeapMinNode*, xHeapMinNode*);
@@ -42,7 +41,7 @@ static inline xHeapMinNode*   xheapmin_peek(xHeapMin* heap);
 
 static inline int             xheapmin_size(xHeapMin* heap);
 static inline bool            xheapmin_check(xHeapMin* heap, xHeapMinNode* node);
-static inline void            xheapmin_refresh(xHeapMin* heap, xHeapMinNode* node, long64 new_key);
+static inline void            xheapmin_refresh(xHeapMin* heap, xHeapMinNode* node, uint64_t new_key);
 static inline void            xheapmin_print(xHeapMin* heap);
 
 
@@ -198,12 +197,12 @@ bool xheapmin_check(xHeapMin* heap, xHeapMinNode* node) {
     return idx >= 0 && idx < heap->size && heap->data[idx] == node;
 }
 
-void xheapmin_refresh(xHeapMin* heap, xHeapMinNode* node, long64 new_key) {
+void xheapmin_refresh(xHeapMin* heap, xHeapMinNode* node, uint64_t new_key) {
     if (!xheapmin_check(heap, node)) {
         return;
     }
 
-    long64 old_key = node->key;
+    uint64_t old_key = node->key;
     node->key = new_key;
 
     if (new_key < old_key) {

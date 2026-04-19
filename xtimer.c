@@ -16,10 +16,10 @@ typedef struct xTimerNode {
 typedef struct xTimerSet {
     xHeapMin* timer_heap;
     int next_timer_id;
-    long64 current_time;
+    uint64_t current_time;
 } xTimerSet;
 
-xTimerNode* xtimer_node_new(int id, long64 timeout, int interval_ms, fnOnTime callback
+xTimerNode* xtimer_node_new(int id, uint64_t timeout, int interval_ms, fnOnTime callback
         , void* ud, int num, const char* name) {
     xTimerNode* timer = (xTimerNode*)malloc(sizeof(xTimerNode));
     timer->base.heap_index = -1;
@@ -71,7 +71,7 @@ xTimerNode* xtimer_create(xTimerSet* tm, int interval_ms, const char* name, fnOn
     if (repeat_num == -1) {
         repeat_num = 0x7FFFFFFF;
     }
-    long64 timeout = tm->current_time + interval_ms;
+    uint64_t timeout = tm->current_time + interval_ms;
     xTimerNode* timer = xtimer_node_new(tm->next_timer_id++, timeout, interval_ms, callback, ud, repeat_num, name);
     xheapmin_insert(tm->timer_heap, (xHeapMinNode*)timer);
 
@@ -91,7 +91,7 @@ void xtimer_destroy(xTimerSet* tm, xTimerNode* timer) {
 void timer_refresh(xTimerSet* tm, xTimerNode* timer) {
     if (!tm || !timer || timer->repeat_interval <= 0) return;
 
-    long64 new_expire_time = tm->current_time + timer->repeat_interval;
+    uint64_t new_expire_time = tm->current_time + timer->repeat_interval;
     xheapmin_refresh(tm->timer_heap, (xHeapMinNode*)timer, new_expire_time);
 }
 
@@ -178,7 +178,7 @@ void xtimer_update() {
 
 int xtimer_last() {
     if (_cur) {
-        long64 time_now = time_get_ms();
+        uint64_t time_now = time_get_ms();
         xTimerNode* next_timer = (xTimerNode*)xheapmin_peek(_cur->timer_heap);
         if(next_timer)
             return next_timer->base.key> time_now?(int)(next_timer->base.key - time_now):0;
