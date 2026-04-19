@@ -1,5 +1,6 @@
 // xtimer.c
 #include "xtimer.h"
+#include <stdio.h>
 
 typedef struct xTimerNode {
     xHeapMinNode base;
@@ -44,7 +45,7 @@ static inline void xtimer_node_del(xTimerNode* timer) {
 }
 
 xTimerSet* xtimer_pool_create(int capacity) {
-    capacity = (capacity < 500) ? 1 : capacity;
+    capacity = (capacity < 16) ? 16 : capacity;
     xTimerSet* tm = (xTimerSet*)malloc(sizeof(xTimerSet));
     tm->timer_heap = xheapmin_create(capacity, xheapmin_compare);
     tm->next_timer_id = 1;
@@ -113,15 +114,17 @@ int xtimer_poll(xTimerSet* tm) {
         void* ud = expired_timer->user_data;
         if (expired_timer->repeat_num > 0) {
             timer_refresh(tm, expired_timer);
+            if (callback) callback(ud);
         } else {
             xheapmin_extract(tm->timer_heap);
+            if (callback) callback(ud);
             xtimer_node_del(expired_timer);
         }
-        if (callback) {
-            callback(ud);
-        }
-        if (triggered_count++ > 64)
+
+        if (triggered_count++ > 128) {
+            fprintf(stderr, "[WARN]: Timer triggered more than 128 times; possible infinite loop detected.\n");
             break;
+        }
     }
     return next_timeout;
 }
@@ -150,7 +153,7 @@ void xtimer_print(xTimerSet* tm) {
     }
 }
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 static __declspec(thread) xTimerSet* _cur = NULL;
 #else
 static __thread xTimerSet* _cur = NULL;
@@ -164,6 +167,7 @@ void xtimer_init(int cap) {
 void xtimer_uninit() {
     if (_cur) {
         xtimer_pool_destroy(_cur);
+        _cur = NULL;
     }
 }
 

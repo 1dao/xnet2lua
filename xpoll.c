@@ -52,6 +52,7 @@ struct xPollState {
     int         setsize;      /* allocated length of events[]        */
     int         nfds;         /* number of currently registered fds  */
     int         maxfd;        /* highest fd value seen               */
+    void        *ud;          /* user data */
 
 #if defined(XPOLL_BACKEND_EPOLL)
     int                  epfd;
@@ -149,13 +150,15 @@ static void _pfd_sync(xPollState *loop, int idx) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_create
  * ═══════════════════════════════════════════════════════════════════════ */
-xPollState* xpoll_create(void) {
+int xpoll_init(void) {
+    if (_xpoll) return 0;
+
     xPollState *loop = (xPollState*)calloc(1, sizeof(xPollState));
-    if (!loop) return NULL;
+    if (!loop) return -1;
 
     /* Allocate the shared events table */
     loop->events = (xPoolFD*)malloc(sizeof(xPoolFD) * XPOLL_SETSIZE);
-    if (!loop->events) { free(loop); return NULL; }
+    if (!loop->events) { free(loop); return -2; }
     for (int i = 0; i < XPOLL_SETSIZE; i++) _fe_clear(&loop->events[i]);
 
     loop->setsize = XPOLL_SETSIZE;
@@ -196,18 +199,19 @@ xPollState* xpoll_create(void) {
 #endif
 
     _xpoll = loop;
-    return loop;
+    return 0;
 
 fail_events:
     free(loop->events);
     free(loop);
-    return NULL;
+    return -3;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_free
  * ═══════════════════════════════════════════════════════════════════════ */
-void xpoll_free(xPollState *loop) {
+void xpoll_uninit(void) {
+    xPollState *loop = _xpoll;
     if (!loop) return;
 
 #if defined(XPOLL_BACKEND_EPOLL)
@@ -221,21 +225,22 @@ void xpoll_free(xPollState *loop) {
 #endif
 
     free(loop->events);
-    if (_xpoll == loop) _xpoll = NULL;
     free(loop);
+    _xpoll = NULL;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_get_default
  * ═══════════════════════════════════════════════════════════════════════ */
 xPollState* xpoll_get_default(void) {
-    return _xpoll ? _xpoll : xpoll_create();
+    return _xpoll;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_resize
  * ═══════════════════════════════════════════════════════════════════════ */
-int xpoll_resize(xPollState *loop, int setsize) {
+int xpoll_resize(int setsize) {
+    xPollState *loop = _xpoll;
     if (!loop || setsize <= loop->setsize) return 0;
 
     /* Grow the events table */
@@ -271,9 +276,10 @@ int xpoll_resize(xPollState *loop, int setsize) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_add_event
  * ═══════════════════════════════════════════════════════════════════════ */
-int xpoll_add_event(xPollState *loop, SOCKET_T fd, int mask,
+int xpoll_add_event(SOCKET_T fd, int mask,
                     xFileProc rfileProc, xFileProc wfileProc,
                     xFileProc efileProc, void *clientData) {
+    xPollState *loop = _xpoll;
     if (!loop) return -1;
 
 /* ── epoll backend ────────────────────────────────────────────────────── */
@@ -366,7 +372,7 @@ int xpoll_add_event(xPollState *loop, SOCKET_T fd, int mask,
         idx = xpoll_find_free_slot(loop);
         if (idx < 0) {
             /* Array full: double capacity */
-            if (xpoll_resize(loop, loop->setsize * 2) < 0) return -1;
+            if (xpoll_resize(loop->setsize * 2) < 0) return -1;
             idx = loop->nfds;   /* first slot in newly allocated area */
         }
         loop->events[idx].fd   = fd;
@@ -395,7 +401,8 @@ int xpoll_add_event(xPollState *loop, SOCKET_T fd, int mask,
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_del_event
  * ═══════════════════════════════════════════════════════════════════════ */
-void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask) {
+void xpoll_del_event(SOCKET_T fd, int mask) {
+    xPollState *loop = _xpoll;
     if (!loop) return;
 
     int idx = xpoll_find_fd(loop, fd);
@@ -521,7 +528,8 @@ void xpoll_del_event(xPollState *loop, SOCKET_T fd, int mask) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_poll  – wait for events and dispatch callbacks
  * ═══════════════════════════════════════════════════════════════════════ */
-int xpoll_poll(xPollState *loop, int timeout_ms) {
+int xpoll_poll(int timeout_ms) {
+    xPollState *loop = _xpoll;
     if (!loop) return -1;
 
     int num_ready     = 0;
@@ -691,19 +699,22 @@ int xpoll_poll(xPollState *loop, int timeout_ms) {
 /* ═══════════════════════════════════════════════════════════════════════
  *  Utility helpers
  * ═══════════════════════════════════════════════════════════════════════ */
-int xpoll_get_fd(xPollState *loop, SOCKET_T fd) {
+int xpoll_get_fd(SOCKET_T fd) {
+    xPollState *loop = _xpoll;
     if (!loop) return -1;
     return xpoll_find_fd(loop, fd);
 }
 
-void xpoll_set_client_data(xPollState *loop, SOCKET_T fd, void *clientData) {
+void xpoll_set_client_data(SOCKET_T fd, void *clientData) {
+    xPollState *loop = _xpoll;
     if (!loop) return;
     int idx = xpoll_find_fd(loop, fd);
     if (idx >= 0)
         loop->events[idx].clientData = clientData;
 }
 
-void* xpoll_get_client_data(xPollState *loop, SOCKET_T fd) {
+void* xpoll_get_client_data(SOCKET_T fd) {
+    xPollState *loop = _xpoll;
     if (!loop) return NULL;
     int idx = xpoll_find_fd(loop, fd);
     if (idx >= 0)

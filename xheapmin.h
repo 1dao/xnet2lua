@@ -19,7 +19,9 @@ typedef struct xHeapMinNode {
 
 typedef int (*fnHeapMinComp)(xHeapMinNode*, xHeapMinNode*);
 static inline int xheapmin_compare(xHeapMinNode* a, xHeapMinNode* b) {
-    return (int)(a->key - b->key);
+    if (a->key < b->key) return -1;
+    if (a->key > b->key) return  1;
+    return 0;
 }
 
 typedef struct {
@@ -168,8 +170,9 @@ xHeapMinNode* xheapmin_remove(xHeapMin* heap, int index) {
     heap->size--;
 
     if (index < heap->size) {
+        xHeapMinNode* replaced = heap->data[index];
         heapify_up(heap, index);
-        if (heap->data[index]->heap_index == index) {
+        if (replaced->heap_index == index) {
             heapify_down(heap, index);
         }
     }
