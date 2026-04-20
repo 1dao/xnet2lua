@@ -38,11 +38,11 @@ extern "C" {
 typedef struct xPollState xPollState;
 
 /* File event callback function type */
-typedef void (*xFileProc)(xPollState *loop, SOCKET_T fd, int mask, void *clientData);
+typedef void (*xFileProc)(SOCKET_T fd, int mask, void *clientData);
 
 /* ── Public API ─────────────────────────────────────────────────────────── */
 int         xpoll_init(void);
-void        xpoll_unint(void);
+void        xpoll_uninit(void);
 xPollState* xpoll_get_default(void);
 
 int  xpoll_resize(int setsize);

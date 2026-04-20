@@ -289,7 +289,7 @@ int xpoll_add_event(SOCKET_T fd, int mask,
     if ((int)fd >= loop->setsize) {
         int newsize = loop->setsize;
         while (newsize <= (int)fd) newsize *= 2;
-        if (xpoll_resize(loop, newsize) < 0) return -1;
+        if (xpoll_resize(newsize) < 0) return -1;
     }
 
     xPoolFD *fe = &loop->events[(int)fd];
@@ -329,7 +329,7 @@ int xpoll_add_event(SOCKET_T fd, int mask,
     if ((int)fd >= loop->setsize) {
         int newsize = loop->setsize;
         while (newsize <= (int)fd) newsize *= 2;
-        if (xpoll_resize(loop, newsize) < 0) return -1;
+        if (xpoll_resize(newsize) < 0) return -1;
     }
 
     xPoolFD *fe = &loop->events[(int)fd];
@@ -568,14 +568,14 @@ int xpoll_poll(int timeout_ms) {
         SOCKET_T  fd = fe->fd;
 
         if ((mask & XPOLL_WRITABLE) && wp)
-            wp(loop, fd, XPOLL_WRITABLE, ud);
+            wp(fd, XPOLL_WRITABLE, ud);
         if ((mask & XPOLL_READABLE) && rp)
-            rp(loop, fd, XPOLL_READABLE, ud);
+            rp(fd, XPOLL_READABLE, ud);
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
             fprintf(stderr,
                 "[xpoll] epoll close/error fd=%d events=0x%x\n",
                 sfd, e->events);
-            ep(loop, fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
         }
         num_processed++;
     }
@@ -620,14 +620,14 @@ int xpoll_poll(int timeout_ms) {
         SOCKET_T  fd = fe->fd;
 
         if ((mask & XPOLL_WRITABLE) && wp)
-            wp(loop, fd, XPOLL_WRITABLE, ud);
+            wp(fd, XPOLL_WRITABLE, ud);
         if ((mask & XPOLL_READABLE) && rp)
-            rp(loop, fd, XPOLL_READABLE, ud);
+            rp(fd, XPOLL_READABLE, ud);
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
             fprintf(stderr,
                 "[xpoll] kqueue close/error fd=%d flags=0x%x\n",
                 sfd, ke->flags);
-            ep(loop, fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
         }
         num_processed++;
     }
@@ -679,14 +679,14 @@ int xpoll_poll(int timeout_ms) {
                 i, (int)fd, i, (int)loop->poll_fds[i].fd);
 
         if ((mask & XPOLL_WRITABLE) && wp)
-            wp(loop, fd, XPOLL_WRITABLE, ud);
+            wp(fd, XPOLL_WRITABLE, ud);
         if ((mask & XPOLL_READABLE) && rp)
-            rp(loop, fd, XPOLL_READABLE, ud);
+            rp(fd, XPOLL_READABLE, ud);
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && ep) {
             fprintf(stderr,
                 "[xpoll] poll close/error fd=%d revents=0x%x\n",
                 (int)fd, (unsigned)revents);
-            ep(loop, fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
+            ep(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE), ud);
         }
         num_processed++;
     }
