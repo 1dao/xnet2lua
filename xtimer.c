@@ -49,7 +49,7 @@ xTimerSet* xtimer_pool_create(int capacity) {
     xTimerSet* tm = (xTimerSet*)malloc(sizeof(xTimerSet));
     tm->timer_heap = xheapmin_create(capacity, xheapmin_compare);
     tm->next_timer_id = 1;
-    tm->current_time = time_get_ms();
+    tm->current_time = time_clock_ms();
 
     return tm;
 }
@@ -96,7 +96,7 @@ void timer_refresh(xTimerSet* tm, xTimerNode* timer) {
 }
 
 int xtimer_poll(xTimerSet* tm) {
-    tm->current_time = time_get_ms();
+    tm->current_time = time_clock_ms();
 
     int triggered_count = 0;
     int next_timeout = 0;
@@ -178,7 +178,7 @@ void xtimer_update() {
 
 int xtimer_last() {
     if (_cur) {
-        uint64_t time_now = time_get_ms();
+        uint64_t time_now = time_clock_ms();
         xTimerNode* next_timer = (xTimerNode*)xheapmin_peek(_cur->timer_heap);
         if(next_timer)
             return next_timer->base.key> time_now?(int)(next_timer->base.key - time_now):0;

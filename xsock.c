@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <errno.h>
 
 /* Ensure AF_UNIX/AF_LOCAL compatibility */
 #ifndef _WIN32
@@ -15,7 +16,6 @@
     #include <unistd.h>
     #include <fcntl.h>
     #include <netdb.h>
-    #include <errno.h>
 
     /* Fallback for AF_LOCAL if only AF_UNIX is defined */
     #ifndef AF_LOCAL
