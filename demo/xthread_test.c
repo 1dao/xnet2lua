@@ -160,7 +160,7 @@ static int test_thread_pool_round_robin(void) {
     /* Register a group of 4 worker threads */
     bool ok = xthread_register_group(XTHR_WORKER_GRP1, 4,
                                       XTHSTRATEGY_ROUND_ROBIN,
-                                      "worker-grp1-%d",
+                                      "thr-grp1-%d",
                                       worker_on_init, worker_on_update, worker_on_cleanup);
     if (!ok) {
         printf("Failed to register worker group\n");
@@ -227,7 +227,7 @@ static int test_thread_pool_least_queue(void) {
     /* Register a group with least-queue scheduling (best for workload balancing) */
     bool ok = xthread_register_group(XTHR_WORKER_GRP2, 3,
                                       XTHSTRATEGY_LEAST_QUEUE,
-                                      "worker-grp2-%d",
+                                      "thr-grp2-%d",
                                       worker_on_init, worker_on_update, worker_on_cleanup);
     if (!ok) {
         printf("Failed to register worker group\n");
