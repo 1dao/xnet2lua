@@ -310,12 +310,6 @@ static void notify_read_cb(SOCKET_T fd, int mask, void* clientData) {
 #endif
     xThread* ctx = (xThread*)clientData;
     if (!ctx) return;
-
-    /* Reset pending so the next push can trigger a new write. */
-    xnet_mutex_lock(&ctx->queue.lock);
-    ctx->queue.pending = 0;
-    xnet_mutex_unlock(&ctx->queue.lock);
-
     process_tasks(ctx);
 }
 
@@ -479,24 +473,6 @@ static bool xthread_register_main(int id, const char* name) {
     return true;
 }
 
-static bool xthread_unregister_main(int id) {
-    if (id <= 0 || id >= XTHR_MAX) return false;
-
-    xnet_mutex_lock(&_lock);
-    xThread* ctx = _threads[id];
-    if (!ctx) { xnet_mutex_unlock(&_lock); return false; }
-    atomic_store(&ctx->running, false);
-    _threads[id] = NULL;
-    xnet_mutex_unlock(&_lock);
-
-    /* Wake the thread so it can observe running=false and exit */
-    xthread_notify(ctx, true);
-
-    xqueue_uninit(&ctx->queue);
-    free(ctx);
-    return true;
-}
-
 /* ============================================================================
 ** thread internal init / uninit
 ** ========================================================================== */
@@ -511,8 +487,8 @@ static inline void xthread_internal_update(xThread* ctx) {
 }
 
 static inline void xthread_internal_uninit(xThread* ctx) {
+    xthread_wakeup_uninit(); // must first uninit
     if (ctx->on_cleanup) ctx->on_cleanup(ctx);
-    xthread_wakeup_uninit();
 }
 
 /* ============================================================================
@@ -586,6 +562,9 @@ bool xthread_init(void) {
 
 void xthread_uninit(void) {
     if (!_init) return;
+    xThread* main_ctx = _threads[XTHR_MAIN];
+    if (main_ctx) xthread_wakeup_uninit(); // xthread_unregister_main(XTHR_MAIN);
+
     for (int i = 0; i < XTHR_MAX; i++) {
         if (_threads[i]) xthread_unregister(i);
     }
@@ -594,10 +573,6 @@ void xthread_uninit(void) {
 #endif
     xnet_mutex_uninit(&_lock);
     _init = false;
-
-    // init main thread uninit wakeup
-    xthread_wakeup_uninit();
-    // xthread_unregister_main(XTHR_MAIN);
 }
 
 bool xthread_register(int id, const char* name,
@@ -658,8 +633,6 @@ bool xthread_register(int id, const char* name,
 
 void xthread_unregister(int id) {
     if (id <= 0 || id >= XTHR_MAX) return;
-    XLOGI("Thread unregister [%d:%s]", id, _threads[id] ? _threads[id]->name : "");
-
     xnet_mutex_lock(&_lock);
     xThread* ctx = _threads[id];
     if (!ctx) { xnet_mutex_unlock(&_lock); return; }
@@ -667,20 +640,31 @@ void xthread_unregister(int id) {
     _threads[id] = NULL;
     xnet_mutex_unlock(&_lock);
 
-    /* Wake the thread so it can observe running=false and exit */
-    xthread_notify(ctx, true);
+    #ifdef _WIN32
+        bool is_worker = (ctx->handle != NULL);
+    #else
+        bool is_worker = (ctx->handle != 0);
+    #endif
 
-    if (ctx->handle) {
+    if (is_worker) {
+        /* Sub-thread: wake it up and let worker_func complete the cleanup process by itself */
+        xthread_notify(ctx, true);
 #ifdef _WIN32
         WaitForSingleObject(ctx->handle, INFINITE);
         CloseHandle(ctx->handle);
 #else
         pthread_join(ctx->handle, NULL);
 #endif
+        /* process_tasks / on_cleanup / xthread_wakeup_uninit
+            已在 worker_func 的 xthread_internal_uninit 中完成 */
+    } else {
+        /* Main thread: No worker_func exists, manually supplement the same final cleanup steps */
+        process_tasks(ctx);
+        xthread_internal_uninit(ctx);  // on_cleanup → xthread_wakeup_uninit
     }
 
     xqueue_uninit(&ctx->queue);
-    free(ctx);  /* name is embedded in struct, freed with struct */
+    free(ctx);
 }
 
 xThread* xthread_get       (int id) {
@@ -699,10 +683,10 @@ int xthread_update(int timeout_ms) {
 
     // Only wait if queue is still empty after processing tasks
     xnet_mutex_lock(&ctx->queue.lock);
-    if (ctx->queue.size == 0) {
-        xqueue_wait(&ctx->queue, timeout_ms);
-    }
+    bool empty = (ctx->queue.size == 0);
     xnet_mutex_unlock(&ctx->queue.lock);
+
+    if (empty) xqueue_wait(&ctx->queue, timeout_ms);
     return n;
 }
 
