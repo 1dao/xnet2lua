@@ -17,16 +17,22 @@ else
     EXT :=
 endif
 
-# Target
+# Targets
 TARGET := xthread_test$(EXT)
+XLUA_TARGET := xlua_test$(EXT)
 
-all: $(TARGET)
+all: $(TARGET) $(XLUA_TARGET)
 
 # Compile directly with all source files
 $(TARGET): xthread_test.c ../xthread.c ../xpoll.c ../xsock.c
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -I.. -o $@ xthread_test.c ../xthread.c ../xpoll.c ../xsock.c $(LDFLAGS)
+
+# xthread Lua test - uses embedded minilua.h from 3rd/
+# No external Lua dependency required - cmsgpack is statically linked
+xlua_test$(EXT): xlua_test.c ../xthread.c ../xpoll.c ../xlua/lua_xthread.c ../xlua/lua_cmsgpack.c ../libxsock.a
+	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xlua_test.c ../xthread.c ../xpoll.c ../xlua/lua_xthread.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) $(XLUA_TARGET) *.o
 
 .PHONY: all clean

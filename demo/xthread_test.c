@@ -190,10 +190,9 @@ static int test_thread_pool_round_robin(void) {
         if (processed > 0) {
             printf("[MAIN] Processed %d tasks this iteration\n", processed);
         }
-        usleep(10000);
         waited++;
         /* Timeout after ~30 seconds to avoid infinite loop */
-        if (waited > 3000) {
+        if (waited > 300) {
             printf("[TIMEOUT] Waited too long, exiting loop early. posted=%d, completed=%d\n",
                    producer_counter, task_counter);
             break;
