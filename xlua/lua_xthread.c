@@ -6,7 +6,7 @@
 **   RPC   ->  pack(reply_router,  co_id, 0 (sk), pt, arg1, ...)
 **   REPLY ->  pack(nil, "@async_resume", co_id, 0 (sk), req_pt, ok, r, ...)
 **
-** Lua handler convention (__thread_handle__):
+** Lua handler convention (__thread_handle):
 **
 **   POST: handler(nil,           pt, arg1, ...)
 **   RPC:  handler(reply_router,  co_id, sk, pt, arg1, ...)
@@ -44,6 +44,9 @@
 #include "xthread.h"
 #include "xlog.h"
 
+LUALIB_API int luaopen_cmsgpack(lua_State* L);
+LUALIB_API int luaopen_xthread(lua_State* L);
+
 /* ============================================================================
 ** Registry keys (per lua_State)
 ** ========================================================================== */
@@ -54,9 +57,18 @@
 #define XTHREAD_COID_KEY    "xthread.next_co_id" /* integer auto-increment    */
 
 /* ============================================================================
-** Per-OS-thread Lua state table
+** ThreadData - Stores per-thread Lua state and callback references
 ** ========================================================================== */
-static lua_State* _lua_states[XTHR_MAX];
+typedef struct {
+    lua_State* L;                /* Thread's Lua state */
+    lua_State* owner_L;          /* State that owns the ThreadData userdata */
+    char* script_path;           /* path to script file (loaded by new thread) */
+    int sync_handler_ref;        /* sync message handler reference (in registry) */
+    int init_ref;                /* lifecycle: init callback reference */
+    int update_ref;              /* lifecycle: update callback reference */
+    int uninit_ref;              /* lifecycle: uninit callback reference */
+    int sentinel_ref;            /* GC protection reference (keeps ThreadData alive) */
+} ThreadData;
 
 /* ============================================================================
 ** ThreadMsg: heap buffer carrying a packed message across OS threads
@@ -74,179 +86,249 @@ static ThreadMsg* msg_alloc(const char* buf, size_t len) {
 
 /* Forward declaration */
 static void thread_message_handler(xThread* thr, void* arg);
+static int thread_data_gc(lua_State* L);
+
+/* ThreadData metatable name */
+static const char* THREAD_DATA_META = "xthread.ThreadData";
 
 /* ============================================================================
 ** pack_to_msg
-**
-** Calls cmsgpack.pack with the top `nargs` values currently on the stack.
-** Pops those values; leaves the stack otherwise unchanged.
-** Returns the packed ThreadMsg*, or NULL on error.
+** Pack Lua stack values into a ThreadMsg using cmsgpack
 ** ========================================================================== */
 static ThreadMsg* pack_to_msg(lua_State* L, int nargs) {
-    /* Fetch pack function and insert it *below* the args */
+    /* Call cmsgpack.pack(...) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_PACK_KEY);
-    lua_insert(L, -(nargs + 1));
-
+    if (!lua_isfunction(L, -1)) {
+        XLOGE("xthread: pack function not found (did you call xthread.init?)");
+        return NULL;
+    }
+    lua_insert(L, lua_gettop(L) - nargs); /* move function before args */
     if (lua_pcall(L, nargs, 1, 0) != LUA_OK) {
-        XLOGE("xthread: cmsgpack.pack error: %s", lua_tostring(L, -1));
+        XLOGE("xthread: pack failed: %s", lua_tostring(L, -1));
+        return NULL;
+    }
+    /* Result is a string on top */
+    if (!lua_isstring(L, -1)) {
+        XLOGE("xthread: pack did not return a string");
         lua_pop(L, 1);
         return NULL;
     }
     size_t len;
-    const char* buf = lua_tolstring(L, -1, &len);
-    ThreadMsg* msg = msg_alloc(buf, len);
-    lua_pop(L, 1); /* pop packed string */
+    const char* data = lua_tolstring(L, -1, &len);
+    ThreadMsg* msg = msg_alloc(data, len);
+    lua_pop(L, 1);
     return msg;
 }
 
 /* ============================================================================
 ** unpack_msg
-**
-** Unpacks ThreadMsg onto L's stack.
-** Returns number of values pushed, or -1 on error.
+** Unpack ThreadMsg into Lua stack, returns number of values or -1 on error
 ** ========================================================================== */
 static int unpack_msg(lua_State* L, ThreadMsg* msg) {
     int base = lua_gettop(L);
+    /* Call cmsgpack.unpack(buf) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_UNPACK_KEY);
+    if (!lua_isfunction(L, -1)) {
+        XLOGE("xthread: unpack function not found (did you call xthread.init?)");
+        lua_settop(L, base);
+        return -1;
+    }
     lua_pushlstring(L, msg->data, msg->len);
     if (lua_pcall(L, 1, LUA_MULTRET, 0) != LUA_OK) {
-        XLOGE("xthread: cmsgpack.unpack error: %s", lua_tostring(L, -1));
-        lua_pop(L, 1);
+        XLOGE("xthread: unpack failed: %s", lua_tostring(L, -1));
+        lua_settop(L, base);
         return -1;
     }
     return lua_gettop(L) - base;
 }
 
 /* ============================================================================
-** Coroutine pending-RPC table helpers
-** pending table: LUA_REGISTRYINDEX[XTHREAD_PENDING_KEY] = { [co_id] = thread }
-** The table lives in the CALLER thread's registry; each thread tracks its own
-** pending RPCs.
+** next_co_id - Atomically increment the coroutine ID counter
 ** ========================================================================== */
-
-/* Increment and return next co_id (operates on caller thread's L) */
 static lua_Integer next_co_id(lua_State* L) {
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_COID_KEY);
-    lua_Integer id = lua_tointeger(L, -1) + 1;
+    lua_Integer id = lua_tointeger(L, -1);
     lua_pop(L, 1);
-    lua_pushinteger(L, id);
+    lua_pushinteger(L, id + 1);
     lua_setfield(L, LUA_REGISTRYINDEX, XTHREAD_COID_KEY);
     return id;
 }
 
-/* Store coroutine co in pending[co_id] (operates on caller thread's L) */
-static void pending_put(lua_State* L, lua_Integer co_id, lua_State* co) {
+/* ============================================================================
+** pending_put / pending_pop - Track waiting RPC coroutines
+** ========================================================================== */
+static bool pending_put(lua_State* L, lua_Integer co_id, lua_State* co) {
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_PENDING_KEY);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return false;
+    }
     lua_pushinteger(L, co_id);
-    /* Push the coroutine thread value onto co's stack, then xmove to L */
     lua_pushthread(co);
     lua_xmove(co, L, 1);
-    lua_rawset(L, -3); /* pending[co_id] = coroutine */
-    lua_pop(L, 1);     /* pop pending table */
+    lua_settable(L, -3);
+    lua_pop(L, 1);
+    return true;
 }
 
-/* Retrieve and remove coroutine from pending[co_id] (operates on caller thread's L).
-** Returns the coroutine lua_State*, or NULL if not found. */
-static lua_State* pending_pop(lua_State* L, lua_Integer co_id) {
+static lua_State* pending_pop(lua_State* L, lua_Integer co_id, bool keep_ref) {
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_PENDING_KEY);
-    lua_pushinteger(L, co_id);
-    lua_rawget(L, -2); /* pending[co_id] */
-
-    if (!lua_isthread(L, -1)) {
-        lua_pop(L, 2); /* pop nil + table */
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
         return NULL;
     }
-    lua_State* co = lua_tothread(L, -1);
-    lua_pop(L, 1); /* pop thread value */
-
-    /* Remove from table: pending[co_id] = nil */
     lua_pushinteger(L, co_id);
-    lua_pushnil(L);
-    lua_rawset(L, -3);
-    lua_pop(L, 1); /* pop pending table */
+    lua_gettable(L, -2);
+    lua_State* co = lua_tothread(L, -1);
+    if (co) {
+        /* Remove from pending table */
+        lua_pushinteger(L, co_id);
+        lua_pushnil(L);
+        lua_settable(L, -4);
+
+        if (keep_ref) {
+            lua_remove(L, -2); /* remove pending table; keep coroutine on stack */
+        } else {
+            lua_pop(L, 2);     /* pop coroutine and pending table */
+        }
+    } else {
+        lua_pop(L, 2);         /* pop nil and pending table */
+    }
     return co;
 }
 
 /* ============================================================================
-** l_reply_func  (C closure, upvalue = caller_id:integer)
-**
-** Registered as _thread_replys["xthread:<caller_id>"] on TARGET threads.
-** Called by Lua as: reply(co_id, sk, req_pt, ok, r, ...)
-** Packs a REPLY message and posts it back to the caller thread.
-** Returns: true on success, false on failure.
-** ========================================================================== */
+** l_replys_index - Metatable __index for _thread_replys
+** Auto-creates reply closures for keys "xthread:<id>"
+** ============================================================================ */
 static int l_reply_func(lua_State* L) {
-    int caller_id = (int)lua_tointeger(L, lua_upvalueindex(1));
-    int nargs = lua_gettop(L); /* (co_id, sk, req_pt, ok, r, ...) */
+    /* Closure created with upvalue 1 = target_id (integer) */
+    int target_id = luaL_checkinteger(L, lua_upvalueindex(1));
+    /* reply(co_id, sk, pt, ok, ...) */
+    int nargs = lua_gettop(L);
+    /* Need at least: reply(co_id) */
+    if (nargs < 1) {
+        luaL_error(L, "reply: too few arguments");
+        return 0;
+    }
 
-    /* Pack: (nil, "@async_resume", co_id, sk, req_pt, ok, r, ...) */
-    lua_pushnil(L);
+    /* Pack: nil, "@async_resume", co_id, sk, pt, ok, ... */
     lua_pushstring(L, "@async_resume");
-    for (int i = 1; i <= nargs; i++)
-        lua_pushvalue(L, i);
+    lua_insert(L, 1);
+    lua_pushnil(L);                    /* reply_router = nil */
+    lua_insert(L, 1);
+    /* co_id, sk, pt, ok... are already on stack after that */
 
-    ThreadMsg* msg = pack_to_msg(L, 2 + nargs);
+    ThreadMsg* msg = pack_to_msg(L, nargs + 2); /* +2 for nil + "@async_resume" */
     if (!msg) {
+        XLOGE("xthread.reply: failed to pack message");
+        lua_settop(L, 0);
         lua_pushboolean(L, 0);
         return 1;
     }
 
-    bool ok = xthread_post(caller_id, thread_message_handler, msg);
+    bool ok = xthread_post(target_id, thread_message_handler, msg);
     if (!ok) {
+        XLOGE("xthread.reply: failed to post to thread %d", target_id);
         free(msg);
-        XLOGE("xthread reply: xthread_post(%d) failed", caller_id);
     }
-    lua_pushboolean(L, ok ? 1 : 0);
+    lua_pushboolean(L, ok);
     return 1;
 }
 
-/* ============================================================================
-** l_replys_index  (__index metamethod for _thread_replys)
-**
-** Auto-creates a C reply closure for keys matching "xthread:<id>".
-** Caches the closure back into the table so __index is only called once.
-** ========================================================================== */
 static int l_replys_index(lua_State* L) {
-    /* args: (table, key) */
-    const char* key = lua_tostring(L, 2);
-    if (key) {
-        int caller_id = 0;
-        if (sscanf(key, "xthread:%d", &caller_id) == 1 && caller_id > 0) {
-            /* Create C closure capturing caller_id */
-            lua_pushinteger(L, caller_id);
-            lua_pushcclosure(L, l_reply_func, 1);
-
-            /* Cache: _thread_replys[key] = closure (rawset to avoid re-triggering __index) */
-            lua_pushvalue(L, 2);   /* key */
-            lua_pushvalue(L, -2);  /* closure */
-            lua_rawset(L, 1);      /* table[key] = closure */
-
-            return 1; /* return closure */
-        }
+    /* _thread_replys, "xthread:<id>" */
+    const char* key = luaL_checkstring(L, 2);
+    if (strncmp(key, "xthread:", 8) != 0) {
+        lua_pushnil(L);
+        return 1;
     }
-    lua_pushnil(L);
+    int id = atoi(key + 8);
+    if (id <= 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    /* Create C closure that captures id */
+    lua_pushinteger(L, id);
+    lua_pushcclosure(L, l_reply_func, 1);
+    /* Store it in _thread_replys so it's cached */
+    lua_pushvalue(L, 2);  /* original "xthread:<id>" key */
+    lua_pushvalue(L, -2); /* closure */
+    lua_settable(L, 1); /* _thread_replys[key] = closure */
     return 1;
 }
 
 /* ============================================================================
-** thread_message_handler  (xthread C task)
+** thread_data_gc - GC garbage collection for ThreadData
+** ========================================================================== */
+static void thread_data_unref_callbacks(ThreadData* td, lua_State* L) {
+    if (!td || !L) {
+        return;
+    }
+
+    if (td->sync_handler_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
+        td->sync_handler_ref = LUA_NOREF;
+    }
+    if (td->init_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->init_ref);
+        td->init_ref = LUA_NOREF;
+    }
+    if (td->update_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->update_ref);
+        td->update_ref = LUA_NOREF;
+    }
+    if (td->uninit_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->uninit_ref);
+        td->uninit_ref = LUA_NOREF;
+    }
+}
+
+static int thread_data_gc(lua_State* L) {
+    ThreadData* td = (ThreadData*)luaL_checkudata(L, 1, THREAD_DATA_META);
+    if (!td) return 0;
+
+    XLOGD("thread_data_gc: reclaiming ThreadData for thread");
+
+    /* Free script path copy */
+    if (td->script_path) {
+        free(td->script_path);
+        td->script_path = NULL;
+    }
+
+    if (td->L == L) {
+        thread_data_unref_callbacks(td, L);
+    }
+
+    if (td->owner_L == L && td->sentinel_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->sentinel_ref);
+        td->sentinel_ref = LUA_NOREF;
+    }
+
+    td->L = NULL;
+    td->owner_L = NULL;
+    return 0;
+}
+
+/* ============================================================================
+** thread_message_handler - Entry point for all cross-thread messages
 **
-** Runs on the TARGET thread (for POST/RPC) or CALLER thread (for REPLY).
 ** Unpacks the message and either:
 **   a) Intercepts "@async_resume" → resumes the waiting coroutine directly
 **   b) Dispatches to the registered Lua handler
 ** ============================================================================ */
 static void thread_message_handler(xThread* thr, void* arg) {
     ThreadMsg* msg = (ThreadMsg*)arg;
-    int id = xthread_get_id(thr);
-    lua_State* L = _lua_states[id];
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
 
-    if (!L) {
-        XLOGE("xthread: no lua state for thread %d", id);
+    if (!td || !td->L) {
+        XLOGE("xthread: no lua state for thread %d", xthread_get_id(thr));
         free(msg);
         return;
     }
 
+    lua_State* L = td->L;
+    int id = xthread_get_id(thr);
     int base = lua_gettop(L);
     int nvals = unpack_msg(L, msg);
     free(msg);
@@ -262,14 +344,6 @@ static void thread_message_handler(xThread* thr, void* arg) {
 
     /* ── Intercept @async_resume (REPLY from target → resume coroutine) ── */
     /* REPLY always has base+1 = nil (reply_router is nil), base+2 = "@async_resume" */
-    if (nvals >= 2) {
-        int type = lua_type(L, base + 1);
-        int b1isnil = lua_isnil(L, base + 1);
-        const char* tname = lua_typename(L, type);
-        const char* k1 = (nvals >= 2) ? lua_tostring(L, base + 2) : "(none)";
-        XLOGD("thread_message_handler [id=%d]: base=%d nvals=%d base+1-type=%s base+1-isnil=%d base+2=%s",
-              xthread_current_id(), (int)base, (int)nvals, tname, b1isnil, k1 ? k1 : "(null)");
-    }
     if (nvals >= 2 && lua_isnil(L, base + 1)) {
         const char* k1 = lua_tostring(L, base + 2);
         if (k1 && strcmp(k1, "@async_resume") == 0) {
@@ -294,7 +368,7 @@ static void thread_message_handler(xThread* thr, void* arg) {
             int nresume = nvals - 5; /* ok + results */
 
             XLOGD("xthread: @async_resume looking up co_id=%lld in thread %d pending table", (long long)co_id, xthread_current_id());
-            lua_State* co = pending_pop(L, co_id);
+            lua_State* co = pending_pop(L, co_id, true);
             if (!co) {
                 XLOGE("xthread: @async_resume co_id=%lld not found", (long long)co_id);
                 lua_settop(L, base);
@@ -307,7 +381,6 @@ static void thread_message_handler(xThread* thr, void* arg) {
             }
 
             lua_xmove(L, co, nresume);     /* move n values from top of L to co */
-            lua_settop(L, base);           /* restore original stack height */
 
             int nresults = 0;
             int status = lua_resume(co, L, nresume, &nresults);
@@ -315,30 +388,36 @@ static void thread_message_handler(xThread* thr, void* arg) {
                 XLOGE("xthread: coroutine error: %s", lua_tostring(co, -1));
                 lua_settop(co, 0);
             }
+            lua_settop(L, base);           /* restore original stack height */
             return; /* INTERCEPTED - DONE! do NOT continue to Lua handler */
         }
     }
 
     /* Not @async_resume - go to normal Lua handler dispatch */
     /* ── Normal dispatch: call Lua handler ── */
-    lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_HANDLER_KEY);
-    if (!lua_isfunction(L, -1)) {
-        XLOGE("xthread: no handler on thread %d (did you call xthread.init?)", id);
-        lua_settop(L, base);
-        return;
-    }
-    /* Move handler below all unpacked values */
-    lua_insert(L, base + 1);
-    /* Call: handler(reply_router, k1, k2, k3, ...) */
-    if (lua_pcall(L, nvals, 0, 0) != LUA_OK) {
-        XLOGE("xthread: handler error on thread %d: %s", id, lua_tostring(L, -1));
+    if (td->sync_handler_ref != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
+        if (!lua_isfunction(L, -1)) {
+            XLOGE("xthread: no handler on thread %d (did you call xthread.init?)", id);
+            lua_settop(L, base);
+            return;
+        }
+        /* Move handler below all unpacked values */
+        lua_insert(L, base + 1);
+        /* Call: handler(reply_router, k1, k2, k3, ...) */
+        if (lua_pcall(L, nvals, 0, 0) != LUA_OK) {
+            XLOGE("xthread: handler error on thread %d: %s", id, lua_tostring(L, -1));
+            lua_settop(L, base);
+        }
+    } else {
+        XLOGE("xthread: no handler on thread %d (did you call xthread.init(handler)?)", id);
         lua_settop(L, base);
     }
 }
 
 /* ============================================================================
-** Lua API
-** ========================================================================== */
+** Lua API - Original core API (preserved for compatibility)
+** ============================================================================ */
 
 /* xthread.init([handler_func])
 **
@@ -351,15 +430,46 @@ static void thread_message_handler(xThread* thr, void* arg) {
 **   • message handler function
 **
 ** handler_func: the Lua function called for incoming messages.
-**   Defaults to __exports.__thread_handle__ if not provided. */
+**   Defaults to __thread_handle if not provided. */
 static int l_xthread_init(lua_State* L) {
-    int id = xthread_current_id();
-    if (id <= 0 || id >= XTHR_MAX)
+    xThread* thr = xthread_current();
+    if (!thr)
         return luaL_error(L, "xthread.init: must be called from a registered xthread");
 
-    _lua_states[id] = L;
+    /* Get or create ThreadData for this thread */
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    if (!td) {
+        /* Create new ThreadData userdata */
+        td = (ThreadData*)lua_newuserdata(L, sizeof(ThreadData));
+        td->L = L;
+        td->owner_L = L;
+        td->script_path = NULL;
+        td->sync_handler_ref = LUA_NOREF;
+        td->init_ref = LUA_NOREF;
+        td->update_ref = LUA_NOREF;
+        td->uninit_ref = LUA_NOREF;
+        td->sentinel_ref = LUA_NOREF;
 
-    /* Load and cache cmsgpack.pack / cmsgpack.unpack */
+        /* Get or create metatable */
+        luaL_getmetatable(L, THREAD_DATA_META);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            luaL_newmetatable(L, THREAD_DATA_META);
+            lua_pushcfunction(L, thread_data_gc);
+            lua_setfield(L, -2, "__gc");
+            /* Set metatable */
+        }
+        lua_setmetatable(L, -2);
+        /* Store reference to self in registry to prevent GC */
+        td->sentinel_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+        /* Attach to xthread */
+        xthread_set_userdata(thr, td);
+    }
+
+    td->L = L;
+
+    /* Load and cache cmsgpack.pack / cmsgpack.unpack in registry */
     lua_getglobal(L, "require");
     lua_pushstring(L, "cmsgpack");
     if (lua_pcall(L, 1, 1, 0) != LUA_OK)
@@ -374,14 +484,14 @@ static int l_xthread_init(lua_State* L) {
     if (lua_isfunction(L, 1)) {
         lua_pushvalue(L, 1);
     } else {
-        /* Default: __thread_handle__ (global) */
-        lua_getglobal(L, "__thread_handle__");
+        /* Default: __thread_handle (global) */
+        lua_getglobal(L, "__thread_handle");
         if (!lua_isfunction(L, -1)) {
             lua_pop(L, 1);
-            /* Fallback: try __exports.__thread_handle__ */
+            /* Fallback: try __exports.__thread_handle */
             lua_getglobal(L, "__exports");
             if (lua_istable(L, -1)) {
-                lua_getfield(L, -1, "__thread_handle__");
+                lua_getfield(L, -1, "__thread_handle");
                 lua_remove(L, -2); /* remove __exports */
             } else {
                 lua_pop(L, 1);
@@ -389,13 +499,16 @@ static int l_xthread_init(lua_State* L) {
             }
         }
     }
-    if (!lua_isfunction(L, -1)) {
+    if (lua_isfunction(L, -1)) {
+        if (td->sync_handler_ref != LUA_NOREF) {
+            luaL_unref(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
+        }
+        td->sync_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
         lua_pop(L, 1);
         XLOGW("xthread.init: no handler set for thread %d – "
-              "call xthread.init(handler) or ensure __thread_handle__ exists", id);
-        lua_pushnil(L);
+              "call xthread.init(handler) or ensure __thread_handle exists", xthread_get_id(thr));
     }
-    lua_setfield(L, LUA_REGISTRYINDEX, XTHREAD_HANDLER_KEY);
 
     /* Initialise pending-RPC table and co_id counter */
     lua_newtable(L);
@@ -418,7 +531,7 @@ static int l_xthread_init(lua_State* L) {
     lua_setmetatable(L, -2); /* setmetatable(_thread_replys, mt) */
     lua_pop(L, 1); /* pop _thread_replys */
 
-    XLOGI("xthread.init: thread %d initialised", id);
+    XLOGI("xthread.init: thread %d initialised", xthread_get_id(thr));
     return 0;
 }
 
@@ -473,16 +586,21 @@ static int l_xthread_rpc(lua_State* L) {
         return luaL_error(L, "xthread.rpc: must be called from a coroutine");
 
     int caller_id = xthread_current_id();
-    if (caller_id <= 0 || caller_id >= XTHR_MAX)
+    if (caller_id <= 0)
         return luaL_error(L, "xthread.rpc: calling thread not registered");
 
-    lua_State* main_L = _lua_states[caller_id];
-    if (!main_L)
+    xThread* caller_thr = xthread_current();
+    ThreadData* caller_td = (ThreadData*)xthread_get_userdata(caller_thr);
+    if (!caller_td || !caller_td->L)
         return luaL_error(L, "xthread.rpc: xthread.init() not called on this thread");
+
+    lua_State* main_L = caller_td->L;
 
     /* Generate a unique co_id and store the coroutine */
     lua_Integer co_id = next_co_id(main_L);
-    pending_put(main_L, co_id, L); /* L is the coroutine; main_L holds registry */
+    if (!pending_put(main_L, co_id, L)) { /* L is the coroutine; main_L holds registry */
+        return luaL_error(L, "xthread.rpc: pending table not initialized");
+    }
 
     /* Build reply_router: "xthread:<caller_id>" */
     char reply_router[32];
@@ -497,12 +615,12 @@ static int l_xthread_rpc(lua_State* L) {
     /* nargs = 3 + (top-1) = top+2 */
     ThreadMsg* msg = pack_to_msg(L, top + 2);
     if (!msg) {
-        pending_pop(main_L, co_id); /* roll back */
+        pending_pop(main_L, co_id, false); /* roll back */
         return luaL_error(L, "xthread.rpc: cmsgpack.pack failed");
     }
 
     if (!xthread_post(target_id, thread_message_handler, msg)) {
-        pending_pop(main_L, co_id); /* roll back */
+        pending_pop(main_L, co_id, false); /* roll back */
         free(msg);
         return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
     }
@@ -518,14 +636,316 @@ static int l_current_id(lua_State* L) {
 }
 
 /* ============================================================================
+** New API - Dynamic thread creation from Lua
+** ============================================================================ */
+
+/* Lifecycle callbacks that bridge from C xthread to Lua
+** This runs in the new thread's context after the OS thread has started
+*/
+static void lua_thread_on_init(xThread* thr) {
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    if (!td) {
+        XLOGE("lua_thread_on_init: no ThreadData for thread %d", xthread_get_id(thr));
+        return;
+    }
+
+    /* Create NEW Lua state for this thread */
+    lua_State* L = luaL_newstate();
+    if (!L) {
+        XLOGE("lua_thread_on_init: failed to create Lua state for thread %d", xthread_get_id(thr));
+        return;
+    }
+    td->L = L;
+
+    /* Open standard libraries */
+    luaL_openlibs(L);
+
+    /* Preload cmsgpack (statically linked) */
+    luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1);
+    lua_pop(L, 1);
+
+    /* Open xthread module */
+    luaL_requiref(L, "xthread", luaopen_xthread, 1);
+    lua_pop(L, 1);
+
+    /* Load the script in THIS THREAD'S own Lua state
+    ** Script returns the definition table with callbacks */
+    XLOGI("lua_thread_on_init: loading script '%s' for thread %d", td->script_path, xthread_get_id(thr));
+    if (luaL_dofile(L, td->script_path) != LUA_OK) {
+        XLOGE("lua_thread_on_init: failed to load script '%s': %s",
+              td->script_path, lua_tostring(L, -1));
+        lua_close(L);
+        td->L = NULL;
+        return;
+    }
+
+    /* Script should return the definition table */
+    if (!lua_istable(L, -1)) {
+        XLOGE("lua_thread_on_init: script '%s' did not return a definition table", td->script_path);
+        lua_close(L);
+        td->L = NULL;
+        return;
+    }
+
+    /* Extract callbacks from returned table and store as references */
+    lua_getfield(L, -1, "__thread_handle");
+    if (lua_isfunction(L, -1)) {
+        td->sync_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, 1);
+        XLOGW("lua_thread_on_init: no __thread_handle in script '%s'", td->script_path);
+        td->sync_handler_ref = LUA_NOREF;
+    }
+
+    lua_getfield(L, -1, "__init");
+    if (lua_isfunction(L, -1)) {
+        td->init_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, 1);
+        td->init_ref = LUA_NOREF;
+    }
+
+    lua_getfield(L, -1, "__update");
+    if (lua_isfunction(L, -1)) {
+        td->update_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, 1);
+        td->update_ref = LUA_NOREF;
+    }
+
+    lua_getfield(L, -1, "__uninit");
+    if (lua_isfunction(L, -1)) {
+        td->uninit_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, 1);
+        td->uninit_ref = LUA_NOREF;
+    }
+
+    /* Pop the definition table from stack */
+    lua_pop(L, 1);
+
+    /* Initialize xthread for this thread */
+    int base = lua_gettop(L);
+    lua_getglobal(L, "xthread");
+    lua_getfield(L, -1, "init");
+    lua_remove(L, -2); /* remove xthread table, keep init function */
+    int nargs = 0;
+    if (td->sync_handler_ref != LUA_NOREF) {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
+        nargs = 1;
+    }
+    if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {
+        XLOGE("lua_thread_on_init: xthread.init failed: %s", lua_tostring(L, -1));
+        lua_settop(L, base);
+    }
+
+    /* Call user's __init callback if provided */
+    if (td->init_ref != LUA_NOREF) {
+        base = lua_gettop(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, td->init_ref);
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            XLOGE("lua_thread_on_init: user init callback error: %s", lua_tostring(L, -1));
+            lua_settop(L, base);
+        }
+    }
+
+    XLOGI("lua_thread_on_init: thread %d fully initialized", xthread_get_id(thr));
+}
+
+static void lua_thread_on_update(xThread* thr) {
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    if (!td || td->update_ref == LUA_NOREF || !td->L) {
+        return;
+    }
+
+    lua_State* L = td->L;
+    int base = lua_gettop(L);
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, td->update_ref);
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        XLOGE("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
+        lua_settop(L, base);
+    }
+}
+
+static void lua_thread_on_cleanup(xThread* thr) {
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    if (!td) {
+        return;
+    }
+
+    if (td->uninit_ref != LUA_NOREF && td->L) {
+        lua_State* L = td->L;
+        int base = lua_gettop(L);
+
+        lua_rawgeti(L, LUA_REGISTRYINDEX, td->uninit_ref);
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            XLOGE("lua_thread_on_cleanup: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
+            lua_settop(L, base);
+        }
+    }
+
+    if (td->L) {
+        lua_State* L = td->L;
+        thread_data_unref_callbacks(td, L);
+        td->L = NULL;
+        lua_close(L);
+    }
+
+    /* xthread will unregister, clear the userdata reference */
+    xthread_set_userdata(thr, NULL);
+    XLOGI("lua_thread_on_cleanup: thread %d cleaned up", xthread_get_id(thr));
+}
+
+/* xthread.create_thread(id, name, script_path) → boolean
+**
+** id: integer - thread ID
+** name: string - thread name
+** script_path: string - path to Lua script that defines the thread
+**   The script should return a table with:
+**     {
+**       __init = function() end,              -- optional: called after Lua init
+**       __update = function() end,            -- optional: called each update
+**       __uninit = function() end,            -- optional: called before exit
+**       __thread_handle = function -- required: message handler
+**     }
+**
+** Creates a new OS thread with its own independent Lua state.
+** The new thread will:
+**   1. Create new Lua state
+**   2. Load standard libraries
+**   3. Preload cmsgpack and xthread modules
+**   4. Load and execute the script - script returns definition table
+**   5. Extract callbacks from definition table
+**   6. Call xthread.init with sync handler
+**   7. Call __init callback
+**   8. Run xthread_update loop calling __update each iteration
+**   9. On shutdown: call __uninit then exit
+*/
+static int l_xthread_create_thread(lua_State* L) {
+    int id = luaL_checkinteger(L, 1);
+    const char* name = luaL_checkstring(L, 2);
+    const char* script_path = luaL_checkstring(L, 3);
+
+    /* Check if thread already exists */
+    if (xthread_get(id) != NULL) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xthread.create_thread: thread %d already exists", id);
+        return 2;
+    }
+
+    /* Create ThreadData that will hold all references */
+    ThreadData* td = (ThreadData*)lua_newuserdata(L, sizeof(ThreadData));
+    td->L = NULL;
+    td->owner_L = L;
+    td->script_path = NULL;
+    td->sync_handler_ref = LUA_NOREF;
+    td->init_ref = LUA_NOREF;
+    td->update_ref = LUA_NOREF;
+    td->uninit_ref = LUA_NOREF;
+    td->sentinel_ref = LUA_NOREF;
+
+    /* Get metatable and set GC */
+    luaL_getmetatable(L, THREAD_DATA_META);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        luaL_newmetatable(L, THREAD_DATA_META);
+        lua_pushcfunction(L, thread_data_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+    lua_setmetatable(L, -2);
+
+    /* Store script path copy - the new thread will load it in its own Lua state */
+    td->script_path = malloc(strlen(script_path) + 1);
+    if (!td->script_path) {
+        XLOGE("xthread.create_thread: out of memory copying script path");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.create_thread: out of memory");
+        return 2;
+    }
+    strcpy((char*)td->script_path, script_path);
+
+    /* Store reference in registry to prevent GC while thread is running */
+    td->sentinel_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    /* Register with xthread - this creates the OS thread */
+    /* Attach ThreadData immediately after creation */
+    /* The new thread will get it from xthread_get_userdata in lua_thread_on_init */
+    bool ok = xthread_register_ex(id, name,
+                                lua_thread_on_init,
+                                lua_thread_on_update,
+                                lua_thread_on_cleanup
+                                , td);
+    if (!ok) {
+        XLOGE("xthread.create_thread: failed to register thread %d", id);
+        /* Clean up references */
+        if (td->sync_handler_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
+        if (td->init_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, td->init_ref);
+        if (td->update_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, td->update_ref);
+        if (td->uninit_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, td->uninit_ref);
+        if (td->sentinel_ref != LUA_NOREF) {
+            luaL_unref(L, LUA_REGISTRYINDEX, td->sentinel_ref);
+            td->sentinel_ref = LUA_NOREF;
+        }
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.create_thread: xthread_register failed");
+        return 2;
+    }
+
+    /* Get the xThread pointer and attach ThreadData */
+    xThread* thr = xthread_get(id);
+    if (!thr) {
+        XLOGE("xthread.create_thread: xthread_get failed after registration");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.create_thread: xthread_get failed");
+        return 2;
+    }
+
+    XLOGI("xthread.create_thread: created thread %d '%s'", id, name);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* xthread.shutdown_thread(id) → boolean
+**
+** Unregister and shut down a dynamically created thread.
+** This will trigger the cleanup process: call __uninit and exit the thread.
+*/
+static int l_xthread_shutdown_thread(lua_State* L) {
+    int id = luaL_checkinteger(L, 1);
+    xThread* thr = xthread_get(id);
+    if (!thr) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xthread.shutdown_thread: thread %d not found", id);
+        return 2;
+    }
+
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    xthread_unregister(id);
+    if (td && td->owner_L == L && td->sentinel_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, td->sentinel_ref);
+        td->sentinel_ref = LUA_NOREF;
+    }
+    XLOGI("xthread.shutdown_thread: unregistered thread %d", id);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* ============================================================================
 ** Module registration
 ** ========================================================================== */
 
 static const luaL_Reg xthread_funcs[] = {
-    { "init",       l_xthread_init },
-    { "post",       l_xthread_post },
-    { "rpc",        l_xthread_rpc  },
-    { "current_id", l_current_id   },
+    { "init",             l_xthread_init },
+    { "post",             l_xthread_post },
+    { "rpc",              l_xthread_rpc  },
+    { "current_id",       l_current_id   },
+    { "create_thread",    l_xthread_create_thread },
+    { "shutdown_thread",  l_xthread_shutdown_thread },
     { NULL, NULL }
 };
 
@@ -555,6 +975,12 @@ static const struct { const char* name; int val; } THREAD_CONSTS[] = {
 **   -- load thread_router.lua so __exports is available
 **   xthread.init()   -- or xthread.init(my_handler) */
 LUALIB_API int luaopen_xthread(lua_State* L) {
+    /* Create ThreadData metatable on first load */
+    luaL_newmetatable(L, THREAD_DATA_META);
+    lua_pushcfunction(L, thread_data_gc);
+    lua_setfield(L, -2, "__gc");
+    lua_pop(L, 1);
+
     luaL_newlib(L, xthread_funcs);
 
     for (int i = 0; THREAD_CONSTS[i].name; i++) {

@@ -57,7 +57,7 @@ typedef enum {
 } ThreadSelStrategy;
 
 /* ============================================================================
-** Global init / uninit
+** Global init / uninit, Must be called after xpoll_init if using xpoll
 ** ========================================================================== */
 bool xthread_init  (void);
 void xthread_uninit(void);
@@ -72,6 +72,16 @@ bool xthread_register(int id, const char* name,
                       void (*on_init)   (xThread*),
                       void (*on_update) (xThread*),
                       void (*on_cleanup)(xThread*));
+
+/* Register a worker thread with userdata – creates a new OS thread.
+** on_init / on_update / on_cleanup run inside the new thread.
+** The userdata pointer is stored with the thread and can be retrieved
+** via xthread_get_userdata(). */
+bool xthread_register_ex(int id, const char* name,
+                         void (*on_init)   (xThread*),
+                         void (*on_update) (xThread*),
+                         void (*on_cleanup)(xThread*),
+                         void* userdata);
 
 /* Register a thread group (base_id … base_id+count-1). */
 bool xthread_register_group(int base_id, int count,

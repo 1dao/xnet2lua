@@ -1,11 +1,18 @@
 -- xlua_thread.lua - COMPUTE thread Lua script
--- Called by xlua_test C program on COMPUTE thread
+-- Now returned as a definition table for xthread.create_thread
+-- When dynamically created from Lua, this module returns:
+--   {
+--     __init = function() end,        -- called after thread starts
+--     __update = function() end,      -- called each xthread_update
+--     __uninit = function() end,      -- called before thread exit
+--     __thread_handle = function() end -- message handler
+--   }
 
--- print thread id for debug
 print('[COMPUTE] Current thread id = ' .. xthread.current_id())
 
 -- Default sync thread message handler
 -- This handles POST and RPC dispatch to registered stubs
+-- All handlers run in coroutines so they can yield for nested RPC calls
 _stubs = {}
 _thread_replys = {}
 
@@ -13,7 +20,7 @@ function xthread.register(pt, h)
     _stubs[pt] = h
 end
 
-function __thread_handle__(reply_router, k1, k2, k3, ...)
+local function __thread_handle(reply_router, k1, k2, k3, ...)
     if not reply_router then
         -- POST形式消息 [k1:pt]
         local h = _stubs[k1]
@@ -67,7 +74,7 @@ xthread.register('add', function(a, b)
 end)
 
 -- RPC handler: multiply, then call back to main thread
--- Thanks to coroutine wrapping in __thread_handle__, this can do RPC
+-- Thanks to coroutine wrapping in __thread_handle, this can do RPC
 -- calls that yield just fine
 xthread.register('multiply_and_callback', function(a, b)
     print('[COMPUTE] multiply_and_callback() called: a=', a, 'b=', b)
@@ -84,4 +91,38 @@ xthread.register('multiply_and_callback', function(a, b)
     end
 end)
 
-print('[COMPUTE] All handlers registered')
+-- -----------------------------------------------------------------------------
+-- Lifecycle callbacks for dynamic thread creation
+-- -----------------------------------------------------------------------------
+
+local function __init()
+    print('[COMPUTE] __init: thread starting')
+    -- xthread.init will be called automatically by the dynamic creation
+    -- We just do any additional thread-specific initialization here
+    print('[COMPUTE] All handlers registered')
+end
+
+local function __update()
+    -- Process pending messages - xthread already handles this via xthread_update
+    -- We don't need to do anything here unless we have per-frame processing
+end
+
+local function __uninit()
+    print('[COMPUTE] __uninit: thread shutting down')
+end
+
+-- -----------------------------------------------------------------------------
+-- Return the definition table for xthread.create_thread
+-- This includes all callbacks following the Lua script convention
+-- -----------------------------------------------------------------------------
+local function sinking()
+    return {
+        __init = __init,
+        __update = __update,
+        __uninit = __uninit,
+        __thread_handle = __thread_handle,
+    }
+end
+
+-- sinking
+do return sinking() end

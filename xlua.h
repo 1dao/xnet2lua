@@ -2,7 +2,12 @@
 #ifndef _LUA_XTHREAD_H
 #define _LUA_XTHREAD_H
 
-#include <lua.h>
+#if defined(LUA_EMBEDDED)
+#include "3rd/minilua.h"
+#else
+#include "lua.h"
+#include "lauxlib.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {

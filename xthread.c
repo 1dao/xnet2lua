@@ -103,6 +103,8 @@ static xThread* _threads[XTHR_MAX];
 static xMutex   _lock;
 static bool     _init = false;
 
+void xthread_wakeup_uninit(void);
+
 #ifdef _WIN32
 static DWORD _tls = TLS_OUT_OF_INDEXES;
 #else
@@ -366,6 +368,14 @@ int xthread_wakeup_init() {
 
     xPollState* poll = xpoll_get_default();
 
+    if (ctx->poll) {
+        if (ctx->poll == poll) {
+            process_tasks(ctx);
+            return 0;
+        }
+        xthread_wakeup_uninit();
+    }
+
     if (poll) {
         /* ── fd-based wakeup ─────────────────────────────────── */
 #ifdef _WIN32
@@ -575,10 +585,11 @@ void xthread_uninit(void) {
     _init = false;
 }
 
-bool xthread_register(int id, const char* name,
+bool xthread_register_ex(int id, const char* name,
                       void (*on_init)   (xThread*),
                       void (*on_update) (xThread*),
-                      void (*on_cleanup)(xThread*)) {
+                      void (*on_cleanup)(xThread*)
+                      , void* userdata) {
     if (id <= 0 || id >= XTHR_MAX || !_init) return false;
 
     xnet_mutex_lock(&_lock);
@@ -593,7 +604,7 @@ bool xthread_register(int id, const char* name,
     ctx->on_init    = on_init;
     ctx->on_update  = on_update;
     ctx->on_cleanup = on_cleanup;
-    ctx->userdata   = NULL;
+    ctx->userdata   = userdata;
     ctx->group      = NULL;
     ctx->poll       = NULL;
     ctx->notify_wfd = INVALID_SOCKET;
@@ -629,6 +640,14 @@ bool xthread_register(int id, const char* name,
 
     xnet_mutex_unlock(&_lock);
     return true;
+}
+
+bool xthread_register(int id, const char* name,
+                      void (*on_init)   (xThread*),
+                      void (*on_update) (xThread*),
+                      void (*on_cleanup)(xThread*))
+{
+    return xthread_register_ex(id, name, on_init, on_update, on_cleanup, NULL);
 }
 
 void xthread_unregister(int id) {
@@ -686,7 +705,10 @@ int xthread_update(int timeout_ms) {
     bool empty = (ctx->queue.size == 0);
     xnet_mutex_unlock(&ctx->queue.lock);
 
-    if (empty) xqueue_wait(&ctx->queue, timeout_ms);
+    if (empty) {
+        xqueue_wait(&ctx->queue, timeout_ms);
+        n += process_tasks(ctx);
+    }
     return n;
 }
 
@@ -761,7 +783,7 @@ bool xthread_pool_add_thread(xThreadPool* pool, xThread* thread) {
     atomic_store(&pool->queue_sizes[count], 0);
     atomic_store(&pool->thread_count, count + 1);
     XLOGI("Thread[%d:%s] added to pool[%d:%s]",
-          thread->id, thread->name ? thread->name : "unnamed",
+          thread->id, thread->name[0] ? thread->name : "unnamed",
           pool->group_id, pool->name);
     return true;
 }

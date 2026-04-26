@@ -1,5 +1,11 @@
 -- xlua_main.lua - MAIN thread Lua script
 -- Called by xlua_test C main program
+-- Now follows the same pattern as dynamically created threads:
+-- Returns a definition table with lifecycle callbacks and message handler
+-- All tests run in a coroutine from __init, exits via xthread.stop() when done
+
+local COMPUTE_THREAD_ID = 99 -- Keep below XTHR_MAX
+local compute_thread_running = false
 
 print('[MAIN] Current thread id = ' .. xthread.current_id())
 
@@ -13,7 +19,7 @@ function xthread.register(pt, h)
     _stubs[pt] = h
 end
 
-function __thread_handle__(reply_router, k1, k2, k3, ...)
+local function __thread_handle(reply_router, k1, k2, k3, ...)
     if not reply_router then
         -- POST形式消息 [k1:pt]
         local h = _stubs[k1]
@@ -49,7 +55,7 @@ function __thread_handle__(reply_router, k1, k2, k3, ...)
     local co = coroutine.create(function(...)
         -- Capture all results from pcall
         if not reply(k1, k2, k3, pcall(h, ...)) then
-            io.stderr:write('[COMPUTE] thread message route failed! reply_router: ' .. tostring(reply_router) .. ' pt: ' .. tostring(k3) .. '\n')
+            io.stderr:write('[MAIN] thread message route failed! reply_router: ' .. tostring(reply_router) .. ' pt: ' .. tostring(k3) .. '\n')
         end
     end)
     coroutine.resume(co, ...)
@@ -60,15 +66,34 @@ xthread.register('reverse_string', function(s)
     print('[MAIN] reverse_string() called: ' .. s)
     local reversed = string.reverse(s)
     return reversed
+    -- return 'aa', 'bb', 12345
 end)
 
+local check_results
+
+local function shutdown_compute_thread()
+    if not compute_thread_running then
+        return true
+    end
+
+    local ok, err = xthread.shutdown_thread(COMPUTE_THREAD_ID)
+    if not ok then
+        io.stderr:write('[MAIN] Failed to shutdown compute thread: ' .. tostring(err) .. '\n')
+        return false
+    end
+
+    compute_thread_running = false
+    print('[MAIN] Compute thread shutdown complete')
+    return true
+end
+
 -- Test function that runs all tests
-function run_tests()
+local function run_tests()
     print('\n===== Starting tests =====')
 
     -- Test 1: POST fire-and-forget
     print('\n[Test 1] POST from MAIN to COMPUTE')
-    local ok, err = xthread.post(xthread.COMPUTE, 'print_message', 'Hello from MAIN!')
+    local ok, err = xthread.post(COMPUTE_THREAD_ID, 'print_message', 'Hello from MAIN (dynamically created)!')
     if not ok then
         print('[MAIN] POST failed: ' .. err)
     else
@@ -77,9 +102,9 @@ function run_tests()
 
     -- Test 2: RPC add
     print('\n[Test 2] RPC add(123, 456) from MAIN to COMPUTE')
-    local co = coroutine.create(function()
-        print("[MAIN] multi result:", xthread.rpc(xthread.COMPUTE, 'add', 123, 456))
-        local ok, result = xthread.rpc(xthread.COMPUTE, 'add', 123, 456)
+    do
+        print("[MAIN] multi result:", xthread.rpc(COMPUTE_THREAD_ID, 'add', 123, 456))
+        local ok, result = xthread.rpc(COMPUTE_THREAD_ID, 'add', 123, 456)
         if ok then
             print('[MAIN] RPC result: 123 + 456 = ' .. result)
             TEST_add_result = result
@@ -87,13 +112,12 @@ function run_tests()
             print('[MAIN] RPC failed: ' .. tostring(result))
             TEST_add_result = nil
         end
-    end)
-    coroutine.resume(co)
+    end
 
     -- Test 3: RPC with callback back to MAIN
     print('\n[Test 3] RPC multiply_and_callback(12, 34) from MAIN to COMPUTE')
-    local co2 = coroutine.create(function()
-        local ok, product, reversed = xthread.rpc(xthread.COMPUTE, 'multiply_and_callback', 12, 34)
+    do
+        local ok, product, reversed = xthread.rpc(COMPUTE_THREAD_ID, 'multiply_and_callback', 12, 34)
         if ok then
             print('[MAIN] RPC result: 12 * 34 = ' .. product)
             print('[MAIN] Reversed product from MAIN: ' .. reversed)
@@ -103,10 +127,15 @@ function run_tests()
             print('[MAIN] RPC failed: ' .. tostring(product))
             TEST_multiply_result = nil
         end
-    end)
-    coroutine.resume(co2)
+    end
 
-    print('\n[MAIN] All tests dispatched, waiting for completion...')
+    -- Check and print results
+    local all_ok = check_results()
+    local shutdown_ok = shutdown_compute_thread()
+
+    -- Tell C to exit
+    print('[MAIN] All tests completed, requesting exit...')
+    xthread.stop((all_ok and shutdown_ok) and 0 or 1)
 end
 
 -- Check test results
@@ -139,4 +168,54 @@ function check_results()
     return all_ok
 end
 
-print('[MAIN] Lua initialized, ready')
+-- -----------------------------------------------------------------------------
+-- Lifecycle callbacks for main thread (following same pattern as dynamic threads)
+-- -----------------------------------------------------------------------------
+
+local function __init()
+    print('[MAIN] __init: thread starting')
+
+    -- Create compute thread dynamically from Lua
+    -- This creates a new OS thread with its own independent Lua state
+    -- The script will be loaded and executed in the new thread's own Lua state
+    print('[MAIN] Creating compute thread dynamically via xthread.create_thread...')
+    local ok, err = xthread.create_thread(COMPUTE_THREAD_ID, 'dynamic-compute', 'demo/xlua_thread.lua')
+
+    if not ok then
+        error('[MAIN] Failed to create compute thread: ' .. tostring(err))
+    end
+    compute_thread_running = true
+    print('[MAIN] Compute thread created successfully, waiting for it to initialize...')
+
+    -- Launch once; xthread.rpc will yield and C will resume it on reply.
+    _test_coroutine = coroutine.create(run_tests)
+    local ok, err = coroutine.resume(_test_coroutine)
+    if not ok then
+        io.stderr:write('[MAIN] test coroutine error: ' .. tostring(err) .. '\n')
+        shutdown_compute_thread()
+        xthread.stop(1)
+    end
+end
+
+local function __update()
+end
+
+local function __uninit()
+    shutdown_compute_thread()
+    print('[MAIN] __uninit: thread shutting down')
+end
+
+-- -----------------------------------------------------------------------------
+-- Return the definition table following the same convention as xlua_thread.lua
+-- -----------------------------------------------------------------------------
+local function sinking()
+    return {
+        __init = __init,
+        __update = __update,
+        __uninit = __uninit,
+        __thread_handle = __thread_handle,
+    }
+end
+
+-- sinking
+do return sinking() end

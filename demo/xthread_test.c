@@ -87,6 +87,7 @@ static void test_task_func(xThread* thr, void* arg) {
 
 /* Producer thread that posts tasks to worker pool */
 static void producer_task_func(xThread* thr, void* arg) {
+    (void)thr;
     int producer_id = *(int*)arg;
     int tasks_per_producer = 5;
 
@@ -182,7 +183,6 @@ static int test_thread_pool_round_robin(void) {
     /* Process tasks on main thread (since we registered main thread) */
     printf("[MAIN] Processing tasks...\n");
     int processed;
-    int timeout_sec = 30;
     int waited = 0;
     do {
         processed = xthread_update(300);
