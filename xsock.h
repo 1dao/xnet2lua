@@ -144,7 +144,7 @@ static inline int socket_set_nonblocking(SOCKET_T sock) {
 
 static inline BOOL socket_check_eagain(void) {
     int err = GET_ERRNO();
-    return err == WSAEWOULDBLOCK || err == WSAEINTR;
+    return err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS;
 }
 
 static inline long64 time_get_ms(void) {
@@ -168,7 +168,7 @@ static inline int socket_set_nonblocking(SOCKET_T sock) {
 
 static inline BOOL socket_check_eagain(void) {
     int err = GET_ERRNO();
-    return err == EWOULDBLOCK || err == EAGAIN || err == EINTR;
+    return err == EWOULDBLOCK || err == EAGAIN || err == EINTR || err == EINPROGRESS;
 }
 
 static inline long64 time_get_ms(void) {

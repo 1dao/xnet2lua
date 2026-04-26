@@ -18,6 +18,7 @@
 /* cmsgpack is statically linked */
 LUA_API int luaopen_cmsgpack(lua_State *L);
 LUA_API int luaopen_xthread(lua_State *L);
+LUA_API int luaopen_xnet(lua_State *L);
 
 typedef struct {
     lua_State* L;
@@ -71,6 +72,9 @@ static MainLuaData* main_init(void) {
     lua_pop(data->L, 1);
 
     luaL_requiref(data->L, "xthread", luaopen_xthread, 1);
+    lua_pop(data->L, 1);
+
+    luaL_requiref(data->L, "xnet", luaopen_xnet, 1);
     lua_pop(data->L, 1);
 
     XLOGI("[main] loading script 'demo/xlua_main.lua'");

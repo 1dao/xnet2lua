@@ -27,7 +27,7 @@ else
 endif
 
 # 3. Source Files (Ensure these files exist in the same directory)
-SRCS = xargs.c xpoll.c xsock.c xthread.c xtimer.c
+SRCS = xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c
 OBJS = $(addprefix $(OBJ_DIR)/, $(notdir $(SRCS:.c=.o)))
 
 # 4. Build Rules
