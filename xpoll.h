@@ -1,7 +1,7 @@
 #ifndef XPOLL_H
 #define XPOLL_H
 
-#include "socket_util.h"
+#include "xsock.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
