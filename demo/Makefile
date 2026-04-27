@@ -11,32 +11,29 @@ ifeq ($(OS),Windows_NT)
     # MinGW on Windows
     LDFLAGS += -lws2_32
     EXT := .exe
+    RM := /usr/bin/rm -f
 else
     # Linux
     LDFLAGS += -lpthread
     EXT :=
+    RM := rm -f
 endif
 
 # Targets
 TARGET := xthread_test$(EXT)
-XLUA_TARGET := xlua_test$(EXT)
-XNET_TARGET := xnet_test$(EXT)
+XNET_TARGET := xnet$(EXT)
 
-all: $(TARGET) $(XLUA_TARGET) $(XNET_TARGET)
+all: $(TARGET) $(XNET_TARGET)
 
 # Compile directly with all source files
 $(TARGET): xthread_test.c ../xthread.c ../xpoll.c ../xsock.c
 	$(CC) $(CFLAGS) -I.. -o $@ xthread_test.c ../xthread.c ../xpoll.c ../xsock.c $(LDFLAGS)
 
-# xthread Lua test - uses embedded minilua.h from 3rd/
-# No external Lua dependency required - cmsgpack is statically linked
-xlua_test$(EXT): xlua_test.c ../xthread.c ../xpoll.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a
-	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xlua_test.c ../xthread.c ../xpoll.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
-
-xnet_test$(EXT): xnet_test.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a
-	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xnet_test.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
+# Generic Lua runner - pass the Lua main file at runtime.
+xnet$(EXT): xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a
+	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
 
 clean:
-	rm -f $(TARGET) $(XLUA_TARGET) $(XNET_TARGET) *.o
+	$(RM) $(TARGET) $(XNET_TARGET) xlua_test$(EXT) xnet_test$(EXT) xredis_test$(EXT) *.o
 
 .PHONY: all clean
