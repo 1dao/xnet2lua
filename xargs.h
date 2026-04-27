@@ -12,6 +12,7 @@ typedef struct {
 } xArgsCFG;
 
 void xargs_init(xArgsCFG* configs, int count, int argc, char* argv[]);
+int  xargs_load_config(const char* filepath);
 void xargs_cleanup();
 
 const char* xargs_get(const char* key);

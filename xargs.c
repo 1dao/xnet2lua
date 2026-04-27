@@ -277,6 +277,80 @@ const char* xargs_get(const char* key) {
     return val ? val : getenv(key);
 }
 
+/* ---------- config file parser ----------
+ * Format (per line):
+ *   key=value          plain assignment
+ *   key=value  # note  inline comment
+ *   # whole line       full-line comment
+ *   (blank lines are ignored)
+ *
+ * Rules:
+ *   - Leading/trailing whitespace is stripped from both key and value.
+ *   - The first unquoted '#' ends the value; everything after is comment.
+ *   - Config values do NOT override values already set by argv (argv wins).
+ *     Change the hash_get guard below if you want the opposite behaviour.
+ *
+ * Returns: 0 on success, -1 if the file cannot be opened.
+ */
+int xargs_load_config(const char* filepath) {
+    FILE* fp = fopen(filepath, "r");
+    if (!fp) return -1;
+
+    hash_init();
+
+    char line[4096];
+    while (fgets(line, sizeof(line), fp)) {
+        /* ---- strip newline ---- */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+            line[--len] = '\0';
+
+        /* ---- skip leading whitespace ---- */
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+
+        /* ---- skip blank lines and full-line comments ---- */
+        if (*p == '\0' || *p == '#') continue;
+
+        /* ---- locate '=' ---- */
+        char* eq = strchr(p, '=');
+        if (!eq) continue;   /* no '=', not a valid assignment */
+
+        /* ---- extract key (trim right) ---- */
+        char* key_end = eq - 1;
+        while (key_end >= p && (*key_end == ' ' || *key_end == '\t'))
+            key_end--;
+        size_t key_len = (size_t)(key_end - p + 1);
+        if (key_len == 0) continue;
+
+        char key[256];
+        if (key_len >= sizeof(key)) key_len = sizeof(key) - 1;
+        memcpy(key, p, key_len);
+        key[key_len] = '\0';
+
+        /* ---- extract value: start after '=', trim left ---- */
+        char* val = eq + 1;
+        while (*val == ' ' || *val == '\t') val++;
+
+        /* ---- strip inline comment: first '#' ends the value ---- */
+        char* comment = strchr(val, '#');
+        if (comment) *comment = '\0';
+
+        /* ---- trim right of value ---- */
+        size_t val_len = strlen(val);
+        while (val_len > 0 && (val[val_len - 1] == ' ' || val[val_len - 1] == '\t'))
+            val[--val_len] = '\0';
+
+        /* ---- store: argv already set this key → skip (argv wins) ---- */
+        if (hash_get(key) == NULL) {
+            hash_set(key, val);
+        }
+    }
+
+    fclose(fp);
+    return 0;
+}
+
 void xargs_cleanup() {
     for (int i = 0; i < HASH_SIZE; i++) {
         HashNode* node = hash_table[i];
