@@ -6,6 +6,7 @@
 **   not in executable command-line options.
 **
 ** Usage:
+**   xnet.exe demo/xmysql_main.lua
 **   xnet.exe demo/xredis_main.lua
 **   xnet.exe demo/xnet_main.lua
 **   xnet.exe demo/xlua_main.lua
