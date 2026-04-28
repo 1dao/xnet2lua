@@ -319,17 +319,24 @@ static void notify_read_cb(SOCKET_T fd, int mask, void* clientData) {
 static void xthread_notify(xThread* target, bool need_notify) {
     if (!need_notify) return;
 
-    if (target->poll) {
+    if (target->poll && target->notify_wfd != INVALID_SOCKET_VAL) {
         /* Poke the poll fd */
         char c = '!';
 #ifdef _WIN32
-        if (send((SOCKET)target->notify_wfd, &c, 1, 0) < 0)
-            XLOGE("Thread[%d:%s] notify send failed: %d",
-                  target->id, target->name, WSAGetLastError());
+        if (send((SOCKET)target->notify_wfd, &c, 1, 0) < 0) {
+            int err = WSAGetLastError();
+            if (atomic_load(&target->running)) {
+                XLOGE("Thread[%d:%s] notify send failed: %d",
+                      target->id, target->name, err);
+            }
+        }
 #else
-        if (write((int)target->notify_wfd, &c, 1) < 0 && errno != EAGAIN)
-            XLOGE("Thread[%d:%s] notify write failed: %s",
-                  target->id, target->name, strerror(errno));
+        if (write((int)target->notify_wfd, &c, 1) < 0 && errno != EAGAIN) {
+            if (atomic_load(&target->running)) {
+                XLOGE("Thread[%d:%s] notify write failed: %s",
+                      target->id, target->name, strerror(errno));
+            }
+        }
 #endif
     } else {
         /* Signal the blocking primitive */

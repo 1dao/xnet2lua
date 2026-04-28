@@ -27,6 +27,8 @@ extern "C" {
 #define XTHR_LOG            4   /* logging thread               */
 #define XTHR_IO             5   /* generic I/O thread           */
 #define XTHR_COMPUTE        6   /* compute thread               */
+#define XTHR_NATS           7   /* NATS I/O thread              */
+#define XTHR_HTTP           8   /* HTTP/HTTPS service thread    */
 #define XTHR_WORKER_GRP1    10  /* worker group 1 base          */
 #define XTHR_WORKER_GRP2    30  /* worker group 2 base          */
 #define XTHR_WORKER_GRP3    50  /* worker group 3 base          */
@@ -101,6 +103,12 @@ xThread* xthread_current   (void);
 
 /* Process all queued tasks on the calling thread (main / poll-driven use). */
 int xthread_update(int timeout_ms);
+
+/* Re-arm the calling thread's wakeup backend.
+** Call after xpoll_init() if the thread was already registered before the
+** poll instance existed. */
+int  xthread_wakeup_init(void);
+void xthread_wakeup_uninit(void);
 
 /* ============================================================================
 ** Cross-thread task posting

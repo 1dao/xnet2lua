@@ -7,6 +7,7 @@
 **
 ** Usage:
 **   xnet.exe demo/xnats_main.lua SERVER_NAME=game1
+**   xnet.exe demo/xhttp_main.lua
 **   xnet.exe demo/xmysql_main.lua
 **   xnet.exe demo/xredis_main.lua
 **   xnet.exe demo/xnet_main.lua
@@ -23,6 +24,14 @@
 #include "xargs.h"
 #include "xlog.h"
 #include "xthread.h"
+
+#ifndef XNET_WITH_HTTP
+#define XNET_WITH_HTTP 1
+#endif
+
+#ifndef XNET_WITH_HTTPS
+#define XNET_WITH_HTTPS 0
+#endif
 
 LUA_API int luaopen_cmsgpack(lua_State *L);
 LUA_API int luaopen_xthread(lua_State *L);
@@ -54,6 +63,14 @@ static xArgsCFG g_arg_configs[] = {
     { 0,   "NATS_TEST_TIMEOUT_SEC", NULL, 0 },
     { 0,   "NATS_TEST_HOLD_SEC", NULL, 0 },
     { 0,   "NATS_TEST_PEER", NULL, 0 },
+    { 0,   "HTTP_ENABLE", NULL, 0 },
+    { 0,   "HTTP_HOST", NULL, 0 },
+    { 0,   "HTTP_PORT", NULL, 0 },
+    { 0,   "HTTP_WORKERS", NULL, 0 },
+    { 0,   "HTTPS_ENABLE", NULL, 0 },
+    { 0,   "HTTPS_PORT", NULL, 0 },
+    { 0,   "HTTPS_CERT", NULL, 0 },
+    { 0,   "HTTPS_KEY", NULL, 0 },
     { 0,   "REDIS_HOST", NULL, 0 },
     { 0,   "REDIS_PORT", NULL, 0 },
     { 0,   "REDIS_DB", NULL, 0 },
@@ -110,6 +127,12 @@ static void set_runner_globals(lua_State* L) {
     if (g_process_name) lua_pushstring(L, g_process_name);
     else lua_pushnil(L);
     lua_setglobal(L, "XNET_PROCESS_NAME");
+
+    lua_pushboolean(L, XNET_WITH_HTTP ? 1 : 0);
+    lua_setglobal(L, "XNET_WITH_HTTP");
+
+    lua_pushboolean(L, XNET_WITH_HTTPS ? 1 : 0);
+    lua_setglobal(L, "XNET_WITH_HTTPS");
 
     lua_newtable(L);
     lua_pushstring(L, g_main_file);
