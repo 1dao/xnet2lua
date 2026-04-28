@@ -19,6 +19,7 @@
 #include "xchannel.h"
 #include "xpoll.h"
 #include "xthread.h"
+#include "xargs.h"
 #include "xlog.h"
 
 #ifndef lua_absindex
@@ -808,6 +809,32 @@ static int l_xnet_connect(lua_State* L) {
     return 1;
 }
 
+static int l_xnet_load_config(lua_State* L) {
+    const char* path = luaL_checkstring(L, 1);
+    if (xargs_load_config(path) != 0) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "load config failed: %s", path);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_xnet_get_config(lua_State* L) {
+    const char* key = luaL_checkstring(L, 1);
+    const char* value = xargs_get(key);
+    if (value) {
+        lua_pushstring(L, value);
+        return 1;
+    }
+    if (lua_gettop(L) >= 2) {
+        lua_pushvalue(L, 2);
+        return 1;
+    }
+    lua_pushnil(L);
+    return 1;
+}
+
 static const luaL_Reg conn_methods[] = {
     { "fd",          l_conn_fd },
     { "peer",        l_conn_peer },
@@ -837,6 +864,8 @@ static const luaL_Reg xnet_funcs[] = {
     { "connect", l_xnet_connect },
     { "attach",  l_xnet_attach },
     { "connect_fd", l_xnet_attach },
+    { "load_config", l_xnet_load_config },
+    { "get_config",  l_xnet_get_config },
     { NULL, NULL }
 };
 

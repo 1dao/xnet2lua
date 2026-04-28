@@ -30,8 +30,8 @@ $(TARGET): xthread_test.c ../xthread.c ../xpoll.c ../xsock.c
 	$(CC) $(CFLAGS) -I.. -o $@ xthread_test.c ../xthread.c ../xpoll.c ../xsock.c $(LDFLAGS)
 
 # Generic Lua runner - pass the Lua main file at runtime.
-xnet$(EXT): xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a
-	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
+xnet$(EXT): xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a
+	$(CC) $(CFLAGS) -DLUA_EMBEDDED -I.. -o $@ xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_cmsgpack.c ../libxsock.a $(LDFLAGS)
 
 clean:
 	$(RM) $(TARGET) $(XNET_TARGET) xlua_test$(EXT) xnet_test$(EXT) xredis_test$(EXT) *.o

@@ -190,7 +190,20 @@ void xargs_init(xArgsCFG* configs, int count, int argc, char* argv[]) {
         } else if (arg[0] == '-' && arg[1]) {
             used = parse_arg(arg, i, argc, argv, 0);
         } else {
-            add_to_other(arg);
+            char* eq = strchr(arg, '=');
+            if (eq) {
+                *eq = '\0';
+                xArgsCFG* c = find_config(arg);
+                if (c) {
+                    set_config_value(c, eq + 1);
+                    *eq = '=';
+                } else {
+                    *eq = '=';
+                    add_to_other(arg);
+                }
+            } else {
+                add_to_other(arg);
+            }
         }
     }
 

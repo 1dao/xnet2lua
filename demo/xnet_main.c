@@ -2,10 +2,11 @@
 **
 ** xnet test mode:
 **   Build this file once into xnet.exe, then run any Lua test by passing the
-**   test's main script. Per-test configuration belongs in that Lua main file,
-**   not in executable command-line options.
+**   test's main script. Shared service configuration can be loaded by Lua via
+**   xnet.load_config(); SERVER_NAME can be supplied after the main script.
 **
 ** Usage:
+**   xnet.exe demo/xnats_main.lua SERVER_NAME=game1
 **   xnet.exe demo/xmysql_main.lua
 **   xnet.exe demo/xredis_main.lua
 **   xnet.exe demo/xnet_main.lua
@@ -39,6 +40,29 @@ typedef struct {
 static volatile bool g_running = false;
 static int g_exit_code = 0;
 static const char* g_main_file = NULL;
+static int g_script_argc = 0;
+static char** g_script_argv = NULL;
+static const char* g_process_name = NULL;
+
+static xArgsCFG g_arg_configs[] = {
+    { 'c', "config", NULL, 0 },
+    { 0,   "SERVER_NAME", NULL, 0 },
+    { 0,   "NATS_HOST", NULL, 0 },
+    { 0,   "NATS_PORT", NULL, 0 },
+    { 0,   "NATS_PREFIX", NULL, 0 },
+    { 0,   "NATS_TEST_DELAY_SEC", NULL, 0 },
+    { 0,   "NATS_TEST_TIMEOUT_SEC", NULL, 0 },
+    { 0,   "NATS_TEST_HOLD_SEC", NULL, 0 },
+    { 0,   "NATS_TEST_PEER", NULL, 0 },
+    { 0,   "REDIS_HOST", NULL, 0 },
+    { 0,   "REDIS_PORT", NULL, 0 },
+    { 0,   "REDIS_DB", NULL, 0 },
+    { 0,   "MYSQL_HOST", NULL, 0 },
+    { 0,   "MYSQL_PORT", NULL, 0 },
+    { 0,   "MYSQL_USER", NULL, 0 },
+    { 0,   "MYSQL_PASSWORD", NULL, 0 },
+    { 0,   "MYSQL_DATABASE", NULL, 0 },
+};
 
 static int l_xthread_stop(lua_State* L) {
     if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
@@ -82,6 +106,19 @@ static void install_stop(lua_State* L) {
 static void set_runner_globals(lua_State* L) {
     lua_pushstring(L, g_main_file);
     lua_setglobal(L, "XNET_MAIN_FILE");
+
+    if (g_process_name) lua_pushstring(L, g_process_name);
+    else lua_pushnil(L);
+    lua_setglobal(L, "XNET_PROCESS_NAME");
+
+    lua_newtable(L);
+    lua_pushstring(L, g_main_file);
+    lua_rawseti(L, -2, 0);
+    for (int i = 0; i < g_script_argc; i++) {
+        lua_pushstring(L, g_script_argv[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setglobal(L, "arg");
 }
 
 static void call_xthread_init(MainLuaData* data) {
@@ -241,15 +278,21 @@ static void main_uninit(MainLuaData* data) {
 int main(int argc, char** argv) {
     console_set_consolas_font();
 
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s <main.lua>\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s <main.lua> [SERVER_NAME=name]\n", argv[0]);
         return 2;
     }
 
     g_main_file = argv[1];
+    g_script_argc = argc - 2;
+    g_script_argv = (argc > 2) ? &argv[2] : NULL;
+    xargs_init(g_arg_configs, (int)(sizeof(g_arg_configs) / sizeof(g_arg_configs[0])),
+               argc - 1, &argv[1]);
+    g_process_name = xargs_get("SERVER_NAME");
 
     if (!xthread_init()) {
         XLOGE("[xnet] xthread_init failed");
+        xargs_cleanup();
         return 1;
     }
 
@@ -257,6 +300,7 @@ int main(int argc, char** argv) {
     MainLuaData* data = main_init();
     if (!data) {
         xthread_uninit();
+        xargs_cleanup();
         return g_exit_code ? g_exit_code : 1;
     }
 
@@ -266,5 +310,6 @@ int main(int argc, char** argv) {
 
     main_uninit(data);
     xthread_uninit();
+    xargs_cleanup();
     return g_exit_code;
 }

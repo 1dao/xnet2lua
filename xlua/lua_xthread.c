@@ -961,6 +961,7 @@ static const struct { const char* name; int val; } THREAD_CONSTS[] = {
     { "LOG",         XTHR_LOG         },
     { "IO",          XTHR_IO          },
     { "COMPUTE",     XTHR_COMPUTE     },
+    { "NATS",        XTHR_NATS        },
     { "WORKER_GRP1", XTHR_WORKER_GRP1 },
     { "WORKER_GRP2", XTHR_WORKER_GRP2 },
     { "WORKER_GRP3", XTHR_WORKER_GRP3 },
