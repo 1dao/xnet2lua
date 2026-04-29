@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 
 #if defined(LUA_EMBEDDED)
 #include "../3rd/minilua.h"
@@ -21,6 +22,11 @@
 #include "xthread.h"
 #include "xargs.h"
 #include "xlog.h"
+#include "lua_xnet_tls.h"
+
+#ifndef XNET_WITH_HTTPS
+#define XNET_WITH_HTTPS 0
+#endif
 
 #ifndef lua_absindex
 #define lua_absindex(L, i) \
@@ -457,6 +463,20 @@ static int l_conn_send_raw(lua_State* L) {
     return 1;
 }
 
+static int l_conn_send_file_response(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    size_t header_len = 0;
+    const char* header = luaL_checklstring(L, 2, &header_len);
+    const char* path = luaL_checkstring(L, 3);
+    lua_Integer offset = luaL_optinteger(L, 4, 0);
+    lua_Integer length = luaL_optinteger(L, 5, -1);
+
+    lua_pushboolean(L, c->ch && !c->closed &&
+                       xchannel_send_file_raw(c->ch, header, header_len, path,
+                           (long long)offset, (long long)length) == 0);
+    return 1;
+}
+
 static int l_conn_send_packet(lua_State* L) {
     return l_conn_send(L);
 }
@@ -843,6 +863,7 @@ static const luaL_Reg conn_methods[] = {
     { "send",        l_conn_send },
     { "send_raw",    l_conn_send_raw },
     { "send_packet", l_conn_send_packet },
+    { "send_file_response", l_conn_send_file_response },
     { "set_handler", l_conn_set_handler },
     { "set_framing", l_conn_set_framing },
     { NULL, NULL }
@@ -864,6 +885,9 @@ static const luaL_Reg xnet_funcs[] = {
     { "connect", l_xnet_connect },
     { "attach",  l_xnet_attach },
     { "connect_fd", l_xnet_attach },
+#if XNET_WITH_HTTPS
+    { "attach_tls", l_xnet_attach_tls },
+#endif
     { "load_config", l_xnet_load_config },
     { "get_config",  l_xnet_get_config },
     { NULL, NULL }
@@ -887,6 +911,10 @@ LUALIB_API int luaopen_xnet(lua_State* L) {
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);
+
+#if XNET_WITH_HTTPS
+    lua_xnet_tls_register(L);
+#endif
 
     luaL_newlib(L, xnet_funcs);
     lua_pushinteger(L, XPOLL_READABLE);

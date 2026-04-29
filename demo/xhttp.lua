@@ -52,6 +52,9 @@ local function normalize_config(cfg)
         server_name = cfg.server_name or cfg.name or 'xnet-http',
         worker_script = cfg.worker_script or DEFAULT_WORKER_SCRIPT,
         app_script = cfg.app_script or DEFAULT_APP_SCRIPT,
+        cert_file = cfg.cert_file or cfg.cert or '',
+        key_file = cfg.key_file or cfg.key or '',
+        key_password = cfg.key_password or cfg.password or '',
         max_request_size = tonumber(cfg.max_request_size) or 16 * 1024 * 1024,
         workers = build_workers(cfg),
     }
@@ -87,7 +90,9 @@ function M.start(cfg)
         return false, 'HTTPS support is not compiled in; rebuild with WITH_HTTPS=1'
     end
     if conf.https then
-        return false, 'HTTPS transport is not implemented yet'
+        if conf.cert_file == '' or conf.key_file == '' then
+            return false, 'HTTPS requires cert_file and key_file'
+        end
     end
 
     workers = {}
@@ -102,7 +107,8 @@ function M.start(cfg)
         workers[#workers + 1] = id
 
         ok, err = xthread.post(id, 'xhttp_worker_start',
-            conf.app_script, conf.max_request_size, conf.server_name)
+            conf.app_script, conf.max_request_size, conf.server_name,
+            conf.https, conf.cert_file, conf.key_file, conf.key_password)
         if not ok then
             shutdown_workers()
             return false, err
@@ -135,7 +141,8 @@ function M.start(cfg)
 
     listener = l
     running = true
-    print(string.format('[XHTTP] listening on %s:%d workers=%d', conf.host, conf.port, #workers))
+    print(string.format('[XHTTP] listening on %s://%s:%d workers=%d',
+        conf.https and 'https' or 'http', conf.host, conf.port, #workers))
     return true
 end
 

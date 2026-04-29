@@ -8,6 +8,8 @@ local app = nil
 local app_script = nil
 local max_request_size = 16 * 1024 * 1024
 local server_name = 'xnet-http'
+local use_https = false
+local tls_config = nil
 local connections = {}
 
 _stubs = {}
@@ -256,6 +258,7 @@ local function normalize_response(req, resp)
     end
 
     local status = tonumber(resp.status or resp.code or 200) or 200
+    local file_path = resp.file or resp.file_path
     local body = resp.body
     if body == nil then body = '' end
     if type(body) ~= 'string' then body = tostring(body) end
@@ -268,24 +271,65 @@ local function normalize_response(req, resp)
     end
 
     headers['Server'] = headers['Server'] or server_name
-    headers['Content-Length'] = tostring(#body)
     headers['Connection'] = headers['Connection'] or (req.keep_alive and 'keep-alive' or 'close')
-    if body ~= '' and not headers['Content-Type'] then
-        headers['Content-Type'] = 'text/plain; charset=utf-8'
+
+    if file_path then
+        local f = io.open(file_path, 'rb')
+        if not f then
+            status = 404
+            body = 'file not found\n'
+            file_path = nil
+        else
+            local size = f:seek('end') or 0
+            f:close()
+            headers['Content-Length'] = tostring(size)
+            if not headers['Content-Type'] then
+                headers['Content-Type'] = resp.content_type or 'application/octet-stream'
+            end
+        end
     end
 
-    return status, body, headers
+    if not file_path then
+        headers['Content-Length'] = tostring(#body)
+        if body ~= '' and not headers['Content-Type'] then
+            headers['Content-Type'] = 'text/plain; charset=utf-8'
+        end
+    end
+
+    return status, body, headers, file_path
+end
+
+local function read_file(path)
+    local f = io.open(path, 'rb')
+    if not f then return nil end
+    local data = f:read('*a')
+    f:close()
+    return data
 end
 
 local function send_response(conn, req, resp)
-    local status, body, headers = normalize_response(req, resp)
+    local status, body, headers, file_path = normalize_response(req, resp)
     local reason = STATUS_TEXT[status] or 'Status'
     local out = { string.format('HTTP/1.1 %d %s\r\n', status, reason) }
     for k, v in pairs(headers) do
         out[#out + 1] = clean_header(k) .. ': ' .. clean_header(v) .. '\r\n'
     end
     out[#out + 1] = '\r\n'
-    if req.method ~= 'HEAD' then
+    local header = table.concat(out)
+
+    if file_path and req.method ~= 'HEAD' then
+        if type(conn.send_file_response) == 'function' and conn:send_file_response(header, file_path) then
+            return
+        end
+        local data = read_file(file_path)
+        if data then
+            conn:send_raw(header .. data)
+            return
+        end
+    end
+
+    out = { header }
+    if req.method ~= 'HEAD' and not file_path then
         out[#out + 1] = body
     end
     conn:send_raw(table.concat(out))
@@ -380,18 +424,35 @@ function server_handler.on_close(conn, reason)
     print('[XHTTP-WORKER] close:', reason)
 end
 
-xthread.register('xhttp_worker_start', function(script_path, max_size, name)
+xthread.register('xhttp_worker_start', function(script_path, max_size, name,
+                                               https, cert_file, key_file, key_password)
     max_request_size = tonumber(max_size) or max_request_size
     server_name = name or server_name
+    use_https = https and true or false
+    if use_https then
+        tls_config = {
+            cert_file = cert_file,
+            key_file = key_file,
+            password = key_password ~= '' and key_password or nil,
+            max_packet = max_request_size,
+        }
+    else
+        tls_config = nil
+    end
     load_app(script_path)
-    print(string.format('[XHTTP-WORKER] start app=%s max_request=%d',
-        tostring(script_path), max_request_size))
+    print(string.format('[XHTTP-WORKER] start scheme=%s app=%s max_request=%d',
+        use_https and 'https' or 'http', tostring(script_path), max_request_size))
 end)
 
 xthread.register('xhttp_accept', function(fd, ip, port)
-    local conn, err = xnet.attach(fd, server_handler, ip, port)
+    local conn, err
+    if use_https then
+        conn, err = xnet.attach_tls(fd, server_handler, ip, port, tls_config)
+    else
+        conn, err = xnet.attach(fd, server_handler, ip, port)
+    end
     if not conn then
-        io.stderr:write('[XHTTP-WORKER] xnet.attach failed: ' .. tostring(err) .. '\n')
+        io.stderr:write('[XHTTP-WORKER] attach failed: ' .. tostring(err) .. '\n')
     end
 end)
 
