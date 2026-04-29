@@ -60,6 +60,10 @@ void      xchannel_detach(xChannel* ch);
 
 int       xchannel_send_raw(xChannel* ch, const char* data, size_t len);
 int       xchannel_send_packet(xChannel* ch, const char* data, size_t len);
+int       xchannel_send_file_raw(xChannel* ch,
+                                  const char* header, size_t header_len,
+                                  const char* path,
+                                  long long offset, long long length);
 void      xchannel_close(xChannel* ch, const char* reason);
 
 #ifdef __cplusplus

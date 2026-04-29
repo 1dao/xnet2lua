@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="zh-CN">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>PAC域名管理</title>
+        <style>
+            :root {
+                color-scheme: light;
+                --text: #19324a;
+                --muted: #5b6b7c;
+                --line: #dfe4ea;
+                --band: #f7f9fb;
+                --blue: #2386d8;
+                --green: #24b35b;
+                --red: #e94b3c;
+            }
+            * {
+                box-sizing: border-box;
+            }
+            body {
+                margin: 0;
+                min-height: 100vh;
+                font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+                color: var(--text);
+                background: #f0f2f5;
+            }
+            main {
+                width: min(1180px, calc(100vw - 48px));
+                margin: 32px auto;
+                background: #fff;
+                border: 1px solid #e7ebef;
+                border-radius: 8px;
+                padding: 36px 38px 44px;
+                box-shadow: 0 8px 26px rgba(26, 48, 70, 0.08);
+            }
+            h1 {
+                margin: 0;
+                font-size: 32px;
+                font-weight: 700;
+                letter-spacing: 0;
+            }
+            h2 {
+                margin: 36px 0 18px;
+                font-size: 24px;
+                color: var(--blue);
+                letter-spacing: 0;
+            }
+            .top {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                border-bottom: 1px solid var(--line);
+                padding-bottom: 22px;
+            }
+            .mark {
+                width: 38px;
+                height: 38px;
+                display: grid;
+                place-items: center;
+                border: 1px solid #cfd8e3;
+                border-radius: 8px;
+                color: var(--blue);
+                font-weight: 700;
+            }
+            .stats {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 24px;
+                margin: 26px 0;
+            }
+            .stat {
+                background: var(--band);
+                border-radius: 8px;
+                padding: 24px 20px;
+            }
+            .stat strong {
+                display: block;
+                font-size: 28px;
+                line-height: 1;
+                margin-bottom: 12px;
+            }
+            .stat span {
+                color: var(--muted);
+                font-size: 15px;
+            }
+            .pac {
+                border-left: 4px solid var(--blue);
+                background: var(--band);
+                padding: 22px 20px;
+            }
+            .pac a {
+                color: var(--blue);
+                text-decoration: none;
+                font-size: 18px;
+            }
+            form {
+                display: grid;
+                gap: 18px;
+                margin-bottom: 34px;
+            }
+            label {
+                display: grid;
+                gap: 9px;
+                font-weight: 700;
+            }
+            input,
+            select {
+                width: 100%;
+                height: 48px;
+                border: 1px solid #d8dde3;
+                border-radius: 5px;
+                padding: 0 14px;
+                font-size: 16px;
+                background: #fff;
+            }
+            button {
+                border: 0;
+                border-radius: 5px;
+                min-width: 112px;
+                height: 48px;
+                padding: 0 18px;
+                color: #fff;
+                font-size: 16px;
+                font-weight: 700;
+                cursor: pointer;
+            }
+            .add {
+                background: var(--green);
+                justify-self: start;
+            }
+            .delete {
+                background: var(--red);
+            }
+            .message {
+                min-height: 24px;
+                color: var(--muted);
+                margin: 12px 0 0;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                border: 1px solid var(--line);
+                table-layout: fixed;
+            }
+            th,
+            td {
+                border: 1px solid var(--line);
+                text-align: left;
+                padding: 16px 18px;
+                vertical-align: middle;
+                word-break: break-word;
+            }
+            th {
+                background: #f3f5f7;
+                font-size: 17px;
+            }
+            code {
+                background: #f2f4f6;
+                border-radius: 4px;
+                padding: 2px 5px;
+            }
+            .empty {
+                text-align: center;
+                color: var(--muted);
+                padding: 28px;
+            }
+            @media (max-width: 760px) {
+                main {
+                    width: min(100vw - 20px, 1180px);
+                    padding: 24px 18px;
+                }
+                h1 {
+                    font-size: 26px;
+                }
+                .stats {
+                    grid-template-columns: 1fr;
+                    gap: 12px;
+                }
+                table {
+                    table-layout: auto;
+                }
+                th,
+                td {
+                    padding: 12px;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <main>
+            <div class="top">
+                <div class="mark">PAC</div>
+                <h1>PAC域名管理</h1>
+            </div>
+
+            <section class="stats">
+                <div class="stat">
+                    <strong id="httpProxy">-</strong><span>HTTP代理</span>
+                </div>
+                <div class="stat">
+                    <strong id="socks5Proxy">-</strong><span>SOCKS5代理</span>
+                </div>
+                <div class="stat">
+                    <strong id="ruleCount">0</strong><span>域名规则数</span>
+                </div>
+            </section>
+
+            <section class="pac">
+                <strong>PAC文件地址：</strong>
+                <p>
+                    <a id="pacLink" href="/proxy.pac" target="_blank"
+                        >proxy.pac</a
+                    >
+                </p>
+            </section>
+
+            <h2>添加域名规则</h2>
+            <form id="addForm">
+                <label>
+                    域名模式：
+                    <input
+                        id="pattern"
+                        name="pattern"
+                        placeholder="例如：*.google.com 或 www.example.com"
+                        autocomplete="off"
+                    />
+                </label>
+                <label>
+                    代理类型：
+                    <select id="proxy" name="proxy">
+                        <option value="http">HTTP代理</option>
+                        <option value="socks5">SOCKS5代理</option>
+                    </select>
+                </label>
+                <button class="add" type="submit">添加规则</button>
+                <div class="message" id="message"></div>
+            </form>
+
+            <h2>域名规则列表</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>域名模式</th>
+                        <th>代理类型</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="rules"></tbody>
+            </table>
+        </main>
+
+        <script>
+            const form = document.getElementById("addForm");
+            const pattern = document.getElementById("pattern");
+            const proxy = document.getElementById("proxy");
+            const message = document.getElementById("message");
+            const rules = document.getElementById("rules");
+
+            function setMessage(text, bad) {
+                message.textContent = text || "";
+                message.style.color = bad ? "#e94b3c" : "#5b6b7c";
+            }
+
+            function escapeHtml(value) {
+                return String(value || "").replace(
+                    /[&<>"']/g,
+                    (ch) =>
+                        ({
+                            "&": "&amp;",
+                            "<": "&lt;",
+                            ">": "&gt;",
+                            '"': "&quot;",
+                            "'": "&#39;",
+                        })[ch],
+                );
+            }
+
+            async function request(url, options) {
+                const res = await fetch(url, options);
+                const data = await res.json();
+                if (!res.ok || data.ok === false)
+                    throw new Error(data.message || "请求失败");
+                return data;
+            }
+
+            function render(data) {
+                document.getElementById("httpProxy").textContent =
+                    data.http_proxy || "-";
+                document.getElementById("socks5Proxy").textContent =
+                    data.socks5_proxy || "-";
+                document.getElementById("ruleCount").textContent =
+                    data.count || 0;
+                document.getElementById("pacLink").textContent =
+                    data.pac_file || "proxy.pac";
+
+                if (!data.rules || data.rules.length === 0) {
+                    rules.innerHTML =
+                        '<tr><td colspan="3" class="empty">暂无规则</td></tr>';
+                    return;
+                }
+
+                rules.innerHTML = data.rules
+                    .map(
+                        (rule) => `
+        <tr>
+          <td><code>${escapeHtml(rule.pattern)}</code></td>
+          <td>${escapeHtml(rule.proxy)}</td>
+          <td><button class="delete" type="button" data-pattern="${escapeHtml(rule.pattern)}">删除</button></td>
+        </tr>
+      `,
+                    )
+                    .join("");
+            }
+
+            async function loadRules() {
+                const data = await request("/api/rules");
+                render(data);
+            }
+
+            form.addEventListener("submit", async (event) => {
+                event.preventDefault();
+                setMessage("");
+                try {
+                    const body = new URLSearchParams({
+                        pattern: pattern.value,
+                        proxy: proxy.value,
+                    });
+                    const data = await request("/api/rules", {
+                        method: "POST",
+                        body,
+                    });
+                    pattern.value = "";
+                    render(data);
+                    setMessage(data.message || "完成");
+                } catch (err) {
+                    setMessage(err.message, true);
+                }
+            });
+
+            rules.addEventListener("click", async (event) => {
+                const btn = event.target.closest("button[data-pattern]");
+                if (!btn) return;
+                setMessage("");
+                try {
+                    const body = new URLSearchParams({
+                        pattern: btn.dataset.pattern,
+                    });
+                    const data = await request("/api/rules/delete", {
+                        method: "POST",
+                        body,
+                    });
+                    render(data);
+                    setMessage(data.message || "完成");
+                } catch (err) {
+                    setMessage(err.message, true);
+                }
+            });
+
+            loadRules().catch((err) => setMessage(err.message, true));
+        </script>
+    </body>
+</html>

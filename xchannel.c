@@ -6,6 +6,16 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+
+#ifdef __linux__
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#elif !defined(_WIN32)
+#include <sys/types.h>
+#endif
 
 #ifndef XCHANNEL_READ_CHUNK
 #define XCHANNEL_READ_CHUNK 8192
@@ -34,6 +44,15 @@ struct xChannel {
     size_t outlen;
     size_t outcap;
 
+#ifdef __linux__
+    int file_fd;
+    long long file_offset;
+#else
+    FILE* file_fp;
+#endif
+    bool file_pending;
+    long long file_remaining;
+
     xChannelConnectProc connect_cb;
     xChannelPacketProc packet_cb;
     xChannelCloseProc close_cb;
@@ -44,6 +63,27 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData);
+
+static bool has_pending_file(xChannel* ch) {
+    return ch && ch->file_pending && ch->file_remaining > 0;
+}
+
+static void close_pending_file(xChannel* ch) {
+    if (!ch) return;
+#ifdef __linux__
+    if (ch->file_fd >= 0) {
+        close(ch->file_fd);
+        ch->file_fd = -1;
+    }
+#else
+    if (ch->file_fp) {
+        fclose(ch->file_fp);
+        ch->file_fp = NULL;
+    }
+#endif
+    ch->file_pending = false;
+    ch->file_remaining = 0;
+}
 
 static bool valid_frame(xChannelFrame frame) {
     return frame == XCHANNEL_FRAME_RAW ||
@@ -72,6 +112,7 @@ static void xchannel_retain(xChannel* ch) {
 
 static void xchannel_free_storage(xChannel* ch) {
     if (!ch) return;
+    close_pending_file(ch);
     free(ch->inbuf);
     free(ch->outbuf);
     free(ch);
@@ -147,6 +188,7 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
         xsock_close(ch->fd);
         ch->fd = INVALID_SOCKET_VAL;
     }
+    close_pending_file(ch);
 
     if (notify && ch->close_cb) {
         ch->close_cb(ch, reason ? reason : "closed", ch->userdata);
@@ -247,7 +289,69 @@ static void flush_output(xChannel* ch) {
         return;
     }
 
-    if (!ch->closed) {
+    while (!ch->closed && has_pending_file(ch)) {
+#ifdef __linux__
+        off_t off = (off_t)ch->file_offset;
+        size_t chunk = ch->file_remaining > 1024 * 1024
+            ? 1024 * 1024
+            : (size_t)ch->file_remaining;
+        ssize_t n = sendfile((int)ch->fd, ch->file_fd, &off, chunk);
+        if (n > 0) {
+            ch->file_offset = (long long)off;
+            ch->file_remaining -= (long long)n;
+            continue;
+        }
+        if (n == 0) {
+            close_pending_file(ch);
+            break;
+        }
+        if (socket_check_eagain()) return;
+        xchannel_close(ch, "sendfile_error");
+        return;
+#else
+        char buf[64 * 1024];
+        size_t want = ch->file_remaining > (long long)sizeof(buf)
+            ? sizeof(buf)
+            : (size_t)ch->file_remaining;
+        size_t got = fread(buf, 1, want, ch->file_fp);
+        if (got == 0) {
+            if (ferror(ch->file_fp)) {
+                xchannel_close(ch, "sendfile_read_error");
+                return;
+            }
+            close_pending_file(ch);
+            break;
+        }
+
+        size_t off = 0;
+        while (off < got) {
+            size_t remaining = got - off;
+            int chunk = (remaining > INT_MAX) ? INT_MAX : (int)remaining;
+            int n = send(ch->fd, buf + off, chunk, 0);
+            if (n > 0) {
+                off += (size_t)n;
+                ch->file_remaining -= (long long)n;
+                continue;
+            }
+            if (n == 0 || socket_check_eagain()) {
+                long long rewind_bytes = (long long)(got - off);
+                if (rewind_bytes > 0) {
+#ifdef _WIN32
+                    _fseeki64(ch->file_fp, -rewind_bytes, SEEK_CUR);
+#else
+                    fseeko(ch->file_fp, (off_t)-rewind_bytes, SEEK_CUR);
+#endif
+                }
+                return;
+            }
+            xchannel_close(ch, "sendfile_write_error");
+            return;
+        }
+#endif
+    }
+
+    if (!ch->closed && !has_pending_file(ch)) {
+        close_pending_file(ch);
         xpoll_del_event(ch->fd, XPOLL_WRITABLE);
     }
 }
@@ -256,6 +360,7 @@ static int queue_or_send_raw(xChannel* ch, const char* data, size_t len) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
     if (!data && len > 0) return -1;
     if (len == 0) return 0;
+    if (has_pending_file(ch)) return -1;
 
     if (ch->connect_pending || ch->outlen > 0 || !ch->connected) {
         if (!buffer_append(&ch->outbuf, &ch->outlen, &ch->outcap, data, len)) {
@@ -421,6 +526,9 @@ xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg) {
     ch->connect_pending = false;
     ch->frame = XCHANNEL_FRAME_RAW;
     ch->max_packet = XCHANNEL_DEFAULT_MAX_PACKET;
+#ifdef __linux__
+    ch->file_fd = -1;
+#endif
 
     if (cfg) {
         if (!valid_frame(cfg->frame)) {
@@ -450,6 +558,7 @@ void xchannel_destroy(xChannel* ch) {
             xsock_close(ch->fd);
             ch->fd = INVALID_SOCKET_VAL;
         }
+        close_pending_file(ch);
     }
     xchannel_release(ch);
 }
@@ -522,6 +631,7 @@ int xchannel_send_raw(xChannel* ch, const char* data, size_t len) {
 
 int xchannel_send_packet(xChannel* ch, const char* data, size_t len) {
     if (!ch || ch->closed || (!data && len > 0)) return -1;
+    if (has_pending_file(ch)) return -1;
 
     if (ch->frame == XCHANNEL_FRAME_LEN32) {
         if (len > UINT32_MAX || len > SIZE_MAX - 4) return -1;
@@ -547,6 +657,103 @@ int xchannel_send_packet(xChannel* ch, const char* data, size_t len) {
     }
 
     return queue_or_send_raw(ch, data, len);
+}
+
+int xchannel_send_file_raw(xChannel* ch,
+                           const char* header, size_t header_len,
+                           const char* path,
+                           long long offset, long long length) {
+    if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL || !path) return -1;
+    if (!header && header_len > 0) return -1;
+    if (has_pending_file(ch)) return -1;
+    if (offset < 0) offset = 0;
+
+#ifdef __linux__
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return -1;
+    }
+
+    long long size = (long long)st.st_size;
+    if (offset > size) offset = size;
+    long long available = size - offset;
+    if (length < 0 || length > available) length = available;
+    if (length == 0) {
+        close(fd);
+        return queue_or_send_raw(ch, header, header_len);
+    }
+#else
+    FILE* fp = fopen(path, "rb");
+    if (!fp) return -1;
+
+#ifdef _WIN32
+    if (_fseeki64(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    long long size = _ftelli64(fp);
+#else
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return -1;
+    }
+    long long size = (long long)ftello(fp);
+#endif
+    if (size < 0) {
+        fclose(fp);
+        return -1;
+    }
+    if (offset > size) offset = size;
+    long long available = size - offset;
+    if (length < 0 || length > available) length = available;
+    if (length == 0) {
+        fclose(fp);
+        return queue_or_send_raw(ch, header, header_len);
+    }
+#ifdef _WIN32
+    if (_fseeki64(fp, offset, SEEK_SET) != 0) {
+#else
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+#endif
+        fclose(fp);
+        return -1;
+    }
+#endif
+
+    if (!buffer_append(&ch->outbuf, &ch->outlen, &ch->outcap,
+                       header ? header : "", header_len)) {
+#ifdef __linux__
+        close(fd);
+#else
+        fclose(fp);
+#endif
+        xchannel_close(ch, "out_of_memory");
+        return -1;
+    }
+
+#ifdef __linux__
+    ch->file_fd = fd;
+    ch->file_offset = offset;
+#else
+    ch->file_fp = fp;
+#endif
+    ch->file_pending = true;
+    ch->file_remaining = length;
+
+    flush_output(ch);
+    if (!ch->closed && (ch->outlen > 0 || has_pending_file(ch))) {
+        if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
+                            xchannel_write_event, xchannel_error_event, ch) != 0) {
+            xchannel_close(ch, "poll_error");
+            return -1;
+        }
+        xpoll_set_client_data(ch->fd, ch);
+    }
+    return ch->closed ? -1 : 0;
 }
 
 void xchannel_close(xChannel* ch, const char* reason) {
