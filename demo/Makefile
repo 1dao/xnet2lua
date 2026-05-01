@@ -30,7 +30,7 @@ ifeq ($(OS),Windows_NT)
     MV := /usr/bin/mv -f
 else
     # Linux
-    LDFLAGS += -lpthread
+    LDFLAGS += -lpthread -lm
     EXT :=
     RM := rm -f
 endif

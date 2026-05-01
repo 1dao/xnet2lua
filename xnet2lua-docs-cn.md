@@ -756,14 +756,14 @@ end)
 router.post("/api/data", function(req)
     -- req.body 是原始请求体字符串
     local ok, data = pcall(function()
-        return xutils.json.unpack(req.body)
+        return xutils.json_unpack(req.body)
     end)
     if not ok then
         return { status = 400, body = "Invalid JSON\n" }
     end
     return {
         status  = 200,
-        body    = xutils.json.pack({ result = "ok", received = data }),
+        body    = xutils.json_pack({ result = "ok", received = data }),
         headers = { ["Content-Type"] = "application/json" },
     }
 end)
@@ -939,16 +939,16 @@ local xutils = require("xutils")
 ```lua
 -- 序列化 Lua 值为 JSON 字符串
 -- 依赖 yyjson，性能极高
-local json_str = xutils.json.pack(value)
+local json_str = xutils.json_pack(value)
 
 -- 将 JSON 字符串解析为 Lua 值
-local value = xutils.json.unpack(json_str)
+local value = xutils.json_unpack(json_str)
 
 -- 示例
-local str = xutils.json.pack({ name = "alice", score = 100, tags = {"vip", "active"} })
+local str = xutils.json_pack({ name = "alice", score = 100, tags = {"vip", "active"} })
 -- str = '{"name":"alice","score":100,"tags":["vip","active"]}'
 
-local data = xutils.json.unpack(str)
+local data = xutils.json_unpack(str)
 print(data.name)   -- alice
 print(data.score)  -- 100
 ```
@@ -1267,7 +1267,7 @@ local function json_response(status, data)
     local xutils = require("xutils")
     return {
         status  = status,
-        body    = xutils.json.pack(data),
+        body    = xutils.json_pack(data),
         headers = {
             ["Content-Type"] = "application/json; charset=utf-8",
             table.unpack(CORS_HEADERS),  -- 展开 CORS 头
@@ -1287,7 +1287,7 @@ end)
 -- POST /api/echo
 router.post("/api/echo", function(req)
     local xutils = require("xutils")
-    local ok, body = pcall(xutils.json.unpack, req.body)
+    local ok, body = pcall(xutils.json_unpack, req.body)
     if not ok then
         return json_response(400, { error = "invalid json" })
     end

@@ -2,7 +2,7 @@
 -- Edits ./proxy.pac from Lua through a small HTTP page.
 
 local router = dofile('demo/xhttp_router.lua')
-local xjson = require('xutils').json
+local xutils = require('xutils')
 
 local M = {}
 
@@ -251,7 +251,7 @@ local function delete_rule(pattern)
 end
 local function json_response(status, payload)
     local rules = payload.rules or read_rules()
-    local body, err = xjson.pack({
+    local body, err = xutils.json_pack({
         ok = payload.ok ~= false,
         message = payload.message or '',
         pac_file = payload.pac_file or PAC_FILE,

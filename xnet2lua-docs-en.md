@@ -683,14 +683,14 @@ end)
 router.post("/api/data", function(req)
     -- req.body is the raw request body string
     local ok, data = pcall(function()
-        return xutils.json.unpack(req.body)
+        return xutils.json_unpack(req.body)
     end)
     if not ok then
         return { status = 400, body = "Invalid JSON\n" }
     end
     return {
         status  = 200,
-        body    = xutils.json.pack({ result = "ok", received = data }),
+        body    = xutils.json_pack({ result = "ok", received = data }),
         headers = { ["Content-Type"] = "application/json" },
     }
 end)
@@ -870,16 +870,16 @@ local xutils = require("xutils")
 ```lua
 -- Serialize Lua value to JSON string
 -- Depends on yyjson; very high performance
-local json_str = xutils.json.pack(value)
+local json_str = xutils.json_pack(value)
 
 -- Parse JSON string into a Lua value
-local value = xutils.json.unpack(json_str)
+local value = xutils.json_unpack(json_str)
 
 -- Example
-local str = xutils.json.pack({ name = "alice", score = 100, tags = {"vip", "active"} })
+local str = xutils.json_pack({ name = "alice", score = 100, tags = {"vip", "active"} })
 -- str = '{"name":"alice","score":100,"tags":["vip","active"]}'
 
-local data = xutils.json.unpack(str)
+local data = xutils.json_unpack(str)
 print(data.name)   -- alice
 print(data.score)  -- 100
 ```
@@ -1198,7 +1198,7 @@ local function json_response(status, data)
     local xutils = require("xutils")
     return {
         status  = status,
-        body    = xutils.json.pack(data),
+        body    = xutils.json_pack(data),
         headers = {
             ["Content-Type"] = "application/json; charset=utf-8",
             table.unpack(CORS_HEADERS),  -- Expand CORS headers
@@ -1218,7 +1218,7 @@ end)
 -- POST /api/echo
 router.post("/api/echo", function(req)
     local xutils = require("xutils")
-    local ok, body = pcall(xutils.json.unpack, req.body)
+    local ok, body = pcall(xutils.json_unpack, req.body)
     if not ok then
         return json_response(400, { error = "invalid json" })
     end
@@ -1254,8 +1254,8 @@ return {
 
 ### 便利说明
 
-- 通过上述示例，你可以看到在 HTTP API 服务中，与 JSON 相关的打包/解包都可以使用 xutils.json.pack / xutils.json.unpack 来实现。
-- 你也可以在需要的地方引入 xutils.json.pack/unpack，以统一的方式处理 JSON 数据。
+- 通过上述示例，你可以看到在 HTTP API 服务中，与 JSON 相关的打包/解包都可以使用 xutils.json_pack / xutils.json_unpack 来实现。
+- 你也可以在需要的地方引入 xutils.json_pack/json_unpack，以统一的方式处理 JSON 数据。
 
 ---
 
@@ -1473,4 +1473,3 @@ end
 
 - **Q: How to support more than 99 threads?**
   A: Change the `XTHR_MAX` macro in `xthread.h` and recompile. All code using xthread should be rebuilt.
-

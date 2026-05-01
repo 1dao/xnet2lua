@@ -1,7 +1,7 @@
 -- xhttp_codec.lua - HTTP/1.x parsing helpers shared by demos and workers.
 
 local M = {}
-local xjson = require('xutils').json
+local xutils = require('xutils')
 
 -- ============================================================================
 -- Status and Basic Helpers
@@ -325,13 +325,13 @@ function M.form(req)
     return M.parse_query(tostring(body or ''))
 end
 
-M.JSON_NULL = xjson.null
-M.json_pack = xjson.pack
-M.json_unpack = xjson.unpack
+M.JSON_NULL = xutils.json_null
+M.json_pack = xutils.json_pack
+M.json_unpack = xutils.json_unpack
 
 function M.json(req)
     local body = type(req) == 'table' and req.body or req
-    return xjson.unpack(tostring(body or ''))
+    return xutils.json_unpack(tostring(body or ''))
 end
 
 local function parse_header_block(block)

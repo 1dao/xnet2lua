@@ -2,9 +2,9 @@
 **
 ** Keep this module as a lightweight grab bag for tiny helpers.
 ** Current JSON API:
-**   xutils.json.pack(value)   -> JSON string
-**   xutils.json.unpack(text)  -> Lua value
-**   xutils.json.null          -> sentinel for JSON null
+**   xutils.json_pack(value)   -> JSON string
+**   xutils.json_unpack(text)  -> Lua value
+**   xutils.json_null          -> sentinel for JSON null
 */
 
 #include <math.h>
@@ -354,19 +354,16 @@ static int l_util_json_unpack(lua_State *L) {
     return 1;
 }
 
-static const luaL_Reg util_json_funcs[] = {
-    { "pack",   l_util_json_pack },
-    { "unpack", l_util_json_unpack },
+static const luaL_Reg xutils_funcs[] = {
+    { "json_pack",   l_util_json_pack },
+    { "json_unpack", l_util_json_unpack },
     { NULL, NULL }
 };
 
 LUALIB_API int luaopen_xutils(lua_State *L) {
-    lua_newtable(L);
-
-    luaL_newlib(L, util_json_funcs);
+    luaL_newlib(L, xutils_funcs);
     push_json_null(L);
-    lua_setfield(L, -2, "null");
-    lua_setfield(L, -2, "json");
+    lua_setfield(L, -2, "json_null");
 
     return 1;
 }
