@@ -10,6 +10,7 @@ WITH_HTTPS ?= 1
 XNET_DEFS := -DLUA_EMBEDDED -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
 XNET_CFLAGS :=
 XNET_HTTPS_SRC :=
+XNET_UTIL_SRC := ../3rd/yyjson.c ../xlua/lua_xutils.c
 MV := mv -f
 
 ifeq ($(WITH_HTTPS),1)
@@ -46,9 +47,9 @@ $(TARGET): xthread_test.c ../xthread.c ../xpoll.c ../xsock.c
 	$(CC) $(CFLAGS) -I.. -o $@ xthread_test.c ../xthread.c ../xpoll.c ../xsock.c $(LDFLAGS)
 
 # Generic Lua runner - pass the Lua main file at runtime.
-xnet$(EXT): xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_xnet_tls.c ../xlua/lua_xnet_tls.h ../xlua/lua_cmsgpack.c ../libxsock.a $(XNET_HTTPS_SRC)
+xnet$(EXT): xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_xnet_tls.c ../xlua/lua_xnet_tls.h ../xlua/lua_cmsgpack.c ../xlua/lua_xutils.c ../3rd/yyjson.c ../3rd/yyjson.h ../libxsock.a $(XNET_HTTPS_SRC)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -I.. -o $(XNET_BUILD) xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_xnet_tls.c ../xlua/lua_cmsgpack.c $(XNET_HTTPS_SRC) ../libxsock.a $(LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -I.. -o $(XNET_BUILD) xnet_main.c ../xthread.c ../xpoll.c ../xsock.c ../xchannel.c ../xargs.c ../xlua/lua_xthread.c ../xlua/lua_xnet.c ../xlua/lua_xnet_tls.c ../xlua/lua_cmsgpack.c $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) ../libxsock.a $(LDFLAGS)
 	$(MV) $(XNET_BUILD) $@
 
 clean:

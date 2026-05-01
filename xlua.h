@@ -19,6 +19,9 @@ LUALIB_API int luaopen_xthread(lua_State *L);
 /** Lua module initialization. Called via require("cmsgpack"). */
 LUALIB_API int luaopen_cmsgpack(lua_State *L);
 
+/** Lua module initialization. Called via require("xutils"). */
+LUALIB_API int luaopen_xutils(lua_State *L);
+
 #ifdef __cplusplus
 }
 #endif

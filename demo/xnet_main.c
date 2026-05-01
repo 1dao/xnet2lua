@@ -36,6 +36,7 @@
 LUA_API int luaopen_cmsgpack(lua_State *L);
 LUA_API int luaopen_xthread(lua_State *L);
 LUA_API int luaopen_xnet(lua_State *L);
+LUA_API int luaopen_xutils(lua_State *L);
 
 typedef struct {
     lua_State* L;
@@ -71,11 +72,12 @@ static xArgsCFG g_arg_configs[] = {
     { 0,   "HTTPS_PORT", NULL, 0 },
     { 0,   "HTTPS_CERT", NULL, 0 },
     { 0,   "HTTPS_KEY", NULL, 0 },
+    { 0,   "HTTPS_KEY_PASSWORD", NULL, 0 },
     { 0,   "HTTPS_TEST_SECONDS", NULL, 0 },
     { 0,   "PAC_WEB_HOST", NULL, 0 },
     { 0,   "PAC_WEB_PORT", NULL, 0 },
     { 0,   "PAC_FILE", NULL, 0 },
-    { 0,   "PAC_INDEX_FILE", NULL, 0 },
+    { 0,   "PAC_STATIC_DIR", NULL, 0 },
     { 0,   "PAC_HTTP_PROXY_HOST", NULL, 0 },
     { 0,   "PAC_HTTP_PROXY_PORT", NULL, 0 },
     { 0,   "PAC_SOCKS5_PROXY_HOST", NULL, 0 },
@@ -119,6 +121,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xnet", luaopen_xnet, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xutils", luaopen_xutils, 1);
     lua_pop(L, 1);
 }
 

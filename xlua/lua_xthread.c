@@ -47,6 +47,7 @@
 LUALIB_API int luaopen_cmsgpack(lua_State* L);
 LUALIB_API int luaopen_xthread(lua_State* L);
 LUALIB_API int luaopen_xnet(lua_State* L);
+LUALIB_API int luaopen_xutils(lua_State* L);
 
 /* ============================================================================
 ** Registry keys (per lua_State)
@@ -671,6 +672,10 @@ static void lua_thread_on_init(xThread* thr) {
 
     /* Open xnet module so dynamic Lua threads can use network polling too. */
     luaL_requiref(L, "xnet", luaopen_xnet, 1);
+    lua_pop(L, 1);
+
+    /* Open shared utility module for small helpers such as JSON. */
+    luaL_requiref(L, "xutils", luaopen_xutils, 1);
     lua_pop(L, 1);
 
     /* Load the script in THIS THREAD'S own Lua state

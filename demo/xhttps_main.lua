@@ -15,6 +15,7 @@ local WORKERS = tonumber(xnet.get_config('HTTP_WORKERS', '2')) or 2
 local CERT = xnet.get_config('HTTPS_CERT', 'demo/certs/server.crt')
 local KEY = xnet.get_config('HTTPS_KEY', 'demo/certs/server.key')
 local TEST_SECONDS = tonumber(xnet.get_config('HTTPS_TEST_SECONDS', '15')) or 15
+local ENABLE = true --xnet.get_config('HTTPS_ENABLE', '1') ~= '0'
 
 local started_at = nil
 local stopped = false
@@ -47,6 +48,9 @@ end
 local function __init()
     print(string.format('[XHTTPS-MAIN] init https=%s:%d workers=%d cert=%s',
         HOST, PORT, WORKERS, CERT))
+    if not ENABLE then
+        error('HTTPS_ENABLE=0')
+    end
     if XNET_WITH_HTTPS == false then
         error('xnet was built without HTTPS support; rebuild with WITH_HTTPS=1')
     end

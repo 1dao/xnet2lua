@@ -10,6 +10,23 @@ end
 
 local HOST = xnet.get_config('PAC_WEB_HOST', '127.0.0.1')
 local PORT = tonumber(xnet.get_config('PAC_WEB_PORT', '18090')) or 18090
+local HTTPS = nil
+local CERT = xnet.get_config('HTTPS_CERT', 'demo/certs/server.crt')
+local KEY = xnet.get_config('HTTPS_KEY', 'demo/certs/server.key')
+local KEY_PASSWORD = xnet.get_config('HTTPS_KEY_PASSWORD', '')
+
+local function to_bool(v, default)
+    if v == nil then return default end
+    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then
+        return true
+    end
+    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then
+        return false
+    end
+    return default
+end
+
+HTTPS = to_bool(xnet.get_config('HTTPS_ENABLE', '1'), true)
 
 _stubs = {}
 _thread_replys = {}
@@ -33,13 +50,18 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
 end
 
 local function __init()
-    print(string.format('[XPAC-MAIN] init http=%s:%d pac=%s',
-        HOST, PORT, xnet.get_config('PAC_FILE', 'proxy.pac')))
+    local scheme = HTTPS and 'https' or 'http'
+    print(string.format('[XPAC-MAIN] init %s=%s:%d pac=%s',
+        scheme, HOST, PORT, xnet.get_config('PAC_FILE', 'proxy.pac')))
     assert(xnet.init())
 
     local ok, err = xhttp.start({
         host = HOST,
         port = PORT,
+        https = HTTPS,
+        cert_file = CERT,
+        key_file = KEY,
+        key_password = KEY_PASSWORD,
         worker_count = 1,
         worker_base = xthread.WORKER_GRP3,
         app_script = 'demo/xpac_app.lua',
@@ -48,7 +70,7 @@ local function __init()
     })
     if not ok then error(err) end
 
-    print(string.format('[XPAC-MAIN] open http://%s:%d/', HOST, PORT))
+    print(string.format('[XPAC-MAIN] open %s://%s:%d/', scheme, HOST, PORT))
 end
 
 local function __update()

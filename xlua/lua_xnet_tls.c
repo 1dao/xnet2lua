@@ -12,6 +12,9 @@
 #include <stdint.h>
 #include <limits.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
 
 #if defined(LUA_EMBEDDED)
 #include "../3rd/minilua.h"
@@ -747,6 +750,81 @@ static int l_tls_send_raw(lua_State* L) {
     return 1;
 }
 
+static int l_tls_send_file_response(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    size_t header_len = 0;
+    const char* header = luaL_checklstring(L, 2, &header_len);
+    const char* path = luaL_checkstring(L, 3);
+    lua_Integer offset_arg = luaL_optinteger(L, 4, 0);
+    lua_Integer length_arg = luaL_optinteger(L, 5, -1);
+    long long offset = (long long)offset_arg;
+    long long length = (long long)length_arg;
+    if (offset < 0) offset = 0;
+
+    FILE* fp = fopen(path, "rb");
+    if (!fp) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+#ifdef _WIN32
+    if (_fseeki64(fp, 0, SEEK_END) != 0) {
+#else
+    if (fseeko(fp, 0, SEEK_END) != 0) {
+#endif
+        fclose(fp);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+#ifdef _WIN32
+    long long size = _ftelli64(fp);
+#else
+    long long size = (long long)ftello(fp);
+#endif
+    if (size < 0) {
+        fclose(fp);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    if (offset > size) offset = size;
+    long long remaining = size - offset;
+    if (length < 0 || length > remaining) length = remaining;
+
+#ifdef _WIN32
+    if (_fseeki64(fp, offset, SEEK_SET) != 0) {
+#else
+    if (fseeko(fp, (off_t)offset, SEEK_SET) != 0) {
+#endif
+        fclose(fp);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    int ok = tls_send_raw_c(c, header, header_len) == 0;
+    char buf[64 * 1024];
+    while (ok && length > 0 && !c->closed) {
+        size_t want = length > (long long)sizeof(buf)
+            ? sizeof(buf)
+            : (size_t)length;
+        size_t got = fread(buf, 1, want, fp);
+        if (got == 0) {
+            ok = feof(fp) && length == 0;
+            if (!ok) tls_close_internal(c, "tls_file_read_error", true);
+            break;
+        }
+        if (tls_send_raw_c(c, buf, got) != 0) {
+            ok = 0;
+            break;
+        }
+        length -= (long long)got;
+    }
+
+    fclose(fp);
+    lua_pushboolean(L, ok && !c->closed);
+    return 1;
+}
+
 static int l_tls_send(lua_State* L) {
     return l_tls_send_raw(L);
 }
@@ -793,6 +871,7 @@ static const luaL_Reg tls_methods[] = {
     { "send",        l_tls_send },
     { "send_raw",    l_tls_send_raw },
     { "send_packet", l_tls_send_raw },
+    { "send_file_response", l_tls_send_file_response },
     { "set_handler", l_tls_set_handler },
     { "set_framing", l_tls_set_framing },
     { NULL, NULL }

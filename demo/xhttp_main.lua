@@ -2,6 +2,7 @@
 -- Main thread owns the listener and passes accepted sockets to HTTP workers.
 
 local xhttp = dofile('demo/xhttp.lua')
+local codec = dofile('demo/xhttp_codec.lua')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
 local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
@@ -38,6 +39,23 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
     end
 end
 
+local form_body = 'name=alice+cat&kind=urlencoded'
+local json_body = '{"pt":"demo","arg1":42,"ok":true}'
+local multipart_boundary = '----xnetdemo'
+local multipart_body = table.concat({
+    '--' .. multipart_boundary,
+    'Content-Disposition: form-data; name="name"',
+    '',
+    'alice',
+    '--' .. multipart_boundary,
+    'Content-Disposition: form-data; name="upload"; filename="hello.txt"',
+    'Content-Type: text/plain',
+    '',
+    'file-body',
+    '--' .. multipart_boundary .. '--',
+    '',
+}, '\r\n')
+
 local tests = {
     {
         name = 'hello',
@@ -59,6 +77,27 @@ local tests = {
         request = 'POST /chunked HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n5\r\nhello\r\n1\r\n!\r\n0\r\n\r\n',
         status = 200,
         body = 'chunked:hello!',
+    },
+    {
+        name = 'form',
+        method = 'POST',
+        request = 'POST /form HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: ' .. tostring(#form_body) .. '\r\nConnection: keep-alive\r\n\r\n' .. form_body,
+        status = 200,
+        body = 'form:alice cat:urlencoded\n',
+    },
+    {
+        name = 'json',
+        method = 'POST',
+        request = 'POST /json HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: ' .. tostring(#json_body) .. '\r\nConnection: keep-alive\r\n\r\n' .. json_body,
+        status = 200,
+        body = 'json:demo:42:true\n',
+    },
+    {
+        name = 'multipart',
+        method = 'POST',
+        request = 'POST /multipart HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=' .. multipart_boundary .. '\r\nContent-Length: ' .. tostring(#multipart_body) .. '\r\nConnection: keep-alive\r\n\r\n' .. multipart_body,
+        status = 200,
+        body = 'multipart:alice:hello.txt:file-body\n',
     },
     {
         name = 'headers',
@@ -96,54 +135,6 @@ local function finish(ok, msg)
     xthread.stop(ok and 0 or 1)
 end
 
-local function split_headers(block)
-    local lines = {}
-    local pos = 1
-    while true do
-        local e = block:find('\r\n', pos, true)
-        if not e then
-            lines[#lines + 1] = block:sub(pos)
-            break
-        end
-        lines[#lines + 1] = block:sub(pos, e - 1)
-        pos = e + 2
-    end
-    return lines
-end
-
-local function parse_response(data, pos, expect)
-    local header_end = data:find('\r\n\r\n', pos, true)
-    if not header_end then return nil, nil, 'incomplete' end
-
-    local lines = split_headers(data:sub(pos, header_end - 1))
-    local version, status = (lines[1] or ''):match('^(HTTP/%d%.%d)%s+(%d%d%d)')
-    status = tonumber(status)
-    if not version or not status then
-        return nil, nil, 'bad response line'
-    end
-
-    local headers = {}
-    for i = 2, #lines do
-        local line = lines[i]
-        local colon = line:find(':', 1, true)
-        if colon then
-            local k = string.lower(line:sub(1, colon - 1))
-            local v = line:sub(colon + 1):gsub('^%s+', ''):gsub('%s+$', '')
-            headers[k] = v
-        end
-    end
-
-    local body_start = header_end + 4
-    local body_len = tonumber(headers['content-length'] or '0') or 0
-    if expect.method == 'HEAD' then body_len = 0 end
-    if #data < body_start + body_len - 1 then
-        return nil, nil, 'incomplete'
-    end
-
-    local body = body_len > 0 and data:sub(body_start, body_start + body_len - 1) or ''
-    return { status = status, headers = headers, body = body }, body_start + body_len
-end
-
 local client_handler = {}
 
 function client_handler.on_connect(conn)
@@ -161,7 +152,7 @@ function client_handler.on_packet(_, data)
     local consumed = 0
     while pos <= #data and next_response <= #tests do
         local expect = tests[next_response]
-        local resp, next_pos, err = parse_response(data, pos, expect)
+        local resp, next_pos, err = codec.parse_response(data, pos, { method = expect.method })
         if not resp then
             if err == 'incomplete' then break end
             finish(false, 'client parse failed: ' .. tostring(err))
