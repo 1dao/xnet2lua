@@ -2,6 +2,7 @@
 -- Edits ./proxy.pac from Lua through a small HTTP page.
 
 local router = dofile('demo/xhttp_router.lua')
+local xjson = require('xutils').json
 
 local M = {}
 
@@ -72,41 +73,6 @@ local function parse_form(body)
         end
     end
     return out
-end
-
-local function json_string(s)
-    s = tostring(s or '')
-    s = s:gsub('[\\"%z\1-\31]', function(ch)
-        if ch == '\\' then return '\\\\' end
-        if ch == '"' then return '\\"' end
-        if ch == '\n' then return '\\n' end
-        if ch == '\r' then return '\\r' end
-        if ch == '\t' then return '\\t' end
-        return string.format('\\u%04x', string.byte(ch))
-    end)
-    return '"' .. s .. '"'
-end
-
-local function json_rules(payload)
-    local rows = {}
-    for _, rule in ipairs(payload.rules or {}) do
-        rows[#rows + 1] = string.format(
-            '{"pattern":%s,"proxy":%s}',
-            json_string(rule.pattern),
-            json_string(rule.proxy)
-        )
-    end
-
-    return string.format(
-        '{"ok":%s,"message":%s,"pac_file":%s,"http_proxy":%s,"socks5_proxy":%s,"count":%d,"rules":[%s]}',
-        payload.ok == false and 'false' or 'true',
-        json_string(payload.message or ''),
-        json_string(PAC_FILE),
-        json_string(string.format('%s:%d', HTTP_PROXY_HOST, HTTP_PROXY_PORT)),
-        json_string(string.format('%s:%d', SOCKS5_PROXY_HOST, SOCKS5_PROXY_PORT)),
-        #(payload.rules or {}),
-        table.concat(rows, ',')
-    )
 end
 
 local function read_file(path)
@@ -284,8 +250,20 @@ local function delete_rule(pattern)
     return true, 'rule deleted'
 end
 local function json_response(status, payload)
-    payload.rules = payload.rules or read_rules()
-    return response(status, json_rules(payload), 'application/json; charset=utf-8')
+    local rules = payload.rules or read_rules()
+    local body, err = xjson.pack({
+        ok = payload.ok ~= false,
+        message = payload.message or '',
+        pac_file = payload.pac_file or PAC_FILE,
+        http_proxy = payload.http_proxy or string.format('%s:%d', HTTP_PROXY_HOST, HTTP_PROXY_PORT),
+        socks5_proxy = payload.socks5_proxy or string.format('%s:%d', SOCKS5_PROXY_HOST, SOCKS5_PROXY_PORT),
+        count = payload.count or #rules,
+        rules = rules,
+    })
+    if not body then
+        return response(500, tostring(err or 'json pack failed') .. '\n')
+    end
+    return response(status, body, 'application/json; charset=utf-8')
 end
 
 router.reset({

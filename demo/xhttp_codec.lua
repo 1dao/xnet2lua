@@ -1,6 +1,7 @@
 -- xhttp_codec.lua - HTTP/1.x parsing helpers shared by demos and workers.
 
 local M = {}
+local xjson = require('xutils').json
 
 -- ============================================================================
 -- Status and Basic Helpers
@@ -324,160 +325,13 @@ function M.form(req)
     return M.parse_query(tostring(body or ''))
 end
 
-local JSON_NULL = {}
-M.JSON_NULL = JSON_NULL
-
-local function json_error(pos, msg)
-    return nil, string.format('json parse error at %d: %s', pos, msg)
-end
-
-local function json_skip_ws(s, pos)
-    while true do
-        local ch = s:sub(pos, pos)
-        if ch ~= ' ' and ch ~= '\t' and ch ~= '\r' and ch ~= '\n' then
-            return pos
-        end
-        pos = pos + 1
-    end
-end
-
-local function json_parse_string(s, pos)
-    pos = pos + 1
-    local out = {}
-    while pos <= #s do
-        local ch = s:sub(pos, pos)
-        if ch == '"' then
-            return table.concat(out), pos + 1
-        end
-        if ch == '\\' then
-            local esc = s:sub(pos + 1, pos + 1)
-            if esc == '"' or esc == '\\' or esc == '/' then
-                out[#out + 1] = esc
-                pos = pos + 2
-            elseif esc == 'b' then
-                out[#out + 1] = '\b'
-                pos = pos + 2
-            elseif esc == 'f' then
-                out[#out + 1] = '\f'
-                pos = pos + 2
-            elseif esc == 'n' then
-                out[#out + 1] = '\n'
-                pos = pos + 2
-            elseif esc == 'r' then
-                out[#out + 1] = '\r'
-                pos = pos + 2
-            elseif esc == 't' then
-                out[#out + 1] = '\t'
-                pos = pos + 2
-            elseif esc == 'u' then
-                local hex = s:sub(pos + 2, pos + 5)
-                local code = tonumber(hex, 16)
-                if not code then return json_error(pos, 'bad unicode escape') end
-                if code < 128 then
-                    out[#out + 1] = string.char(code)
-                elseif utf8 and utf8.char then
-                    out[#out + 1] = utf8.char(code)
-                else
-                    out[#out + 1] = '?'
-                end
-                pos = pos + 6
-            else
-                return json_error(pos, 'bad escape')
-            end
-        else
-            out[#out + 1] = ch
-            pos = pos + 1
-        end
-    end
-    return json_error(pos, 'unterminated string')
-end
-
-local json_parse_value
-
-local function json_parse_array(s, pos)
-    local out = {}
-    pos = json_skip_ws(s, pos + 1)
-    if s:sub(pos, pos) == ']' then return out, pos + 1 end
-
-    while true do
-        local value
-        value, pos = json_parse_value(s, pos)
-        if pos == nil then return nil, value end
-        out[#out + 1] = value
-
-        pos = json_skip_ws(s, pos)
-        local ch = s:sub(pos, pos)
-        if ch == ']' then return out, pos + 1 end
-        if ch ~= ',' then return json_error(pos, 'expected array comma or close') end
-        pos = json_skip_ws(s, pos + 1)
-    end
-end
-
-local function json_parse_object(s, pos)
-    local out = {}
-    pos = json_skip_ws(s, pos + 1)
-    if s:sub(pos, pos) == '}' then return out, pos + 1 end
-
-    while true do
-        if s:sub(pos, pos) ~= '"' then
-            return json_error(pos, 'expected object key')
-        end
-        local key
-        key, pos = json_parse_string(s, pos)
-        if pos == nil then return nil, key end
-
-        pos = json_skip_ws(s, pos)
-        if s:sub(pos, pos) ~= ':' then
-            return json_error(pos, 'expected object colon')
-        end
-
-        local value
-        value, pos = json_parse_value(s, json_skip_ws(s, pos + 1))
-        if pos == nil then return nil, value end
-        out[key] = value
-
-        pos = json_skip_ws(s, pos)
-        local ch = s:sub(pos, pos)
-        if ch == '}' then return out, pos + 1 end
-        if ch ~= ',' then return json_error(pos, 'expected object comma or close') end
-        pos = json_skip_ws(s, pos + 1)
-    end
-end
-
-local function json_parse_number(s, pos)
-    local e = pos
-    while s:sub(e, e):match('[%+%-%d%.eE]') do
-        e = e + 1
-    end
-    local raw = s:sub(pos, e - 1)
-    local n = tonumber(raw)
-    if not n then return json_error(pos, 'bad number') end
-    return n, e
-end
-
-function json_parse_value(s, pos)
-    pos = json_skip_ws(s, pos)
-    local ch = s:sub(pos, pos)
-    if ch == '"' then return json_parse_string(s, pos) end
-    if ch == '{' then return json_parse_object(s, pos) end
-    if ch == '[' then return json_parse_array(s, pos) end
-    if ch == '-' or ch:match('%d') then return json_parse_number(s, pos) end
-    if s:sub(pos, pos + 3) == 'true' then return true, pos + 4 end
-    if s:sub(pos, pos + 4) == 'false' then return false, pos + 5 end
-    if s:sub(pos, pos + 3) == 'null' then return JSON_NULL, pos + 4 end
-    return json_error(pos, 'unexpected token')
-end
+M.JSON_NULL = xjson.null
+M.json_pack = xjson.pack
+M.json_unpack = xjson.unpack
 
 function M.json(req)
     local body = type(req) == 'table' and req.body or req
-    local s = tostring(body or '')
-    local value, pos = json_parse_value(s, 1)
-    if pos == nil then return nil, value end
-    pos = json_skip_ws(s, pos)
-    if pos <= #s then
-        return nil, string.format('json parse error at %d: trailing data', pos)
-    end
-    return value
+    return xjson.unpack(tostring(body or ''))
 end
 
 local function parse_header_block(block)

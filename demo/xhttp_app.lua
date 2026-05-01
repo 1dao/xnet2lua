@@ -3,16 +3,6 @@
 local codec = dofile('demo/xhttp_codec.lua')
 local router = dofile('demo/xhttp_router.lua')
 
--- Setup JSON pack/unpack alias using xutils.json if available
--- We expose the interface to use xjson_pack/xjson_unpack in this module.
-local xjson_pack, xjson_unpack
-do
-  local ok, xutils = pcall(require, "xutils")
-  if ok and xutils and type(xutils.json) == "table" then
-    xjson_pack, xjson_unpack = xutils.json.pack, xutils.json.unpack
-  end
-end
-
 local M = {}
 
 local function text(status, body, headers)
@@ -50,20 +40,10 @@ router.reg('post', '/form', function(req)
 end)
 
 router.reg('post', '/json', function(req)
-    local data, err
-    if xjson_unpack then
-        local ok, res = pcall(function() return xjson_unpack(req.body) end)
-        if not ok then
-            return text(400, tostring(res) .. '\n')
-        end
-        data = res
-    else
-        data, err = codec.json(req)
-        if not data then
-            return text(400, tostring(err) .. '\n')
-        end
+    local data, err = codec.json(req)
+    if not data then
+        return text(400, tostring(err) .. '\n')
     end
-    -- Use the decoded table (or value) to format the response
     return text(200, string.format('json:%s:%s:%s\n',
         tostring((data and data.pt) or ''), tostring((data and data.arg1) or ''), tostring((data and data.ok) or '')))
 end)

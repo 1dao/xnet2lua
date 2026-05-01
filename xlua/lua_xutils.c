@@ -2,9 +2,9 @@
 **
 ** Keep this module as a lightweight grab bag for tiny helpers.
 ** Current JSON API:
-**   util.json.pack(value)   -> JSON string
-**   util.json.unpack(text)   -> Lua value
-**   util.json.null          -> sentinel for JSON null
+**   xutils.json.pack(value)   -> JSON string
+**   xutils.json.unpack(text)  -> Lua value
+**   xutils.json.null          -> sentinel for JSON null
 */
 
 #include <math.h>

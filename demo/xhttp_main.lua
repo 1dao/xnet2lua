@@ -3,6 +3,7 @@
 
 local xhttp = dofile('demo/xhttp.lua')
 local codec = dofile('demo/xhttp_codec.lua')
+local xjson = require('xutils').json
 
 local CONFIG_FILE = 'demo/xnet.cfg'
 local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
@@ -40,7 +41,11 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
 end
 
 local form_body = 'name=alice+cat&kind=urlencoded'
-local json_body = '{"pt":"demo","arg1":42,"ok":true}'
+local json_body = assert(xjson.pack({
+    pt = 'demo',
+    arg1 = 42,
+    ok = true,
+}))
 local multipart_boundary = '----xnetdemo'
 local multipart_body = table.concat({
     '--' .. multipart_boundary,
