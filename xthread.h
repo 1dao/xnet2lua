@@ -61,8 +61,8 @@ extern "C" {
 typedef struct xThread     xThread;
 typedef struct xThreadPool xThreadPool;
 
-/* Task callback: (owning thread context, user argument) */
-typedef void (*XThreadFunc)(xThread* thr, void* arg);
+/* Task callback: (owning thread context, user argument, arg length) */
+typedef void (*XThreadFunc)(xThread* thr, void* arg, int arg_len);
 
 /* Thread-group load-balancing strategy */
 typedef enum {
@@ -152,6 +152,15 @@ int xthread_post(int target_id, XThreadFunc func,
 ** Returns: 0 success, -1 malloc failed. Never returns -2. */
 int xthread_post_reply(int target_id, XThreadFunc func,
                        const void* arg, size_t arg_len);
+
+/* Set the queue backpressure cap for a specific thread.
+**   new_max  > 0  → xthread_post returns -2 once queue size >= new_max
+**   new_max == 0  → unlimited (cap disabled)
+** Affects subsequent xthread_post calls; in-flight tasks unaffected.
+** xthread_post_reply always bypasses this cap.
+**
+** Returns: 0 success, -1 thread not found. */
+int xthread_set_queue_max(int target_id, int new_max);
 
 /* ============================================================================
 ** xThread field accessors  (required because xThread is opaque)

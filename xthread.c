@@ -493,7 +493,7 @@ static int process_tasks(xThread* ctx) {
 
     while (task) {
         xthrTask* next = task->next;
-        if (task->func) task->func(ctx, task_arg_ptr(task));
+        if (task->func) task->func(ctx, task_arg_ptr(task), (int)task->arg_len);
 
         /* Release external arg payload (if any). */
         if (task->arg_external && task->arg_ptr) {
@@ -982,6 +982,17 @@ int xthread_post(int target_id, XThreadFunc func,
         xthread_notify(selected, need_notify);
     }
     return err;
+}
+
+int xthread_set_queue_max(int target_id, int new_max) {
+    xThread* target = xthread_get(target_id);
+    if (!target) return -1;
+    if (new_max < 0) new_max = 0;
+
+    xnet_mutex_lock(&target->queue.lock);
+    target->queue.max_size = new_max;
+    xnet_mutex_unlock(&target->queue.lock);
+    return 0;
 }
 
 /* Reply path: no pool selection, no max_size cap. Sends directly to the
