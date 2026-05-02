@@ -61,10 +61,6 @@ typedef struct {
     int         pending;    /* 1 = notification already in flight */
     xMutex      lock;       /* recursive mutex, guards linked list */
 
-    /* Lightweight stats (guarded by lock). */
-    unsigned long long pushed_total;
-    unsigned long long dropped_full;
-
     /* Wakeup primitive used when the thread has no xPollState */
 #ifdef _WIN32
     HANDLE          event;      /* auto-reset Event */
@@ -231,32 +227,31 @@ static void xqueue_uninit(xQueue* q) {
     xnet_mutex_uninit(&q->lock);
 }
 
-/* Enqueue a task.
-** Returns false when the queue is at max_size (backpressure) or malloc fails.
-** out_new_size    – new queue depth (NULL to ignore).
-** out_need_notify – true when caller should send a wakeup signal.
+/* Enqueue a task, respecting backpressure limit.
+** Returns error code:
+**   0 = success
+**   -1 = malloc failed
+**   -2 = queue full (backpressure) — task NOT enqueued
 **
-** Convention: never call malloc/free while holding q->lock. The critical
-** section here only does O(1) pointer/counter updates. */
-static bool xqueue_push(xQueue* q, XThreadFunc func, void* arg,
-                         int* out_new_size, bool* out_need_notify) {
+** out_new_size    – new queue depth (NULL to ignore).
+** out_need_notify – true when caller should send a wakeup signal. */
+static int xqueue_push(xQueue* q, XThreadFunc func, void* arg,
+                       int* out_new_size, bool* out_need_notify) {
     xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
-    if (!task) return false;
+    if (!task) return -1;  /* malloc failed */
     task->func = func;
     task->arg  = arg;
     task->next = NULL;
 
     xnet_mutex_lock(&q->lock);
     if (q->max_size > 0 && q->size >= q->max_size) {
-        q->dropped_full++;
         xnet_mutex_unlock(&q->lock);
         free(task);
-        return false;
+        return -2;  /* queue full, backpressure active */
     }
     if (q->tail) { q->tail->next = task; q->tail = task; }
     else          { q->head = q->tail = task; }
     q->size++;
-    q->pushed_total++;
     int  new_size    = q->size;
     bool need_notify = (q->pending == 0);
     if (need_notify) q->pending = 1;
@@ -264,7 +259,39 @@ static bool xqueue_push(xQueue* q, XThreadFunc func, void* arg,
 
     if (out_new_size)    *out_new_size    = new_size;
     if (out_need_notify) *out_need_notify = need_notify;
-    return true;
+    return 0;  /* success */
+}
+
+/* Force-enqueue a task, bypassing backpressure limit.
+** Used by reply path which MUST succeed even under load.
+** Returns error code:
+**   0 = success
+**   -1 = malloc failed
+**   Never returns -2 (always enqueues if malloc succeeds)
+**
+** out_new_size    – new queue depth (NULL to ignore).
+** out_need_notify – true when caller should send a wakeup signal. */
+static int xqueue_push_reply(xQueue* q, XThreadFunc func, void* arg,
+                              int* out_new_size, bool* out_need_notify) {
+    xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
+    if (!task) return -1;  /* malloc failed */
+    task->func = func;
+    task->arg  = arg;
+    task->next = NULL;
+
+    xnet_mutex_lock(&q->lock);
+    /* Bypass max_size check — always enqueue (reply path, must succeed) */
+    if (q->tail) { q->tail->next = task; q->tail = task; }
+    else          { q->head = q->tail = task; }
+    q->size++;
+    int  new_size    = q->size;
+    bool need_notify = (q->pending == 0);
+    if (need_notify) q->pending = 1;
+    xnet_mutex_unlock(&q->lock);
+
+    if (out_new_size)    *out_new_size    = new_size;
+    if (out_need_notify) *out_need_notify = need_notify;
+    return 0;  /* success */
 }
 
 /* Atomically dequeue all tasks; returns head of linked list.
@@ -744,21 +771,21 @@ int xthread_update(int timeout_ms) {
     return n;
 }
 
-bool xthread_post(int target_id, XThreadFunc func, void* arg) {
+int xthread_post(int target_id, XThreadFunc func, void* arg) {
     xThread* target = xthread_get(target_id);
-    if (!target || !atomic_load(&target->running)) return false;
+    if (!target || !atomic_load(&target->running)) return -1;
 
     xThreadPool* group    = target->group;
     xThread*     selected = group ? xthread_pool_select_thread(group) : target;
     if (!selected) {
         XLOGE("xthread_post: no thread available for id=%d", target_id);
-        return false;
+        return -1;
     }
 
     int  new_size    = 0;
     bool need_notify = false;
-    bool ok = xqueue_push(&selected->queue, func, arg, &new_size, &need_notify);
-    if (ok) {
+    int err = xqueue_push(&selected->queue, func, arg, &new_size, &need_notify);
+    if (err == 0) {
         if (group) {
             /* Update pool's load tracker */
             int count = atomic_load(&group->thread_count);
@@ -771,7 +798,25 @@ bool xthread_post(int target_id, XThreadFunc func, void* arg) {
         }
         xthread_notify(selected, need_notify);
     }
-    return ok;
+    return err;
+}
+
+int xthread_post_reply(int target_id, XThreadFunc func, void* arg) {
+    xThread* target = xthread_get(target_id);
+    if (!target || !atomic_load(&target->running)) {
+        XLOGE("xthread_post_reply: no thread available for id=%d", target_id);
+        return -1;
+    }
+
+    /* Reply path: send directly to target, no load balancing */
+    int  new_size    = 0;
+    bool need_notify = false;
+    int err = xqueue_push_reply(&target->queue, func, arg, &new_size, &need_notify);
+    if (err == 0) {
+        /* No pool load tracker update for direct reply */
+        xthread_notify(target, need_notify);
+    }
+    return err;
 }
 
 /* ============================================================================

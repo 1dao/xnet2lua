@@ -115,8 +115,15 @@ void xthread_wakeup_uninit(void);
 ** ========================================================================== */
 
 /* Asynchronously post func(arg) to target_id.
-** If target belongs to a pool, the best thread in the pool is selected. */
-bool xthread_post(int target_id, XThreadFunc func, void* arg);
+** If target belongs to a pool, the best thread in the pool is selected.
+** Returns: 0 = success, -1 = malloc failed, -2 = queue full (backpressure). */
+int xthread_post(int target_id, XThreadFunc func, void* arg);
+
+/* Post func(arg) directly to target_id, bypassing backpressure limit.
+** Used for reply paths where result MUST be delivered even under load (e.g., RPC reply).
+** Sends to the exact target thread, not to a thread pool; ignores load balancing.
+** Returns: 0 = success, -1 = malloc failed. Never returns -2. */
+int xthread_post_reply(int target_id, XThreadFunc func, void* arg);
 
 /* ============================================================================
 ** xThread field accessors  (required because xThread is opaque)
