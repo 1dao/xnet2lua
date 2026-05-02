@@ -39,6 +39,14 @@
 ** Internal types
 ** ========================================================================== */
 
+/* Default backpressure cap on pending tasks per queue.
+** A queue refuses xthread_post once size >= max_size and returns false.
+** Override at build time with -DXTHREAD_QUEUE_MAX_DEFAULT=N.
+** Set to 0 to disable the cap (unbounded — not recommended for production). */
+#ifndef XTHREAD_QUEUE_MAX_DEFAULT
+#define XTHREAD_QUEUE_MAX_DEFAULT 65536
+#endif
+
 typedef struct xthrTask {
     XThreadFunc      func;
     void*            arg;
@@ -49,8 +57,13 @@ typedef struct {
     xthrTask*   head;
     xthrTask*   tail;
     int         size;
+    int         max_size;   /* pending upper bound; 0 = unlimited */
     int         pending;    /* 1 = notification already in flight */
     xMutex      lock;       /* recursive mutex, guards linked list */
+
+    /* Lightweight stats (guarded by lock). */
+    unsigned long long pushed_total;
+    unsigned long long dropped_full;
 
     /* Wakeup primitive used when the thread has no xPollState */
 #ifdef _WIN32
@@ -181,6 +194,7 @@ static int win_socketpair(SOCKET fds[2]) {
 
 static bool xqueue_init(xQueue* q) {
     memset(q, 0, sizeof(*q));
+    q->max_size = XTHREAD_QUEUE_MAX_DEFAULT;
     xnet_mutex_init(&q->lock);
 
 #ifdef _WIN32
@@ -218,8 +232,12 @@ static void xqueue_uninit(xQueue* q) {
 }
 
 /* Enqueue a task.
+** Returns false when the queue is at max_size (backpressure) or malloc fails.
 ** out_new_size    – new queue depth (NULL to ignore).
-** out_need_notify – true when caller should send a wakeup signal. */
+** out_need_notify – true when caller should send a wakeup signal.
+**
+** Convention: never call malloc/free while holding q->lock. The critical
+** section here only does O(1) pointer/counter updates. */
 static bool xqueue_push(xQueue* q, XThreadFunc func, void* arg,
                          int* out_new_size, bool* out_need_notify) {
     xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
@@ -229,9 +247,16 @@ static bool xqueue_push(xQueue* q, XThreadFunc func, void* arg,
     task->next = NULL;
 
     xnet_mutex_lock(&q->lock);
+    if (q->max_size > 0 && q->size >= q->max_size) {
+        q->dropped_full++;
+        xnet_mutex_unlock(&q->lock);
+        free(task);
+        return false;
+    }
     if (q->tail) { q->tail->next = task; q->tail = task; }
     else          { q->head = q->tail = task; }
     q->size++;
+    q->pushed_total++;
     int  new_size    = q->size;
     bool need_notify = (q->pending == 0);
     if (need_notify) q->pending = 1;
