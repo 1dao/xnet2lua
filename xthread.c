@@ -17,6 +17,8 @@
 #include "xlog.h"
 
 #include <stdatomic.h>
+#include <stdalign.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -40,17 +42,29 @@
 ** ========================================================================== */
 
 /* Default backpressure cap on pending tasks per queue.
-** A queue refuses xthread_post once size >= max_size and returns false.
+** xthread_post returns -2 once size >= max_size. xthread_post_reply ignores it.
 ** Override at build time with -DXTHREAD_QUEUE_MAX_DEFAULT=N.
 ** Set to 0 to disable the cap (unbounded — not recommended for production). */
 #ifndef XTHREAD_QUEUE_MAX_DEFAULT
 #define XTHREAD_QUEUE_MAX_DEFAULT 65536
 #endif
 
+/* Task node with inline arg buffer.
+** arg_len == 0          → use arg_ptr (raw pointer, caller-owned, not freed)
+** arg_len <= INLINE     → arg_buf holds copied bytes
+** arg_len  > INLINE     → arg_ptr holds a malloc'd copy (freed in process_tasks) */
 typedef struct xthrTask {
     XThreadFunc      func;
-    void*            arg;
     struct xthrTask* next;
+    uint32_t         arg_len;       /* 0 = pointer semantics                  */
+    uint8_t          from_heap;     /* 1 if node is malloc'd (not from pool)  */
+    uint8_t          arg_external;  /* 1 if arg payload is malloc'd externally*/
+    uint8_t          _pad[2];
+    union {
+        void*        arg_ptr;       /* used when arg_len == 0 OR arg_external */
+        _Alignas(max_align_t)
+        uint8_t      arg_buf[XTHREAD_TASK_ARG_INLINE];
+    };
 } xthrTask;
 
 typedef struct {
@@ -59,7 +73,13 @@ typedef struct {
     int         size;
     int         max_size;   /* pending upper bound; 0 = unlimited */
     int         pending;    /* 1 = notification already in flight */
-    xMutex      lock;       /* recursive mutex, guards linked list */
+    xMutex      lock;       /* recursive mutex, guards linked list + freelist */
+
+    /* Pre-allocated task pool (one contiguous slab). */
+    xthrTask*   pool_storage;   /* base of slab, NULL if disabled         */
+    int         pool_capacity;  /* number of pre-allocated nodes          */
+    xthrTask*   freelist;       /* head of free list (pool nodes only)    */
+    int         freelist_count; /* current freelist depth                 */
 
     /* Wakeup primitive used when the thread has no xPollState */
 #ifdef _WIN32
@@ -188,35 +208,95 @@ static int win_socketpair(SOCKET fds[2]) {
 ** xQueue  (static – never exposed to callers)
 ** ========================================================================== */
 
+/* Allocate the per-queue task slab and chain its nodes onto the freelist.
+** Called from xqueue_init; returns false on allocation failure. */
+static bool xqueue_pool_init(xQueue* q, int capacity) {
+    if (capacity <= 0) {
+        q->pool_storage   = NULL;
+        q->pool_capacity  = 0;
+        q->freelist       = NULL;
+        q->freelist_count = 0;
+        return true;
+    }
+    xthrTask* slab = (xthrTask*)calloc((size_t)capacity, sizeof(xthrTask));
+    if (!slab) return false;
+    q->pool_storage  = slab;
+    q->pool_capacity = capacity;
+    /* Chain backwards so first allocations come from the front of the slab. */
+    xthrTask* head = NULL;
+    for (int i = 0; i < capacity; i++) {
+        slab[i].from_heap = 0;
+        slab[i].next      = head;
+        head              = &slab[i];
+    }
+    q->freelist       = head;
+    q->freelist_count = capacity;
+    return true;
+}
+
 static bool xqueue_init(xQueue* q) {
     memset(q, 0, sizeof(*q));
     q->max_size = XTHREAD_QUEUE_MAX_DEFAULT;
     xnet_mutex_init(&q->lock);
 
+    if (!xqueue_pool_init(q, XTHREAD_TASK_POOL_SIZE)) {
+        xnet_mutex_uninit(&q->lock);
+        return false;
+    }
+
 #ifdef _WIN32
     q->event = CreateEvent(NULL, FALSE, FALSE, NULL); /* auto-reset */
-    return q->event != NULL;
-#else
-    if (pthread_mutex_init(&q->wait_mutex, NULL) != 0)
+    if (!q->event) {
+        free(q->pool_storage);
+        xnet_mutex_uninit(&q->lock);
         return false;
+    }
+    return true;
+#else
+    if (pthread_mutex_init(&q->wait_mutex, NULL) != 0) {
+        free(q->pool_storage);
+        xnet_mutex_uninit(&q->lock);
+        return false;
+    }
     if (pthread_cond_init(&q->cond, NULL) != 0) {
         pthread_mutex_destroy(&q->wait_mutex);
+        free(q->pool_storage);
+        xnet_mutex_uninit(&q->lock);
         return false;
     }
     return true;
 #endif
 }
 
+/* Free a single task node according to its from_heap / arg_external flags.
+** Pool nodes are NOT returned to the freelist here — caller is destroying
+** the queue, so the entire slab is released afterwards. */
+static void xqueue_release_task_destroy(xthrTask* t) {
+    if (t->arg_external && t->arg_ptr) free(t->arg_ptr);
+    if (t->from_heap) free(t);
+}
+
 static void xqueue_uninit(xQueue* q) {
-    /* Free unprocessed task nodes */
+    /* Free unprocessed task nodes (queue is being destroyed: just release
+    ** any external arg buffers and any heap-allocated overflow nodes; the
+    ** pool slab is freed wholesale below). */
     xthrTask* t = q->head;
     while (t) {
         xthrTask* next = t->next;
-        free(t);
+        xqueue_release_task_destroy(t);
         t = next;
     }
     q->head = q->tail = NULL;
     q->size = 0;
+
+    /* Release the pre-allocated slab. */
+    if (q->pool_storage) {
+        free(q->pool_storage);
+        q->pool_storage   = NULL;
+        q->pool_capacity  = 0;
+        q->freelist       = NULL;
+        q->freelist_count = 0;
+    }
 
 #ifdef _WIN32
     if (q->event) { CloseHandle(q->event); q->event = NULL; }
@@ -227,27 +307,99 @@ static void xqueue_uninit(xQueue* q) {
     xnet_mutex_uninit(&q->lock);
 }
 
-/* Enqueue a task, respecting backpressure limit.
-** Returns error code:
-**   0 = success
-**   -1 = malloc failed
-**   -2 = queue full (backpressure) — task NOT enqueued
+/* Try to take a task node from the freelist while holding q->lock.
+** Returns NULL if pool is empty (caller must malloc one outside the lock). */
+static xthrTask* xqueue_freelist_take_locked(xQueue* q) {
+    xthrTask* t = q->freelist;
+    if (!t) return NULL;
+    q->freelist = t->next;
+    q->freelist_count--;
+    return t;
+}
+
+/* Return a pool node to the freelist. Caller must hold q->lock. */
+static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
+    t->next     = q->freelist;
+    q->freelist = t;
+    q->freelist_count++;
+}
+
+/* Enqueue a task.
+**
+** ignore_max:
+**   false → standard backpressure (return -2 when q->size >= q->max_size)
+**   true  → bypass cap (used by xthread_post_reply)
 **
 ** out_new_size    – new queue depth (NULL to ignore).
-** out_need_notify – true when caller should send a wakeup signal. */
-static int xqueue_push(xQueue* q, XThreadFunc func, void* arg,
-                       int* out_new_size, bool* out_need_notify) {
-    xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
-    if (!task) return -1;  /* malloc failed */
-    task->func = func;
-    task->arg  = arg;
-    task->next = NULL;
+** out_need_notify – true when caller should send a wakeup signal.
+**
+** Returns: 0 success, -1 malloc failed, -2 queue full (only when !ignore_max).
+**
+** Convention: every malloc/free happens outside q->lock. The critical
+** section only does O(1) pointer/counter updates and freelist swaps. */
+static int xqueue_push_internal(xQueue* q, XThreadFunc func,
+                                const void* arg, size_t arg_len,
+                                bool ignore_max,
+                                int* out_new_size, bool* out_need_notify) {
+    /* Decide whether arg payload needs an external buffer (out-of-band copy).
+    ** arg_len == 0           → pointer semantics, no copy
+    ** arg_len <= INLINE      → copied into task->arg_buf later
+    ** arg_len  > INLINE      → copy into a fresh malloc buffer (this branch). */
+    void* ext_buf = NULL;
+    if (arg_len > XTHREAD_TASK_ARG_INLINE) {
+        ext_buf = malloc(arg_len);
+        if (!ext_buf) return -1;
+        if (arg) memcpy(ext_buf, arg, arg_len);
+    }
 
+    /* Acquire a node: try pool first, fall back to malloc outside the lock. */
     xnet_mutex_lock(&q->lock);
-    if (q->max_size > 0 && q->size >= q->max_size) {
+    if (!ignore_max && q->max_size > 0 && q->size >= q->max_size) {
         xnet_mutex_unlock(&q->lock);
-        free(task);
-        return -2;  /* queue full, backpressure active */
+        if (ext_buf) free(ext_buf);
+        return -2;
+    }
+    xthrTask* task = xqueue_freelist_take_locked(q);
+    xnet_mutex_unlock(&q->lock);
+
+    bool from_heap = false;
+    if (!task) {
+        task = (xthrTask*)malloc(sizeof(xthrTask));
+        if (!task) {
+            if (ext_buf) free(ext_buf);
+            return -1;
+        }
+        from_heap = true;
+    }
+
+    /* Populate node (outside the lock — this node is private to us). */
+    task->func         = func;
+    task->next         = NULL;
+    task->arg_len      = (uint32_t)arg_len;
+    task->from_heap    = from_heap ? 1 : 0;
+    task->arg_external = ext_buf ? 1 : 0;
+    if (arg_len == 0) {
+        task->arg_ptr = (void*)arg;            /* pointer semantics */
+    } else if (ext_buf) {
+        task->arg_ptr = ext_buf;               /* large copy, freed later */
+    } else if (arg_len > 0 && arg) {
+        memcpy(task->arg_buf, arg, arg_len);   /* inline copy */
+    }
+
+    /* Re-enter the lock to enqueue and re-check max_size (the queue may have
+    ** filled up between our first check and now). */
+    xnet_mutex_lock(&q->lock);
+    if (!ignore_max && q->max_size > 0 && q->size >= q->max_size) {
+        /* Roll back: return node to freelist or free; release ext buffer. */
+        if (from_heap) {
+            xnet_mutex_unlock(&q->lock);
+            free(task);
+        } else {
+            xqueue_freelist_return_locked(q, task);
+            xnet_mutex_unlock(&q->lock);
+        }
+        if (ext_buf) free(ext_buf);
+        return -2;
     }
     if (q->tail) { q->tail->next = task; q->tail = task; }
     else          { q->head = q->tail = task; }
@@ -259,39 +411,23 @@ static int xqueue_push(xQueue* q, XThreadFunc func, void* arg,
 
     if (out_new_size)    *out_new_size    = new_size;
     if (out_need_notify) *out_need_notify = need_notify;
-    return 0;  /* success */
+    return 0;
 }
 
-/* Force-enqueue a task, bypassing backpressure limit.
-** Used by reply path which MUST succeed even under load.
-** Returns error code:
-**   0 = success
-**   -1 = malloc failed
-**   Never returns -2 (always enqueues if malloc succeeds)
-**
-** out_new_size    – new queue depth (NULL to ignore).
-** out_need_notify – true when caller should send a wakeup signal. */
-static int xqueue_push_reply(xQueue* q, XThreadFunc func, void* arg,
-                              int* out_new_size, bool* out_need_notify) {
-    xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
-    if (!task) return -1;  /* malloc failed */
-    task->func = func;
-    task->arg  = arg;
-    task->next = NULL;
+static int xqueue_push(xQueue* q, XThreadFunc func,
+                       const void* arg, size_t arg_len,
+                       int* out_new_size, bool* out_need_notify) {
+    return xqueue_push_internal(q, func, arg, arg_len,
+                                /*ignore_max=*/false,
+                                out_new_size, out_need_notify);
+}
 
-    xnet_mutex_lock(&q->lock);
-    /* Bypass max_size check — always enqueue (reply path, must succeed) */
-    if (q->tail) { q->tail->next = task; q->tail = task; }
-    else          { q->head = q->tail = task; }
-    q->size++;
-    int  new_size    = q->size;
-    bool need_notify = (q->pending == 0);
-    if (need_notify) q->pending = 1;
-    xnet_mutex_unlock(&q->lock);
-
-    if (out_new_size)    *out_new_size    = new_size;
-    if (out_need_notify) *out_need_notify = need_notify;
-    return 0;  /* success */
+static int xqueue_push_reply(xQueue* q, XThreadFunc func,
+                             const void* arg, size_t arg_len,
+                             int* out_new_size, bool* out_need_notify) {
+    return xqueue_push_internal(q, func, arg, arg_len,
+                                /*ignore_max=*/true,
+                                out_new_size, out_need_notify);
 }
 
 /* Atomically dequeue all tasks; returns head of linked list.
@@ -336,15 +472,57 @@ static void xqueue_wait(xQueue* q, int timeout_ms) {
 ** Task dispatch
 ** ========================================================================== */
 
+/* Resolve callback arg pointer based on storage class.
+**   arg_len == 0          → raw pointer in arg_ptr
+**   arg_external          → external malloc buffer in arg_ptr
+**   otherwise (inline)    → arg_buf */
+static inline void* task_arg_ptr(xthrTask* t) {
+    if (t->arg_len == 0) return t->arg_ptr;
+    if (t->arg_external) return t->arg_ptr;
+    return (void*)t->arg_buf;
+}
+
 static int process_tasks(xThread* ctx) {
     int count = 0;
-    xthrTask* task = xqueue_pop_all(&ctx->queue);
+    xQueue*   q    = &ctx->queue;
+    xthrTask* task = xqueue_pop_all(q);
+
+    /* Locally batch pool nodes for return; free heap nodes individually. */
+    xthrTask* return_head = NULL;
+    int       return_count = 0;
+
     while (task) {
         xthrTask* next = task->next;
-        if (task->func) task->func(ctx, task->arg);
-        free(task);
+        if (task->func) task->func(ctx, task_arg_ptr(task));
+
+        /* Release external arg payload (if any). */
+        if (task->arg_external && task->arg_ptr) {
+            free(task->arg_ptr);
+            task->arg_ptr      = NULL;
+            task->arg_external = 0;
+        }
+
+        if (task->from_heap) {
+            free(task);
+        } else {
+            /* Pool node — chain into local batch, return all under one lock. */
+            task->next   = return_head;
+            return_head  = task;
+            return_count++;
+        }
         count++;
         task = next;
+    }
+
+    if (return_head) {
+        xnet_mutex_lock(&q->lock);
+        while (return_head) {
+            xthrTask* nx = return_head->next;
+            xqueue_freelist_return_locked(q, return_head);
+            return_head = nx;
+        }
+        xnet_mutex_unlock(&q->lock);
+        (void)return_count;
     }
     return count;
 }
@@ -771,9 +949,13 @@ int xthread_update(int timeout_ms) {
     return n;
 }
 
-int xthread_post(int target_id, XThreadFunc func, void* arg) {
+int xthread_post(int target_id, XThreadFunc func,
+                 const void* arg, size_t arg_len) {
     xThread* target = xthread_get(target_id);
-    if (!target || !atomic_load(&target->running)) return -1;
+    if (!target || !atomic_load(&target->running)) {
+        XLOGE("xthread_post: no thread available for id=%d", target_id);
+        return -1;
+    }
 
     xThreadPool* group    = target->group;
     xThread*     selected = group ? xthread_pool_select_thread(group) : target;
@@ -784,7 +966,8 @@ int xthread_post(int target_id, XThreadFunc func, void* arg) {
 
     int  new_size    = 0;
     bool need_notify = false;
-    int err = xqueue_push(&selected->queue, func, arg, &new_size, &need_notify);
+    int err = xqueue_push(&selected->queue, func, arg, arg_len,
+                          &new_size, &need_notify);
     if (err == 0) {
         if (group) {
             /* Update pool's load tracker */
@@ -801,19 +984,22 @@ int xthread_post(int target_id, XThreadFunc func, void* arg) {
     return err;
 }
 
-int xthread_post_reply(int target_id, XThreadFunc func, void* arg) {
+/* Reply path: no pool selection, no max_size cap. Sends directly to the
+** thread identified by target_id so the reply reaches the originating thread. */
+int xthread_post_reply(int target_id, XThreadFunc func,
+                       const void* arg, size_t arg_len) {
     xThread* target = xthread_get(target_id);
     if (!target || !atomic_load(&target->running)) {
         XLOGE("xthread_post_reply: no thread available for id=%d", target_id);
         return -1;
     }
 
-    /* Reply path: send directly to target, no load balancing */
     int  new_size    = 0;
     bool need_notify = false;
-    int err = xqueue_push_reply(&target->queue, func, arg, &new_size, &need_notify);
+    int err = xqueue_push_reply(&target->queue, func, arg, arg_len,
+                                &new_size, &need_notify);
     if (err == 0) {
-        /* No pool load tracker update for direct reply */
+        /* No pool load-tracker update for direct reply. */
         xthread_notify(target, need_notify);
     }
     return err;
