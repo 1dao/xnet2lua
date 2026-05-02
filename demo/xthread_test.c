@@ -101,9 +101,9 @@ static void producer_task_func(xThread* thr, void* arg) {
         task->task_num = i;
 
         /* Post task to worker pool - posting to group base ID will automatically select a thread */
-        bool ok = xthread_post(XTHR_WORKER_GRP1, test_task_func, task);
-        if (!ok) {
-            printf("[PRODUCER] Producer %d failed to post task %d\n", producer_id, i);
+        int err = xthread_post(XTHR_WORKER_GRP1, test_task_func, task);
+        if (err != 0) {
+            printf("[PRODUCER] Producer %d failed to post task %d (err=%d)\n", producer_id, i, err);
             free(task);
         } else {
             producer_counter++;
@@ -133,9 +133,9 @@ static int test_basic_single_thread(void) {
         TestTask* task = malloc(sizeof(TestTask));
         task->producer_id = 0;
         task->task_num = i;
-        ok = xthread_post(XTHR_COMPUTE, test_task_func, task);
-        if (!ok) {
-            printf("Failed to post task %d\n", i);
+        int err = xthread_post(XTHR_COMPUTE, test_task_func, task);
+        if (err != 0) {
+            printf("Failed to post task %d (err=%d)\n", i, err);
             free(task);
         }
     }
@@ -175,9 +175,9 @@ static int test_thread_pool_round_robin(void) {
     for (int i = 0; i < 4; i++) {
         int* producer_id = malloc(sizeof(int));
         *producer_id = i + 1;
-        ok = xthread_post(XTHR_MAIN, producer_task_func, producer_id);
-        if (!ok) {
-            printf("Failed to post producer task %d\n", i);
+        int err = xthread_post(XTHR_MAIN, producer_task_func, producer_id);
+        if (err != 0) {
+            printf("Failed to post producer task %d (err=%d)\n", i, err);
             free(producer_id);
         }
     }
@@ -241,9 +241,9 @@ static int test_thread_pool_least_queue(void) {
         TestTask* task = malloc(sizeof(TestTask));
         task->producer_id = 0;
         task->task_num = i;
-        ok = xthread_post(XTHR_WORKER_GRP2, test_task_func, task);
-        if (!ok) {
-            printf("Failed to post task %d\n", i);
+        int err = xthread_post(XTHR_WORKER_GRP2, test_task_func, task);
+        if (err != 0) {
+            printf("Failed to post task %d (err=%d)\n", i, err);
             free(task);
         }
     }
@@ -320,9 +320,9 @@ static void worker_post_to_main(xThread* thr) {
     for (int i = 0; i < tasks_per_worker; i++) {
         int* task_num = malloc(sizeof(int));
         *task_num = i;
-        bool ok = xthread_post(XTHR_MAIN, worker_to_main_task, task_num);
-        if (!ok) {
-            printf("[WORKER] Worker %d failed to post task %d to main\n", worker_id, i);
+        int err = xthread_post(XTHR_MAIN, worker_to_main_task, task_num);
+        if (err != 0) {
+            printf("[WORKER] Worker %d failed to post task %d to main (err=%d)\n", worker_id, i, err);
             free(task_num);
         }
     }
