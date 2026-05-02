@@ -12,9 +12,22 @@
 */
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* Per-task inline arg buffer size. Args with arg_len <= this size are copied
+** into the task node (zero allocation); larger args fall back to malloc. */
+#ifndef XTHREAD_TASK_ARG_INLINE
+#define XTHREAD_TASK_ARG_INLINE 256
+#endif
+
+/* Per-queue task freelist size. Tasks are pre-allocated at xqueue_init.
+** Once exhausted, additional tasks are malloc'd individually. */
+#ifndef XTHREAD_TASK_POOL_SIZE
+#define XTHREAD_TASK_POOL_SIZE 256
 #endif
 
 /* ============================================================================
@@ -116,14 +129,29 @@ void xthread_wakeup_uninit(void);
 
 /* Asynchronously post func(arg) to target_id.
 ** If target belongs to a pool, the best thread in the pool is selected.
-** Returns: 0 = success, -1 = malloc failed, -2 = queue full (backpressure). */
-int xthread_post(int target_id, XThreadFunc func, void* arg);
+**
+** arg semantics by arg_len:
+**   arg_len == 0                       → arg stored as raw pointer (caller owns lifetime)
+**   0 < arg_len <= XTHREAD_TASK_ARG_INLINE → arg copied into task's inline buffer
+**   arg_len  > XTHREAD_TASK_ARG_INLINE → arg copied into a fresh malloc buffer
+**
+** Callback receives a pointer to the stored / copied bytes (or the original
+** pointer for arg_len == 0). The buffer is freed automatically after the
+** callback returns; do not retain the pointer.
+**
+** Returns: 0 success, -1 malloc failed, -2 queue full (backpressure). */
+int xthread_post(int target_id, XThreadFunc func,
+                 const void* arg, size_t arg_len);
 
-/* Post func(arg) directly to target_id, bypassing backpressure limit.
-** Used for reply paths where result MUST be delivered even under load (e.g., RPC reply).
-** Sends to the exact target thread, not to a thread pool; ignores load balancing.
-** Returns: 0 = success, -1 = malloc failed. Never returns -2. */
-int xthread_post_reply(int target_id, XThreadFunc func, void* arg);
+/* Reply path: post directly to target_id (no pool load balancing) and
+** bypass the queue's max_size cap. Use this for RPC reply or any path
+** where delivery MUST succeed under load.
+**
+** arg semantics identical to xthread_post.
+**
+** Returns: 0 success, -1 malloc failed. Never returns -2. */
+int xthread_post_reply(int target_id, XThreadFunc func,
+                       const void* arg, size_t arg_len);
 
 /* ============================================================================
 ** xThread field accessors  (required because xThread is opaque)

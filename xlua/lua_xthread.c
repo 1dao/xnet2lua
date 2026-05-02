@@ -229,15 +229,13 @@ static int l_reply_func(lua_State* L) {
         return 1;
     }
 
-    /* Reply MUST succeed even if target queue is full (backpressure).
-    ** Use post_reply to bypass backpressure: reply MUST be delivered directly to target.
-    ** Only fails on malloc (-1), never on backpressure. */
-    int err = xthread_post_reply(target_id, thread_message_handler, msg);
+    /* Reply MUST be delivered: bypass backpressure and pool load-balancing. */
+    int err = xthread_post_reply(target_id, thread_message_handler, msg, 0);
     if (err != 0) {
         XLOGE("xthread.reply: failed to post to thread %d (err=%d)", target_id, err);
         free(msg);
     }
-    lua_pushinteger(L, err);
+    lua_pushboolean(L, err == 0);
     return 1;
 }
 
@@ -557,27 +555,24 @@ static int l_xthread_post(lua_State* L) {
     /* nargs = 1 (nil) + (top-1) (pt + rest) = top */
     ThreadMsg* msg = pack_to_msg(L, top);
     if (!msg) {
-        lua_pushinteger(L, -1);
+        lua_pushboolean(L, 0);
         lua_pushstring(L, "xthread.post: cmsgpack.pack failed");
         return 2;
     }
 
-    int err = xthread_post(target_id, thread_message_handler, msg);
-    if (err != 0) {
+    int post_err = xthread_post(target_id, thread_message_handler, msg, 0);
+    if (post_err != 0) {
         free(msg);
-        lua_pushinteger(L, err);
-        if (err == -2) {
-            lua_pushstring(L, "queue full");
-        } else if (err == -1) {
-            lua_pushstring(L, "malloc failed");
+        lua_pushboolean(L, 0);
+        if (post_err == -2) {
+            lua_pushfstring(L, "xthread.post: thread %d queue full", target_id);
         } else {
-            lua_pushfstring(L, "thread %d unavailable", target_id);
+            lua_pushfstring(L, "xthread.post: thread %d unavailable", target_id);
         }
         return 2;
     }
-    lua_pushinteger(L, 0);
-    lua_pushstring(L, "ok");
-    return 2;
+    lua_pushboolean(L, 1);
+    return 1;
 }
 
 /* xthread.rpc(target_id, pt, ...)   [must be called from a coroutine]
@@ -632,17 +627,14 @@ static int l_xthread_rpc(lua_State* L) {
         return luaL_error(L, "xthread.rpc: cmsgpack.pack failed");
     }
 
-    int err = xthread_post(target_id, thread_message_handler, msg);
-    if (err != 0) {
+    int rpc_err = xthread_post(target_id, thread_message_handler, msg, 0);
+    if (rpc_err != 0) {
         pending_pop(main_L, co_id, false); /* roll back */
         free(msg);
-        if (err == -2) {
-            return luaL_error(L, "xthread.rpc: queue full");
-        } else if (err == -1) {
-            return luaL_error(L, "xthread.rpc: malloc failed");
-        } else {
-            return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
+        if (rpc_err == -2) {
+            return luaL_error(L, "xthread.rpc: thread %d queue full", target_id);
         }
+        return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
     }
 
     /* Yield; thread_message_handler on caller thread will resume us */
