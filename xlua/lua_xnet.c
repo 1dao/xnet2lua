@@ -9,18 +9,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <limits.h>
-#include <stdio.h>
-
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <dirent.h>
-#include <sys/stat.h>
-#include <errno.h>
-#endif
 
 #if defined(LUA_EMBEDDED)
 #include "../3rd/minilua.h"
@@ -32,7 +20,6 @@
 #include "xchannel.h"
 #include "xpoll.h"
 #include "xthread.h"
-#include "xargs.h"
 #include "xlog.h"
 #include "lua_xnet_tls.h"
 
@@ -841,181 +828,6 @@ static int l_xnet_connect(lua_State* L) {
     return 1;
 }
 
-static int l_xnet_load_config(lua_State* L) {
-    const char* path = luaL_checkstring(L, 1);
-    if (xargs_load_config(path) != 0) {
-        lua_pushboolean(L, 0);
-        lua_pushfstring(L, "load config failed: %s", path);
-        return 2;
-    }
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-static int l_xnet_get_config(lua_State* L) {
-    const char* key = luaL_checkstring(L, 1);
-    const char* value = xargs_get(key);
-    if (value) {
-        lua_pushstring(L, value);
-        return 1;
-    }
-    if (lua_gettop(L) >= 2) {
-        lua_pushvalue(L, 2);
-        return 1;
-    }
-    lua_pushnil(L);
-    return 1;
-}
-
-static char* path_join_dup(const char* a, const char* b) {
-    size_t alen = strlen(a);
-    size_t blen = strlen(b);
-    bool need_sep = alen > 0 && a[alen - 1] != '/' && a[alen - 1] != '\\';
-    char* out = (char*)malloc(alen + blen + (need_sep ? 2 : 1));
-    if (!out) return NULL;
-    memcpy(out, a, alen);
-    if (need_sep) out[alen++] = '/';
-    memcpy(out + alen, b, blen);
-    out[alen + blen] = '\0';
-    return out;
-}
-
-static char* rel_join_dup(const char* rel, const char* name) {
-    char* out = (!rel || rel[0] == '\0')
-        ? (char*)malloc(strlen(name) + 1)
-        : path_join_dup(rel, name);
-    if (!out) return NULL;
-    if (!rel || rel[0] == '\0') strcpy(out, name);
-    for (char* p = out; *p; ++p) {
-        if (*p == '\\') *p = '/';
-    }
-    return out;
-}
-
-static void scan_dir_push_file(lua_State* L, int table_idx, int* count,
-                               const char* path, const char* rel) {
-    lua_newtable(L);
-    lua_pushstring(L, path);
-    lua_setfield(L, -2, "path");
-    lua_pushstring(L, rel);
-    lua_setfield(L, -2, "rel");
-    lua_rawseti(L, table_idx, ++(*count));
-}
-
-static int scan_dir_recursive(lua_State* L, int table_idx, int* count,
-                              const char* dir, const char* rel,
-                              char* errbuf, size_t errcap) {
-#ifdef _WIN32
-    char* pattern = path_join_dup(dir, "*");
-    if (!pattern) {
-        snprintf(errbuf, errcap, "out of memory");
-        return -1;
-    }
-
-    WIN32_FIND_DATAA data;
-    HANDLE h = FindFirstFileA(pattern, &data);
-    free(pattern);
-    if (h == INVALID_HANDLE_VALUE) {
-        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
-        return -1;
-    }
-
-    do {
-        const char* name = data.cFileName;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-        char* full = path_join_dup(dir, name);
-        char* child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            FindClose(h);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                FindClose(h);
-                return -1;
-            }
-        } else {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
-        }
-        free(full);
-        free(child_rel);
-    } while (FindNextFileA(h, &data));
-
-    FindClose(h);
-    return 0;
-#else
-    DIR* d = opendir(dir);
-    if (!d) {
-        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
-        return -1;
-    }
-
-    struct dirent* ent;
-    while ((ent = readdir(d)) != NULL) {
-        const char* name = ent->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-        char* full = path_join_dup(dir, name);
-        char* child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            closedir(d);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        struct stat st;
-        if (stat(full, &st) != 0) {
-            free(full);
-            free(child_rel);
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                closedir(d);
-                return -1;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
-        }
-        free(full);
-        free(child_rel);
-    }
-
-    closedir(d);
-    return 0;
-#endif
-}
-
-static int l_xnet_scan_dir(lua_State* L) {
-    const char* root = luaL_checkstring(L, 1);
-    char errbuf[512] = {0};
-    int count = 0;
-
-    lua_newtable(L);
-    int table_idx = lua_gettop(L);
-    if (scan_dir_recursive(L, table_idx, &count, root, "", errbuf, sizeof(errbuf)) != 0) {
-        lua_pop(L, 1);
-        lua_pushnil(L);
-        lua_pushstring(L, errbuf[0] ? errbuf : "scan directory failed");
-        return 2;
-    }
-    return 1;
-}
-
 static const luaL_Reg conn_methods[] = {
     { "fd",          l_conn_fd },
     { "peer",        l_conn_peer },
@@ -1049,9 +861,6 @@ static const luaL_Reg xnet_funcs[] = {
 #if XNET_WITH_HTTPS
     { "attach_tls", l_xnet_attach_tls },
 #endif
-    { "load_config", l_xnet_load_config },
-    { "get_config",  l_xnet_get_config },
-    { "scan_dir",    l_xnet_scan_dir },
     { NULL, NULL }
 };
 

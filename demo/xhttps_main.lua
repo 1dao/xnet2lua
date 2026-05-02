@@ -2,20 +2,21 @@
 -- Starts the same Lua HTTP app over TLS. Use openssl/curl to verify it.
 
 local xhttp = dofile('demo/xhttp.lua')
+local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XHTTPS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('HTTP_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('HTTPS_PORT', '18443')) or 18443
-local WORKERS = tonumber(xnet.get_config('HTTP_WORKERS', '2')) or 2
-local CERT = xnet.get_config('HTTPS_CERT', 'demo/certs/server.crt')
-local KEY = xnet.get_config('HTTPS_KEY', 'demo/certs/server.key')
-local TEST_SECONDS = tonumber(xnet.get_config('HTTPS_TEST_SECONDS', '15')) or 15
-local ENABLE = true --xnet.get_config('HTTPS_ENABLE', '1') ~= '0'
+local HOST = xutils.get_config('HTTP_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('HTTPS_PORT', '18443')) or 18443
+local WORKERS = tonumber(xutils.get_config('HTTP_WORKERS', '2')) or 2
+local CERT = xutils.get_config('HTTPS_CERT', 'demo/certs/server.crt')
+local KEY = xutils.get_config('HTTPS_KEY', 'demo/certs/server.key')
+local TEST_SECONDS = tonumber(xutils.get_config('HTTPS_TEST_SECONDS', '15')) or 15
+local ENABLE = true --xutils.get_config('HTTPS_ENABLE', '1') ~= '0'
 
 local started_at = nil
 local stopped = false

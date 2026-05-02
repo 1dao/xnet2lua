@@ -2,20 +2,21 @@
 -- Main starts one NATS service thread plus business workers in __init.
 
 local xnats = dofile('demo/xnats.lua')
+local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XNATS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('NATS_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('NATS_PORT', '4222')) or 4222
-local PROCESS_NAME = XNET_PROCESS_NAME or xnet.get_config('SERVER_NAME', 'game1')
-local PREFIX = xnet.get_config('NATS_PREFIX', 'xnet.test')
-local TEST_DELAY_SEC = tonumber(xnet.get_config('NATS_TEST_DELAY_SEC', '5')) or 5
-local TIMEOUT_SEC = tonumber(xnet.get_config('NATS_TEST_TIMEOUT_SEC', '30')) or 30
-local PEER_PROCESS = xnet.get_config('NATS_TEST_PEER', '')
+local HOST = xutils.get_config('NATS_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
+local PROCESS_NAME = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'game1')
+local PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
+local TEST_DELAY_SEC = tonumber(xutils.get_config('NATS_TEST_DELAY_SEC', '5')) or 5
+local TIMEOUT_SEC = tonumber(xutils.get_config('NATS_TEST_TIMEOUT_SEC', '30')) or 30
+local PEER_PROCESS = xutils.get_config('NATS_TEST_PEER', '')
 if PEER_PROCESS == 'auto' then
     if PROCESS_NAME == 'game1' then
         PEER_PROCESS = 'game2'
@@ -25,7 +26,7 @@ if PEER_PROCESS == 'auto' then
         PEER_PROCESS = ''
     end
 end
-local hold_cfg = xnet.get_config('NATS_TEST_HOLD_SEC')
+local hold_cfg = xutils.get_config('NATS_TEST_HOLD_SEC')
 local TEST_HOLD_SEC = tonumber(hold_cfg)
 if not TEST_HOLD_SEC then
     TEST_HOLD_SEC = (PEER_PROCESS ~= '' and 10 or 0)

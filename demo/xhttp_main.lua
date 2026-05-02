@@ -6,15 +6,15 @@ local codec = dofile('demo/xhttp_codec.lua')
 local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XHTTP-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('HTTP_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('HTTP_PORT', '18080')) or 18080
-local WORKERS = tonumber(xnet.get_config('HTTP_WORKERS', '2')) or 2
-local ENABLE = xnet.get_config('HTTP_ENABLE', '1') ~= '0'
+local HOST = xutils.get_config('HTTP_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('HTTP_PORT', '18080')) or 18080
+local WORKERS = tonumber(xutils.get_config('HTTP_WORKERS', '2')) or 2
+local ENABLE = xutils.get_config('HTTP_ENABLE', '1') ~= '0'
 
 local client_conn = nil
 local finished = false

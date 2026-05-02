@@ -3,16 +3,17 @@
 -- them in __uninit. Business workers issue Redis operations.
 
 local xredis = dofile('demo/xredis.lua')
+local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XREDIS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('REDIS_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('REDIS_PORT', '6379')) or 6379
-local DB = tonumber(xnet.get_config('REDIS_DB', '1')) or 1
+local HOST = xutils.get_config('REDIS_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('REDIS_PORT', '6379')) or 6379
+local DB = tonumber(xutils.get_config('REDIS_DB', '1')) or 1
 
 local BUSINESS_THREADS = {
     { id = xthread.WORKER_GRP1, name = 'redis-biz-1', label = 'biz-1' },

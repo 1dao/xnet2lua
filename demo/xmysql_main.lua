@@ -3,18 +3,19 @@
 -- them in __uninit. Business workers issue MySQL operations.
 
 local xmysql = dofile('demo/xmysql.lua')
+local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XMYSQL-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('MYSQL_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('MYSQL_PORT', '3306')) or 3306
-local USER = xnet.get_config('MYSQL_USER', 'chib')
-local PASSWORD = xnet.get_config('MYSQL_PASSWORD', 'xqb111')
-local DATABASE = xnet.get_config('MYSQL_DATABASE', '')
+local HOST = xutils.get_config('MYSQL_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('MYSQL_PORT', '3306')) or 3306
+local USER = xutils.get_config('MYSQL_USER', 'chib')
+local PASSWORD = xutils.get_config('MYSQL_PASSWORD', 'xqb111')
+local DATABASE = xutils.get_config('MYSQL_DATABASE', '')
 
 local BUSINESS_THREADS = {
     { id = xthread.WORKER_GRP2, name = 'mysql-biz-1', label = 'biz-1' },

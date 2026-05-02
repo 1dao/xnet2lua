@@ -1,19 +1,20 @@
 -- xpac_main.lua - browser test entry for editing ./proxy.pac.
 
 local xhttp = dofile('demo/xhttp.lua')
+local xutils = require('xutils')
 
 local CONFIG_FILE = 'demo/xnet.cfg'
-local ok_cfg, cfg_err = xnet.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XPAC-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
 end
 
-local HOST = xnet.get_config('PAC_WEB_HOST', '127.0.0.1')
-local PORT = tonumber(xnet.get_config('PAC_WEB_PORT', '18090')) or 18090
+local HOST = xutils.get_config('PAC_WEB_HOST', '127.0.0.1')
+local PORT = tonumber(xutils.get_config('PAC_WEB_PORT', '18090')) or 18090
 local HTTPS = nil
-local CERT = xnet.get_config('HTTPS_CERT', 'demo/certs/server.crt')
-local KEY = xnet.get_config('HTTPS_KEY', 'demo/certs/server.key')
-local KEY_PASSWORD = xnet.get_config('HTTPS_KEY_PASSWORD', '')
+local CERT = xutils.get_config('HTTPS_CERT', 'demo/certs/server.crt')
+local KEY = xutils.get_config('HTTPS_KEY', 'demo/certs/server.key')
+local KEY_PASSWORD = xutils.get_config('HTTPS_KEY_PASSWORD', '')
 
 local function to_bool(v, default)
     if v == nil then return default end
@@ -26,7 +27,7 @@ local function to_bool(v, default)
     return default
 end
 
-HTTPS = to_bool(xnet.get_config('HTTPS_ENABLE', '1'), true)
+HTTPS = to_bool(xutils.get_config('HTTPS_ENABLE', '1'), true)
 
 _stubs = {}
 _thread_replys = {}
@@ -52,7 +53,7 @@ end
 local function __init()
     local scheme = HTTPS and 'https' or 'http'
     print(string.format('[XPAC-MAIN] init %s=%s:%d pac=%s',
-        scheme, HOST, PORT, xnet.get_config('PAC_FILE', 'proxy.pac')))
+        scheme, HOST, PORT, xutils.get_config('PAC_FILE', 'proxy.pac')))
     assert(xnet.init())
 
     local ok, err = xhttp.start({

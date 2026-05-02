@@ -515,7 +515,7 @@ conn:set_handler(new_handlers)
 -- 扫描目录，返回文件列表
 -- root：目录路径
 -- 返回：{ {rel="相对路径", path="完整路径"}, ... }，或 nil + err
-local files, err = xnet.scan_dir("static/")
+local files, err = xutils.scan_dir("static/")
 if files then
     for _, f in ipairs(files) do
         print(f.rel, f.path)
@@ -984,16 +984,16 @@ MYSQL_DATABASE=mydb
 
 ```lua
 -- 加载配置文件（通常在主线程 __init 最开始执行）
-local ok, err = xnet.load_config("config/xnet.cfg")
+local ok, err = xutils.load_config("config/xnet.cfg")
 if not ok then
     io.stderr:write("配置加载失败: " .. tostring(err) .. "\n")
 end
 
 -- 读取配置项（第二个参数为默认值）
-local host    = xnet.get_config("HTTP_HOST", "127.0.0.1")
-local port    = tonumber(xnet.get_config("HTTP_PORT", "8080")) or 8080
-local workers = tonumber(xnet.get_config("HTTP_WORKERS", "2")) or 2
-local debug   = xnet.get_config("DEBUG", "0") ~= "0"
+local host    = xutils.get_config("HTTP_HOST", "127.0.0.1")
+local port    = tonumber(xutils.get_config("HTTP_PORT", "8080")) or 8080
+local workers = tonumber(xutils.get_config("HTTP_WORKERS", "2")) or 2
+local debug   = xutils.get_config("DEBUG", "0") ~= "0"
 ```
 
 ### 11.3 命令行覆盖配置
@@ -1209,7 +1209,7 @@ return {
 local xhttp = dofile("demo/xhttp.lua")
 
 local CONFIG_FILE = "config/xnet.cfg"
-xnet.load_config(CONFIG_FILE)
+xutils.load_config(CONFIG_FILE)
 
 _stubs = {}
 _thread_replys = {}
@@ -1224,9 +1224,9 @@ local function __init()
     assert(xnet.init())
 
     local ok, err = xhttp.start({
-        host         = xnet.get_config("HTTP_HOST", "0.0.0.0"),
-        port         = tonumber(xnet.get_config("HTTP_PORT", "8080")),
-        worker_count = tonumber(xnet.get_config("HTTP_WORKERS", "4")),
+        host         = xutils.get_config("HTTP_HOST", "0.0.0.0"),
+        port         = tonumber(xutils.get_config("HTTP_PORT", "8080")),
+        worker_count = tonumber(xutils.get_config("HTTP_WORKERS", "4")),
         app_script   = "api_app.lua",
     })
 

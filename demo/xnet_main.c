@@ -3,7 +3,7 @@
 ** xnet test mode:
 **   Build this file once into xnet.exe, then run any Lua test by passing the
 **   test's main script. Shared service configuration can be loaded by Lua via
-**   xnet.load_config(); SERVER_NAME can be supplied after the main script.
+**   xutils.load_config(); SERVER_NAME can be supplied after the main script.
 **
 ** Usage:
 **   xnet.exe demo/xnats_main.lua SERVER_NAME=game1

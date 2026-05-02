@@ -1,5 +1,6 @@
 -- xhttp_router.lua - Lua-state singleton router for xhttp apps.
 
+local xutils = require 'xutils'
 local ROUTER_KEY = '__xnet_xhttp_router'
 local M = rawget(_G, ROUTER_KEY)
 if M then return M end
@@ -122,7 +123,7 @@ end
 
 function M.reg_path(root, opts)
     opts = opts or {}
-    local files, err = xnet.scan_dir(root)
+    local files, err = xutils.scan_dir(root)
     if not files then
         io.stderr:write(string.format('[%s] scan static dir failed: %s\n',
             M.log_prefix, tostring(err)))
