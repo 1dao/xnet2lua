@@ -71,7 +71,8 @@ static void worker_on_cleanup(xThread* thr) {
 }
 
 /* The actual task function that runs on the target thread */
-static void test_task_func(xThread* thr, void* arg) {
+static void test_task_func(xThread* thr, void* arg, int arg_len) {
+    (void)arg_len;
     TestTask* task = (TestTask*)arg;
     int current_id = xthread_current_id();
     int target_id = xthread_get_id(thr);
@@ -88,8 +89,9 @@ static void test_task_func(xThread* thr, void* arg) {
 }
 
 /* Producer thread that posts tasks to worker pool */
-static void producer_task_func(xThread* thr, void* arg) {
+static void producer_task_func(xThread* thr, void* arg, int arg_len) {
     (void)thr;
+    (void)arg_len;
     int producer_id = *(int*)arg;
     int tasks_per_producer = 5;
 
@@ -293,7 +295,8 @@ static int test_thread_identification(void) {
 static volatile int worker_to_main_counter = 0;
 
 /* Task that runs on main thread, posted from worker */
-static void worker_to_main_task(xThread* thr, void* arg) {
+static void worker_to_main_task(xThread* thr, void* arg, int arg_len) {
+    (void)arg_len;
     int task_num = *(int*)arg;
     int from_thread_id = xthread_current_id();
     int target_id = xthread_get_id(thr);
@@ -375,6 +378,241 @@ static int test_worker_to_main(void) {
     return 0;
 }
 
+/* ============================================================================
+** Test 6: arg_len semantics — pointer / inline copy / heap copy
+** ============================================================================ */
+
+typedef struct {
+    unsigned int magic;
+    int          task_num;
+} SmallArg;
+
+#define BIG_PAYLOAD_SIZE 512  /* must be > XTHREAD_TASK_ARG_INLINE (256) */
+
+typedef struct {
+    unsigned int magic;
+    int          task_num;
+    char         payload[BIG_PAYLOAD_SIZE - 8];  /* total 512B */
+} BigArg;
+
+static volatile int test6_pointer_count = 0;
+static volatile int test6_inline_count  = 0;
+static volatile int test6_heap_count    = 0;
+static volatile int test6_errors        = 0;
+
+/* arg_len == 0 → raw pointer (caller-owned, callback frees). */
+static void test6_pointer_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr;
+    SmallArg* a = (SmallArg*)arg;
+    if (arg_len != 0) {
+        test6_errors++;
+        printf("[T6 ptr] expected arg_len=0, got %d\n", arg_len);
+    }
+    if (a->magic != 0xCAFEBABEu) {
+        test6_errors++;
+        printf("[T6 ptr] bad magic 0x%x\n", a->magic);
+    }
+    test6_pointer_count++;
+    free(arg);  /* pointer semantics — we own it */
+}
+
+/* 0 < arg_len <= XTHREAD_TASK_ARG_INLINE → arg copied into task's inline buffer. */
+static void test6_inline_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr;
+    SmallArg* a = (SmallArg*)arg;
+    if (arg_len != (int)sizeof(SmallArg)) {
+        test6_errors++;
+        printf("[T6 inline] expected arg_len=%d, got %d\n",
+               (int)sizeof(SmallArg), arg_len);
+    }
+    if (a->magic != 0xDEADBEEFu) {
+        test6_errors++;
+        printf("[T6 inline] bad magic 0x%x\n", a->magic);
+    }
+    test6_inline_count++;
+    /* No free — arg lives in the task's inline buffer, freed by xthread. */
+}
+
+/* arg_len > XTHREAD_TASK_ARG_INLINE → arg copied into a fresh heap buffer. */
+static void test6_heap_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr;
+    BigArg* a = (BigArg*)arg;
+    if (arg_len != (int)sizeof(BigArg)) {
+        test6_errors++;
+        printf("[T6 heap] expected arg_len=%d, got %d\n",
+               (int)sizeof(BigArg), arg_len);
+    }
+    if (a->magic != 0x12345678u) {
+        test6_errors++;
+        printf("[T6 heap] bad magic 0x%x\n", a->magic);
+    }
+    /* Tail byte sentinel — catches truncated / partial copies. */
+    if (a->payload[sizeof(a->payload) - 1] != (char)0x5A) {
+        test6_errors++;
+        printf("[T6 heap] payload tail mismatch\n");
+    }
+    test6_heap_count++;
+    /* No free — heap buffer owned by xthread. */
+}
+
+static int test_arg_len_semantics(void) {
+    printf("\n========================================\n");
+    printf("Test 6: arg_len semantics (pointer / inline / heap copy)\n");
+    printf("Sizes: SmallArg=%d  BigArg=%d  INLINE_MAX=%d\n",
+           (int)sizeof(SmallArg), (int)sizeof(BigArg),
+           XTHREAD_TASK_ARG_INLINE);
+    printf("========================================\n");
+
+    test6_pointer_count = 0;
+    test6_inline_count  = 0;
+    test6_heap_count    = 0;
+    test6_errors        = 0;
+
+    bool ok = xthread_register(XTHR_COMPUTE, "argtest-worker",
+                               worker_on_init, worker_on_update, worker_on_cleanup);
+    if (!ok) {
+        printf("Failed to register worker thread\n");
+        return -1;
+    }
+
+    const int N = 5;
+
+    /* Mode 1: arg_len = 0 → raw pointer; producer mallocs, consumer frees. */
+    for (int i = 0; i < N; i++) {
+        SmallArg* a = malloc(sizeof(SmallArg));
+        a->magic    = 0xCAFEBABEu;
+        a->task_num = i;
+        int err = xthread_post(XTHR_COMPUTE, test6_pointer_handler, a, 0);
+        if (err != 0) { printf("post(ptr) err=%d\n", err); free(a); }
+    }
+
+    /* Mode 2: arg_len = sizeof(SmallArg) (<=256) → inline copy. Stack arg OK. */
+    for (int i = 0; i < N; i++) {
+        SmallArg a = { .magic = 0xDEADBEEFu, .task_num = i };
+        int err = xthread_post(XTHR_COMPUTE, test6_inline_handler,
+                               &a, sizeof(a));
+        if (err != 0) printf("post(inline) err=%d\n", err);
+    }
+
+    /* Mode 3: arg_len = sizeof(BigArg) (>256) → heap copy. Stack arg OK. */
+    for (int i = 0; i < N; i++) {
+        BigArg a;
+        memset(&a, 0, sizeof(a));
+        a.magic    = 0x12345678u;
+        a.task_num = i;
+        a.payload[sizeof(a.payload) - 1] = (char)0x5A;
+        int err = xthread_post(XTHR_COMPUTE, test6_heap_handler,
+                               &a, sizeof(a));
+        if (err != 0) printf("post(heap) err=%d\n", err);
+    }
+
+    sleep(1);
+    xthread_unregister(XTHR_COMPUTE);
+    sleep(1);
+
+    printf("Test 6 done: pointer=%d  inline=%d  heap=%d  errors=%d "
+           "(expected %d/%d/%d/0)\n",
+           test6_pointer_count, test6_inline_count, test6_heap_count,
+           test6_errors, N, N, N);
+
+    if (test6_pointer_count != N || test6_inline_count != N
+        || test6_heap_count != N || test6_errors != 0) {
+        printf("[FAIL] Test 6 did not get expected counts\n");
+        return -1;
+    }
+    return 0;
+}
+
+/* ============================================================================
+** Test 7: backpressure — xthread_set_queue_max + xthread_post -2 path
+** ============================================================================ */
+
+#define BP_QUEUE_MAX  5
+#define BP_TOTAL_POSTS 20
+
+static volatile int bp_post_ok      = 0;
+static volatile int bp_post_full    = 0;
+static volatile int bp_post_other   = 0;
+static volatile int bp_consumed     = 0;
+
+/* Slow consumer keeps the queue backed up so further posts hit -2. */
+static void bp_slow_task(xThread* thr, void* arg, int arg_len) {
+    (void)thr;
+    (void)arg_len;
+    int task_id = *(int*)arg;
+    free(arg);
+    usleep(100000); /* 100 ms */
+    bp_consumed++;
+    (void)task_id;
+}
+
+static int test_backpressure(void) {
+    printf("\n========================================\n");
+    printf("Test 7: backpressure (max_size=%d, posts=%d)\n",
+           BP_QUEUE_MAX, BP_TOTAL_POSTS);
+    printf("========================================\n");
+
+    bp_post_ok    = 0;
+    bp_post_full  = 0;
+    bp_post_other = 0;
+    bp_consumed   = 0;
+
+    bool ok = xthread_register(XTHR_COMPUTE, "bp-worker",
+                               worker_on_init, worker_on_update, worker_on_cleanup);
+    if (!ok) {
+        printf("Failed to register worker thread\n");
+        return -1;
+    }
+
+    if (xthread_set_queue_max(XTHR_COMPUTE, BP_QUEUE_MAX) != 0) {
+        printf("xthread_set_queue_max failed\n");
+        xthread_unregister(XTHR_COMPUTE);
+        return -1;
+    }
+
+    for (int i = 0; i < BP_TOTAL_POSTS; i++) {
+        int* task_id = malloc(sizeof(int));
+        *task_id = i;
+        int err = xthread_post(XTHR_COMPUTE, bp_slow_task, task_id, 0);
+        if (err == 0) {
+            bp_post_ok++;
+        } else if (err == -2) {
+            bp_post_full++;
+            free(task_id);
+        } else {
+            bp_post_other++;
+            free(task_id);
+        }
+        usleep(10000); /* 10 ms — faster than the 100 ms consumer */
+    }
+
+    /* Drain remaining queued tasks (post_ok * 100ms is the worst case). */
+    sleep(3);
+
+    xthread_unregister(XTHR_COMPUTE);
+
+    printf("Test 7 done: ok=%d  full(-2)=%d  other_err=%d  consumed=%d\n",
+           bp_post_ok, bp_post_full, bp_post_other, bp_consumed);
+
+    if (bp_post_ok + bp_post_full + bp_post_other != BP_TOTAL_POSTS) {
+        printf("[FAIL] post counts do not sum to %d\n", BP_TOTAL_POSTS);
+        return -1;
+    }
+    if (bp_post_full == 0) {
+        printf("[FAIL] no -2 (queue full) seen — backpressure not triggered\n");
+        return -1;
+    }
+    if (bp_post_other != 0) {
+        printf("[FAIL] unexpected error code seen\n");
+        return -1;
+    }
+    if (bp_consumed != bp_post_ok) {
+        printf("[FAIL] consumed (%d) != post_ok (%d)\n", bp_consumed, bp_post_ok);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -414,6 +652,16 @@ int main(int argc, char** argv) {
     }
 
     if (test_worker_to_main() != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    if (test_arg_len_semantics() != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    if (test_backpressure() != 0) {
         ret = -1;
         goto cleanup;
     }

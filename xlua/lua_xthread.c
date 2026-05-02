@@ -72,61 +72,48 @@ typedef struct {
     int sentinel_ref;            /* GC protection reference (keeps ThreadData alive) */
 } ThreadData;
 
-/* ============================================================================
-** ThreadMsg: heap buffer carrying a packed message across OS threads
-** ========================================================================== */
-typedef struct {
-    size_t len;
-    char   data[1]; /* flexible – allocate sizeof(ThreadMsg) + len - 1 */
-} ThreadMsg;
-
-static ThreadMsg* msg_alloc(const char* buf, size_t len) {
-    ThreadMsg* m = (ThreadMsg*)malloc(offsetof(ThreadMsg, data) + len);
-    if (m) { m->len = len; memcpy(m->data, buf, len); }
-    return m;
-}
-
 /* Forward declaration */
-static void thread_message_handler(xThread* thr, void* arg);
+static void thread_message_handler(xThread* thr, void* arg, int arg_len);
 static int thread_data_gc(lua_State* L);
 
 /* ThreadData metatable name */
 static const char* THREAD_DATA_META = "xthread.ThreadData";
 
 /* ============================================================================
-** pack_to_msg
-** Pack Lua stack values into a ThreadMsg using cmsgpack
+** pack_to_lua_stack
+** Pack Lua stack values with cmsgpack, leaving the result string on stack.
+** Returns the packed byte length, or -1 on failure.
+** Successful: stack top = Lua string (data, len via lua_tolstring).
+** Failed:     stack unchanged.
 ** ========================================================================== */
-static ThreadMsg* pack_to_msg(lua_State* L, int nargs) {
+static lua_Integer pack_to_lua_stack(lua_State* L, int nargs) {
     /* Call cmsgpack.pack(...) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_PACK_KEY);
     if (!lua_isfunction(L, -1)) {
         XLOGE("xthread: pack function not found (did you call xthread.init?)");
-        return NULL;
+        return -1;
     }
     lua_insert(L, lua_gettop(L) - nargs); /* move function before args */
     if (lua_pcall(L, nargs, 1, 0) != LUA_OK) {
         XLOGE("xthread: pack failed: %s", lua_tostring(L, -1));
-        return NULL;
+        return -1;
     }
     /* Result is a string on top */
     if (!lua_isstring(L, -1)) {
         XLOGE("xthread: pack did not return a string");
         lua_pop(L, 1);
-        return NULL;
+        return -1;
     }
     size_t len;
-    const char* data = lua_tolstring(L, -1, &len);
-    ThreadMsg* msg = msg_alloc(data, len);
-    lua_pop(L, 1);
-    return msg;
+    lua_tolstring(L, -1, &len);  /* just to get length; string stays on stack */
+    return (lua_Integer)len;
 }
 
 /* ============================================================================
-** unpack_msg
-** Unpack ThreadMsg into Lua stack, returns number of values or -1 on error
+** unpack_raw
+** Unpack raw bytes into Lua stack, returns number of values or -1 on error.
 ** ========================================================================== */
-static int unpack_msg(lua_State* L, ThreadMsg* msg) {
+static int unpack_raw(lua_State* L, const char* data, size_t len) {
     int base = lua_gettop(L);
     /* Call cmsgpack.unpack(buf) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_UNPACK_KEY);
@@ -135,7 +122,7 @@ static int unpack_msg(lua_State* L, ThreadMsg* msg) {
         lua_settop(L, base);
         return -1;
     }
-    lua_pushlstring(L, msg->data, msg->len);
+    lua_pushlstring(L, data, len);
     if (lua_pcall(L, 1, LUA_MULTRET, 0) != LUA_OK) {
         XLOGE("xthread: unpack failed: %s", lua_tostring(L, -1));
         lua_settop(L, base);
@@ -221,21 +208,26 @@ static int l_reply_func(lua_State* L) {
     lua_insert(L, 1);
     /* co_id, sk, pt, ok... are already on stack after that */
 
-    ThreadMsg* msg = pack_to_msg(L, nargs + 2); /* +2 for nil + "@async_resume" */
-    if (!msg) {
+    lua_Integer pkt_len = pack_to_lua_stack(L, nargs + 2); /* +2 for nil + "@async_resume" */
+    if (pkt_len < 0) {
         XLOGE("xthread.reply: failed to pack message");
         lua_settop(L, 0);
         lua_pushboolean(L, 0);
         return 1;
     }
 
-    /* Reply MUST be delivered: bypass backpressure and pool load-balancing. */
-    int err = xthread_post_reply(target_id, thread_message_handler, msg, 0);
-    if (err != 0) {
-        XLOGE("xthread.reply: failed to post to thread %d (err=%d)", target_id, err);
-        free(msg);
+    {
+        size_t tmp;
+        const char* pkt_data = lua_tolstring(L, -1, &tmp);
+        /* Reply MUST be delivered: bypass backpressure and pool load-balancing. */
+        int err = xthread_post_reply(target_id, thread_message_handler,
+                                     pkt_data, (size_t)pkt_len);
+        lua_pop(L, 1);  /* pop packed string */
+        if (err != 0) {
+            XLOGE("xthread.reply: failed to post to thread %d (err=%d)", target_id, err);
+        }
+        lua_pushboolean(L, err == 0);
     }
-    lua_pushboolean(L, err == 0);
     return 1;
 }
 
@@ -320,21 +312,19 @@ static int thread_data_gc(lua_State* L) {
 **   a) Intercepts "@async_resume" → resumes the waiting coroutine directly
 **   b) Dispatches to the registered Lua handler
 ** ============================================================================ */
-static void thread_message_handler(xThread* thr, void* arg) {
-    ThreadMsg* msg = (ThreadMsg*)arg;
+static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
     ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
 
     if (!td || !td->L) {
         XLOGE("xthread: no lua state for thread %d", xthread_get_id(thr));
-        free(msg);
         return;
     }
 
     lua_State* L = td->L;
     int id = xthread_get_id(thr);
     int base = lua_gettop(L);
-    int nvals = unpack_msg(L, msg);
-    free(msg);
+
+    int nvals = unpack_raw(L, (const char*)arg, (size_t)arg_len);
     if (nvals < 0) return; /* unpack failed */
 
     /* Unpacked layout (1-based, relative to base):
@@ -553,23 +543,28 @@ static int l_xthread_post(lua_State* L) {
     for (int i = 2; i <= top; i++)
         lua_pushvalue(L, i);
     /* nargs = 1 (nil) + (top-1) (pt + rest) = top */
-    ThreadMsg* msg = pack_to_msg(L, top);
-    if (!msg) {
+    lua_Integer pkt_len = pack_to_lua_stack(L, top);
+    if (pkt_len < 0) {
         lua_pushboolean(L, 0);
         lua_pushstring(L, "xthread.post: cmsgpack.pack failed");
         return 2;
     }
 
-    int post_err = xthread_post(target_id, thread_message_handler, msg, 0);
-    if (post_err != 0) {
-        free(msg);
-        lua_pushboolean(L, 0);
-        if (post_err == -2) {
-            lua_pushfstring(L, "xthread.post: thread %d queue full", target_id);
-        } else {
-            lua_pushfstring(L, "xthread.post: thread %d unavailable", target_id);
+    {
+        size_t tmp;
+        const char* pkt_data = lua_tolstring(L, -1, &tmp);
+        int post_err = xthread_post(target_id, thread_message_handler,
+                                    pkt_data, (size_t)pkt_len);
+        lua_pop(L, 1);
+        if (post_err != 0) {
+            lua_pushboolean(L, 0);
+            if (post_err == -2) {
+                lua_pushfstring(L, "xthread.post: thread %d queue full", target_id);
+            } else {
+                lua_pushfstring(L, "xthread.post: thread %d unavailable", target_id);
+            }
+            return 2;
         }
-        return 2;
     }
     lua_pushboolean(L, 1);
     return 1;
@@ -621,20 +616,25 @@ static int l_xthread_rpc(lua_State* L) {
     for (int i = 2; i <= top; i++)
         lua_pushvalue(L, i); /* pt, args */
     /* nargs = 3 + (top-1) = top+2 */
-    ThreadMsg* msg = pack_to_msg(L, top + 2);
-    if (!msg) {
+    lua_Integer pkt_len = pack_to_lua_stack(L, top + 2);
+    if (pkt_len < 0) {
         pending_pop(main_L, co_id, false); /* roll back */
         return luaL_error(L, "xthread.rpc: cmsgpack.pack failed");
     }
 
-    int rpc_err = xthread_post(target_id, thread_message_handler, msg, 0);
-    if (rpc_err != 0) {
-        pending_pop(main_L, co_id, false); /* roll back */
-        free(msg);
-        if (rpc_err == -2) {
-            return luaL_error(L, "xthread.rpc: thread %d queue full", target_id);
+    {
+        size_t tmp;
+        const char* pkt_data = lua_tolstring(L, -1, &tmp);
+        int rpc_err = xthread_post(target_id, thread_message_handler,
+                                   pkt_data, (size_t)pkt_len);
+        lua_pop(L, 1);
+        if (rpc_err != 0) {
+            pending_pop(main_L, co_id, false); /* roll back */
+            if (rpc_err == -2) {
+                return luaL_error(L, "xthread.rpc: thread %d queue full", target_id);
+            }
+            return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
         }
-        return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
     }
 
     /* Yield; thread_message_handler on caller thread will resume us */
