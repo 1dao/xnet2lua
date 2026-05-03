@@ -43,12 +43,12 @@ extern "C" {
 #define XTHR_COMPUTE        6   /* compute thread               */
 #define XTHR_NATS           7   /* NATS I/O thread              */
 #define XTHR_HTTP           8   /* HTTP/HTTPS service thread    */
-#define XTHR_WORKER_GRP1    10  /* worker group 1 base          */
-#define XTHR_WORKER_GRP2    30  /* worker group 2 base          */
-#define XTHR_WORKER_GRP3    50  /* worker group 3 base          */
-#define XTHR_WORKER_GRP4    60  /* worker group 4 base          */
-#define XTHR_WORKER_GRP5    70  /* worker group 5 base          */
-#define XTHR_MAX            100
+#define XTHR_WORKER_GRP1    20  /* worker group 1 base          */
+#define XTHR_WORKER_GRP2    40  /* worker group 2 base          */
+#define XTHR_WORKER_GRP3    60  /* worker group 3 base          */
+#define XTHR_WORKER_GRP4    80  /* worker group 4 base          */
+#define XTHR_WORKER_GRP5    100  /* worker group 5 base          */
+#define XTHR_MAX            120
 #define XTHR_GROUP_MAX      20
 
 /* Error codes */

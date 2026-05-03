@@ -21,7 +21,10 @@ typedef enum {
 typedef void (*xChannelConnectProc)(xChannel* ch, void* ud);
 
 /* Framed modes ignore the return value. RAW mode uses it as the number of
-** bytes consumed from the input buffer. Return 0 to keep all buffered data. */
+** bytes consumed from the input buffer. Return 0 to keep all buffered data. 
+** The data pointer is only valid during the callback. 
+** Do not store it after the callback returns. Copy it if needed.
+* */
 typedef size_t (*xChannelPacketProc)(xChannel* ch, const char* data, size_t len, void* ud);
 
 typedef void (*xChannelCloseProc)(xChannel* ch, const char* reason, void* ud);
