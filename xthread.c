@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <time.h>
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -52,14 +53,19 @@
 /* Task node with inline arg buffer.
 ** arg_len == 0          → use arg_ptr (raw pointer, caller-owned, not freed)
 ** arg_len <= INLINE     → arg_buf holds copied bytes
-** arg_len  > INLINE     → arg_ptr holds a malloc'd copy (freed in process_tasks) */
+** arg_len  > INLINE     → arg_ptr holds a malloc'd copy (freed in process_tasks)
+**
+** created_sec records the wall-clock second at xthread_post time, used by
+** process_tasks for per-thread timeout dispatch. 0 means "skip timeout
+** check" (used by xthread_post_reply — replies are never dropped). */
 typedef struct xthrTask {
     XThreadFunc      func;
     struct xthrTask* next;
     uint32_t         arg_len;       /* 0 = pointer semantics                  */
     uint8_t          from_heap;     /* 1 if node is malloc'd (not from pool)  */
     uint8_t          arg_external;  /* 1 if arg payload is malloc'd externally*/
-    uint8_t          _pad[2];
+    uint16_t         _pad;          /* alignment for created_sec              */
+    uint32_t         created_sec;   /* push wall-clock seconds; 0 = bypass    */
     union {
         void*        arg_ptr;       /* used when arg_len == 0 OR arg_external */
         _Alignas(max_align_t)
@@ -97,6 +103,12 @@ struct xThread {
     xQueue       queue;
     void*        userdata;
     xThreadPool* group;
+
+    /* Per-thread task expiration. Publish-once at init: set via
+    ** xthread_set_timeout before tasks flow; process_tasks reads raw.
+    ** timeout_secs == 0 disables the check. on_expired may be NULL. */
+    uint32_t     timeout_secs;
+    XThreadFunc  on_expired;
 
     /* Poll-based wakeup (NULL when not using xpoll) */
     xPollState*  poll;
@@ -330,6 +342,10 @@ static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
 **   false → standard backpressure (return -2 when q->size >= q->max_size)
 **   true  → bypass cap (used by xthread_post_reply)
 **
+** created_sec:
+**   wall-clock second to record on the task. 0 marks the task as exempt
+**   from per-thread timeout dispatch (used for replies).
+**
 ** out_new_size    – new queue depth (NULL to ignore).
 ** out_need_notify – true when caller should send a wakeup signal.
 **
@@ -340,6 +356,7 @@ static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
 static int xqueue_push_internal(xQueue* q, XThreadFunc func,
                                 const void* arg, size_t arg_len,
                                 bool ignore_max,
+                                uint32_t created_sec,
                                 int* out_new_size, bool* out_need_notify) {
     /* Decide whether arg payload needs an external buffer (out-of-band copy).
     ** arg_len == 0           → pointer semantics, no copy
@@ -378,6 +395,7 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
     task->arg_len      = (uint32_t)arg_len;
     task->from_heap    = from_heap ? 1 : 0;
     task->arg_external = ext_buf ? 1 : 0;
+    task->created_sec  = created_sec;
     if (arg_len == 0) {
         task->arg_ptr = (void*)arg;            /* pointer semantics */
     } else if (ext_buf) {
@@ -419,14 +437,18 @@ static int xqueue_push(xQueue* q, XThreadFunc func,
                        int* out_new_size, bool* out_need_notify) {
     return xqueue_push_internal(q, func, arg, arg_len,
                                 /*ignore_max=*/false,
+                                /*created_sec=*/(uint32_t)time(NULL),
                                 out_new_size, out_need_notify);
 }
 
+/* Reply path: created_sec=0 means "never expire" — replies signal that
+** the producer has finished work and the originator must be notified. */
 static int xqueue_push_reply(xQueue* q, XThreadFunc func,
                              const void* arg, size_t arg_len,
                              int* out_new_size, bool* out_need_notify) {
     return xqueue_push_internal(q, func, arg, arg_len,
                                 /*ignore_max=*/true,
+                                /*created_sec=*/0,
                                 out_new_size, out_need_notify);
 }
 
@@ -485,7 +507,13 @@ static inline void* task_arg_ptr(xthrTask* t) {
 static int process_tasks(xThread* ctx) {
     int count = 0;
     xQueue*   q    = &ctx->queue;
+
+    /* timeout_secs / on_expired are publish-once at init; safe to read raw. */
+    uint32_t    timeout   = ctx->timeout_secs;
+    XThreadFunc expire_cb = ctx->on_expired;
+
     xthrTask* task = xqueue_pop_all(q);
+    uint32_t now = (timeout > 0) ? (uint32_t)time(NULL) : 0;
 
     /* Locally batch pool nodes for return; free heap nodes individually. */
     xthrTask* return_head = NULL;
@@ -493,7 +521,16 @@ static int process_tasks(xThread* ctx) {
 
     while (task) {
         xthrTask* next = task->next;
-        if (task->func) task->func(ctx, task_arg_ptr(task), (int)task->arg_len);
+        void*     a    = task_arg_ptr(task);
+
+        bool expired = (timeout > 0) && (task->created_sec != 0)
+                       && ((now - task->created_sec) >= timeout);
+
+        if (expired && expire_cb) {
+            expire_cb(ctx, a, (int)task->arg_len);
+        } else if (task->func) {
+            task->func(ctx, a, (int)task->arg_len);
+        }
 
         /* Release external arg payload (if any). */
         if (task->arg_external && task->arg_ptr) {
@@ -992,6 +1029,17 @@ int xthread_set_queue_max(int target_id, int new_max) {
     xnet_mutex_lock(&target->queue.lock);
     target->queue.max_size = new_max;
     xnet_mutex_unlock(&target->queue.lock);
+    return 0;
+}
+
+/* Publish-once API: must be called during thread init, before tasks start
+** flowing in. process_tasks reads these fields raw (no lock). */
+int xthread_set_timeout(int target_id, uint32_t timeout_secs,
+                        XThreadFunc on_expired) {
+    xThread* target = xthread_get(target_id);
+    if (!target) return -1;
+    target->timeout_secs = timeout_secs;
+    target->on_expired   = on_expired;
     return 0;
 }
 
