@@ -613,6 +613,95 @@ static int test_backpressure(void) {
     return 0;
 }
 
+/* ============================================================================
+** Test 8: per-thread task timeout + on_expired callback
+** ============================================================================ */
+
+static volatile int test8_normal_count  = 0;
+static volatile int test8_expired_count = 0;
+
+static void test8_normal_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr; (void)arg_len;
+    test8_normal_count++;
+    free(arg);
+}
+
+static void test8_expired_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr; (void)arg_len;
+    test8_expired_count++;
+    free(arg);  /* raw pointer mode — on_expired owns the free */
+}
+
+static int test_thread_timeout(void) {
+    printf("\n========================================\n");
+    printf("Test 8: per-thread timeout (1s) + on_expired callback\n");
+    printf("========================================\n");
+
+    test8_normal_count  = 0;
+    test8_expired_count = 0;
+
+    /* Phase 1: enable 1s timeout, post tasks, sleep 2s, drain.
+    ** All tasks should expire and be routed to on_expired. */
+    if (xthread_set_timeout(XTHR_MAIN, 1, test8_expired_handler) != 0) {
+        printf("xthread_set_timeout failed\n");
+        return -1;
+    }
+
+    const int N = 5;
+    for (int i = 0; i < N; i++) {
+        int* p = malloc(sizeof(int));
+        *p = i;
+        if (xthread_post(XTHR_MAIN, test8_normal_handler, p, 0) != 0) {
+            printf("post failed\n");
+            free(p);
+        }
+    }
+
+    sleep(2);                  /* let tasks age past 1s timeout */
+    xthread_update(0);          /* drain on this thread */
+
+    if (test8_normal_count != 0 || test8_expired_count != N) {
+        printf("[FAIL] Phase 1: normal=%d expired=%d (expected 0/%d)\n",
+               test8_normal_count, test8_expired_count, N);
+        xthread_set_timeout(XTHR_MAIN, 0, NULL);
+        return -1;
+    }
+    printf("Phase 1 OK: normal=%d  expired=%d\n",
+           test8_normal_count, test8_expired_count);
+
+    /* Phase 2: disable timeout. Same delay, tasks must NOT expire. */
+    xthread_set_timeout(XTHR_MAIN, 0, NULL);
+
+    int n_before = test8_normal_count;
+    int e_before = test8_expired_count;
+
+    const int M = 3;
+    for (int i = 0; i < M; i++) {
+        int* p = malloc(sizeof(int));
+        *p = i;
+        if (xthread_post(XTHR_MAIN, test8_normal_handler, p, 0) != 0) {
+            printf("post failed\n");
+            free(p);
+        }
+    }
+    sleep(2);
+    xthread_update(0);
+
+    int n_delta = test8_normal_count  - n_before;
+    int e_delta = test8_expired_count - e_before;
+
+    if (n_delta != M || e_delta != 0) {
+        printf("[FAIL] Phase 2: normal_delta=%d expired_delta=%d (expected %d/0)\n",
+               n_delta, e_delta, M);
+        return -1;
+    }
+    printf("Phase 2 OK: normal_delta=%d  expired_delta=%d\n", n_delta, e_delta);
+
+    printf("Test 8 done: phase1 expired %d/%d, phase2 normal %d/%d\n",
+           test8_expired_count, N, n_delta, M);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
@@ -662,6 +751,11 @@ int main(int argc, char** argv) {
     }
 
     if (test_backpressure() != 0) {
+        ret = -1;
+        goto cleanup;
+    }
+
+    if (test_thread_timeout() != 0) {
         ret = -1;
         goto cleanup;
     }
