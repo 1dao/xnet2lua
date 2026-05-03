@@ -50,6 +50,14 @@
 #define XTHREAD_QUEUE_MAX_DEFAULT 65536
 #endif
 
+typedef union xAlignMax {
+    void* p;
+    void (*fp)(void);
+    long l;
+    long long ll;
+    double d;
+    long double ld;
+} xAlignMax;
 /* Task node with inline arg buffer.
 ** arg_len == 0          → use arg_ptr (raw pointer, caller-owned, not freed)
 ** arg_len <= INLINE     → arg_buf holds copied bytes
@@ -68,8 +76,8 @@ typedef struct xthrTask {
     uint32_t         created_sec;   /* push wall-clock seconds; 0 = bypass    */
     union {
         void*        arg_ptr;       /* used when arg_len == 0 OR arg_external */
-        _Alignas(max_align_t)
         uint8_t      arg_buf[XTHREAD_TASK_ARG_INLINE];
+        xAlignMax   _align;        /* force alignment to max_align_t         */
     };
 } xthrTask;
 

@@ -21,7 +21,10 @@ typedef enum {
 typedef void (*xChannelConnectProc)(xChannel* ch, void* ud);
 
 /* Framed modes ignore the return value. RAW mode uses it as the number of
-** bytes consumed from the input buffer. Return 0 to keep all buffered data. */
+** bytes consumed from the input buffer. Return 0 to keep all buffered data. 
+** The data pointer is only valid during the callback. 
+** Do not store it after the callback returns. Copy it if needed.
+* */
 typedef size_t (*xChannelPacketProc)(xChannel* ch, const char* data, size_t len, void* ud);
 
 typedef void (*xChannelCloseProc)(xChannel* ch, const char* reason, void* ud);
@@ -51,6 +54,13 @@ bool      xchannel_is_connected(xChannel* ch);
 void      xchannel_set_userdata(xChannel* ch, void* ud);
 void*     xchannel_get_userdata(xChannel* ch);
 void      xchannel_set_max_packet(xChannel* ch, size_t max_packet);
+
+/* Per-direction backpressure limits (default 8 MB each).
+** Send: when send buffer >= max, send_* return -2.
+** Recv: when recv buffer > max, READABLE is suspended until process_input
+**       drains it back below max. */
+void      xchannel_set_max_send(xChannel* ch, size_t max);
+void      xchannel_set_max_recv(xChannel* ch, size_t max);
 
 int       xchannel_set_framing(xChannel* ch, const xChannelConfig* cfg);
 
