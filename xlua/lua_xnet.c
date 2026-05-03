@@ -571,6 +571,20 @@ static int l_conn_set_framing(lua_State* L) {
         }
         lua_pop(L, 1);
 
+        lua_getfield(L, 2, "max_send");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer ms = lua_tointeger(L, -1);
+            if (ms >= 0) xchannel_set_max_send(c->ch, (size_t)ms);
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "max_recv");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer mr = lua_tointeger(L, -1);
+            if (mr >= 0) xchannel_set_max_recv(c->ch, (size_t)mr);
+        }
+        lua_pop(L, 1);
+
         lua_getfield(L, 2, "type");
         if (!lua_isstring(L, -1)) {
             lua_pop(L, 1);
@@ -736,7 +750,6 @@ static int l_xnet_listen(lua_State* L) {
         lua_pushstring(L, "xpoll_add_event failed");
         return 2;
     }
-    xpoll_set_client_data(fd, s);
     return 1;
 }
 
@@ -791,7 +804,6 @@ static int l_xnet_listen_fd(lua_State* L) {
         lua_pushstring(L, "xpoll_add_event failed");
         return 2;
     }
-    xpoll_set_client_data(fd, s);
     return 1;
 }
 

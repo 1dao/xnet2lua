@@ -11,10 +11,13 @@
 #ifdef __linux__
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <fcntl.h>
 #include <unistd.h>
 #elif !defined(_WIN32)
 #include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #endif
 
 #ifndef XCHANNEL_READ_CHUNK
@@ -22,8 +25,20 @@
 #endif
 
 #ifndef XCHANNEL_DEFAULT_MAX_PACKET
-#define XCHANNEL_DEFAULT_MAX_PACKET (16u * 1024u * 1024u)
+#define XCHANNEL_DEFAULT_MAX_PACKET (10u * 1024u * 1024u)
 #endif
+
+#ifndef XCHANNEL_DEFAULT_BUFFER_MAX
+#define XCHANNEL_DEFAULT_BUFFER_MAX (10u * 1024u * 1024u + 4)
+#endif
+
+typedef struct xBuffer {
+    char*  data;
+    size_t off;   /* read position; valid bytes are data[off .. len) */
+    size_t len;   /* write position (end of valid data, NOT length) */
+    size_t cap;
+    size_t max;   /* backpressure threshold; 0 = unlimited */
+} xBuffer;
 
 struct xChannel {
     SOCKET_T fd;
@@ -36,13 +51,8 @@ struct xChannel {
     xChannelFrame frame;
     size_t max_packet;
 
-    char* inbuf;
-    size_t inlen;
-    size_t incap;
-
-    char* outbuf;
-    size_t outlen;
-    size_t outcap;
+    xBuffer in;
+    xBuffer out;
 
 #ifdef __linux__
     int file_fd;
@@ -63,6 +73,65 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData);
+
+static inline size_t xbuf_size(const xBuffer* b) {
+    return b->len - b->off;
+}
+
+static void xbuf_consume(xBuffer* b, size_t n) {
+    size_t avail = b->len - b->off;
+    if (n >= avail) {
+        b->off = 0;
+        b->len = 0;
+        return;
+    }
+    b->off += n;
+}
+
+static bool xbuf_reserve(xBuffer* b, size_t need) {
+    if (need == 0) return true;
+    if (b->cap - b->len >= need) return true;
+
+    size_t used = b->len - b->off;
+
+    /* Try compacting first — avoids realloc when there's stale head space. */
+    if (b->off > 0) {
+        if (used > 0) memmove(b->data, b->data + b->off, used);
+        b->len = used;
+        b->off = 0;
+        if (b->cap - b->len >= need) return true;
+    }
+
+    if (used > SIZE_MAX - need) return false;
+    size_t target = used + need;
+    size_t ncap = b->cap > 0 ? b->cap : 4096;
+    while (ncap < target) {
+        if (ncap > SIZE_MAX / 2) return false;
+        ncap *= 2;
+    }
+    char* nbuf = (char*)realloc(b->data, ncap);
+    if (!nbuf) return false;
+    b->data = nbuf;
+    b->cap = ncap;
+    return true;
+}
+
+static bool xbuf_append(xBuffer* b, const char* data, size_t len) {
+    if (len == 0) return true;
+    if (!xbuf_reserve(b, len)) return false;
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    return true;
+}
+
+static void xbuf_free(xBuffer* b) {
+    free(b->data);
+    b->data = NULL;
+    b->off = 0;
+    b->len = 0;
+    b->cap = 0;
+    b->max = 0;
+}
 
 static bool has_pending_file(xChannel* ch) {
     return ch && ch->file_pending && ch->file_remaining > 0;
@@ -113,8 +182,8 @@ static void xchannel_retain(xChannel* ch) {
 static void xchannel_free_storage(xChannel* ch) {
     if (!ch) return;
     close_pending_file(ch);
-    free(ch->inbuf);
-    free(ch->outbuf);
+    xbuf_free(&ch->in);
+    xbuf_free(&ch->out);
     free(ch);
 }
 
@@ -124,39 +193,6 @@ static void xchannel_release(xChannel* ch) {
     if (ch->refcount <= 0) {
         xchannel_free_storage(ch);
     }
-}
-
-static bool buffer_reserve(char** buf, size_t* cap, size_t need) {
-    if (need <= *cap) return true;
-    size_t ncap = (*cap > 0) ? *cap : 4096;
-    while (ncap < need) {
-        if (ncap > (SIZE_MAX / 2)) return false;
-        ncap *= 2;
-    }
-    char* nbuf = (char*)realloc(*buf, ncap);
-    if (!nbuf) return false;
-    *buf = nbuf;
-    *cap = ncap;
-    return true;
-}
-
-static bool buffer_append(char** buf, size_t* len, size_t* cap,
-                          const char* data, size_t data_len) {
-    if (data_len == 0) return true;
-    if (*len > SIZE_MAX - data_len) return false;
-    if (!buffer_reserve(buf, cap, *len + data_len)) return false;
-    memcpy(*buf + *len, data, data_len);
-    *len += data_len;
-    return true;
-}
-
-static void buffer_consume(char* buf, size_t* len, size_t n) {
-    if (n >= *len) {
-        *len = 0;
-        return;
-    }
-    memmove(buf, buf + n, *len - n);
-    *len -= n;
 }
 
 static size_t find_crlf(const char* buf, size_t len) {
@@ -195,93 +231,154 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
     }
 }
 
-static void process_input(xChannel* ch) {
-    while (ch && !ch->closed && ch->inlen > 0) {
-        if (ch->frame == XCHANNEL_FRAME_RAW) {
-            if (ch->inlen > ch->max_packet) {
-                xchannel_close(ch, "packet_too_large");
-                return;
-            }
+static int check_send_limit(xChannel* ch, size_t alen, size_t blen) {
+    if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
+    if (alen == 0 && blen == 0) return 0;
+    if (has_pending_file(ch)) return -1;
+    if (ch->out.max > 0 && xbuf_size(&ch->out) >= ch->out.max) return -2;
+    if (alen > SIZE_MAX - blen) return -1;
+    return 0;
+}
 
-            size_t consumed = emit_packet(ch, ch->inbuf, ch->inlen);
-            if (ch->closed) return;
-            if (consumed == 0) return;
-            if (consumed > ch->inlen) {
-                xchannel_close(ch, "consume_error");
-                return;
-            }
-
-            buffer_consume(ch->inbuf, &ch->inlen, consumed);
-            continue;
-        }
-
+static int process_input(xChannel* ch) {
+    int rc = 0;
+    while (ch && !ch->closed && xbuf_size(&ch->in) > 0) {
         if (ch->frame == XCHANNEL_FRAME_LEN32) {
-            if (ch->inlen < 4) return;
+            size_t avail = xbuf_size(&ch->in);
+            if (avail < 4) return rc;
 
-            uint32_t body_len = read_u32be(ch->inbuf);
+            uint32_t body_len = read_u32be(ch->in.data + ch->in.off);
             if ((size_t)body_len > ch->max_packet) {
                 xchannel_close(ch, "packet_too_large");
-                return;
+                return rc;
             }
-            if (ch->inlen < (size_t)body_len + 4) return;
+            if (avail < (size_t)body_len + 4) return rc;
 
-            char* pkt = NULL;
-            if (body_len > 0) {
-                pkt = (char*)malloc(body_len);
-                if (!pkt) {
-                    xchannel_close(ch, "out_of_memory");
-                    return;
-                }
-                memcpy(pkt, ch->inbuf + 4, body_len);
-            }
-            buffer_consume(ch->inbuf, &ch->inlen, (size_t)body_len + 4);
-            emit_packet(ch, pkt ? pkt : "", body_len);
-            free(pkt);
+            const char* body = ch->in.data + ch->in.off + 4;
+            emit_packet(ch, body_len > 0 ? body : "", body_len);
+            if (ch->closed) return rc;
+            xbuf_consume(&ch->in, (size_t)body_len + 4);
+            rc += 1;
             continue;
-        }
-
-        if (ch->frame == XCHANNEL_FRAME_CRLF) {
-            size_t pos = find_crlf(ch->inbuf, ch->inlen);
+        } else if (ch->frame == XCHANNEL_FRAME_CRLF) {
+            size_t avail = xbuf_size(&ch->in);
+            const char* base = ch->in.data + ch->in.off;
+            size_t pos = find_crlf(base, avail);
             if (pos == SIZE_MAX) {
-                if (ch->inlen > ch->max_packet) {
+                if (avail > ch->max_packet) {
                     xchannel_close(ch, "packet_too_large");
                 }
-                return;
+                return rc;
             }
             if (pos > ch->max_packet) {
                 xchannel_close(ch, "packet_too_large");
-                return;
+                return rc;
             }
 
-            char* pkt = NULL;
-            if (pos > 0) {
-                pkt = (char*)malloc(pos);
-                if (!pkt) {
-                    xchannel_close(ch, "out_of_memory");
-                    return;
-                }
-                memcpy(pkt, ch->inbuf, pos);
+            emit_packet(ch, pos > 0 ? base : "", pos);
+            if (ch->closed) return rc;
+            xbuf_consume(&ch->in, pos + 2);
+            rc += 1;
+            continue;
+        } else if (ch->frame == XCHANNEL_FRAME_RAW) {
+            size_t avail = xbuf_size(&ch->in);
+            if (avail > ch->max_packet) {
+                xchannel_close(ch, "packet_too_large");
+                return rc;
             }
-            buffer_consume(ch->inbuf, &ch->inlen, pos + 2);
-            emit_packet(ch, pkt ? pkt : "", pos);
-            free(pkt);
+
+            size_t consumed = emit_packet(ch, ch->in.data + ch->in.off, avail);
+            if (ch->closed) return rc;
+            if (consumed == 0) return rc;
+            if (consumed > avail) {
+                xchannel_close(ch, "consume_error");
+                return rc;
+            }
+
+            xbuf_consume(&ch->in, consumed);
+            rc += 1;
             continue;
         }
 
         xchannel_close(ch, "bad_frame");
-        return;
+        return rc;
     }
+    return rc;
+}
+
+/* Try to send up to two segments in a single syscall.
+ * On success returns 0 and writes total bytes sent (possibly 0 on EAGAIN) to
+ * *sent_out. Returns -1 only on a hard error. */
+static int try_send_iov(SOCKET_T fd,
+                        const char* a, size_t alen,
+                        const char* b, size_t blen,
+                        size_t* sent_out) {
+    *sent_out = 0;
+    
+#ifdef _WIN32
+    WSABUF bufs[2];
+    DWORD nbufs = 0;
+    if (alen > 0) {
+        bufs[nbufs].buf = (CHAR*)a;
+        bufs[nbufs].len = (ULONG)((alen > ULONG_MAX) ? ULONG_MAX : alen);
+        nbufs++;
+    }
+    if (blen > 0) {
+        bufs[nbufs].buf = (CHAR*)b;
+        bufs[nbufs].len = (ULONG)((blen > ULONG_MAX) ? ULONG_MAX : blen);
+        nbufs++;
+    }
+    DWORD sent = 0;
+    int rc = WSASend(fd, bufs, nbufs, &sent, 0, NULL, NULL);
+    if (rc == 0) {
+        *sent_out = (size_t)sent;
+        return 0;
+    }
+    if (socket_check_eagain()) return 0;
+    return -1;
+#else
+    if (alen == 0 || blen == 0) {
+        const char* data = alen > 0 ? a : b;
+        size_t len = alen > 0 ? alen : blen;
+        int chunk = (len > INT_MAX) ? INT_MAX : (int)len;
+        ssize_t n = send(fd, data, chunk, 0);
+        if (n >= 0) { *sent_out = (size_t)n; return 0; }
+        if (socket_check_eagain()) return 0;
+        return -1;
+    }
+
+    struct iovec iov[2];
+    iov[0].iov_base = (void*)a;
+    iov[0].iov_len = alen;
+    iov[1].iov_base = (void*)b;
+    iov[1].iov_len = blen;
+    ssize_t n = writev(fd, iov, 2);
+    if (n >= 0) { *sent_out = (size_t)n; return 0; }
+    if (socket_check_eagain()) return 0;
+    return -1;
+#endif
+}
+
+static int arm_writable(xChannel* ch, bool while_connecting) {
+    xFileProc writable = while_connecting ? xchannel_connect_event
+                                          : xchannel_write_event;
+    if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
+                        writable, xchannel_error_event, ch) != 0) {
+        xchannel_close(ch, "poll_error");
+        return -1;
+    }
+    return 0;
 }
 
 static void flush_output(xChannel* ch) {
     if (!ch || ch->closed || ch->connect_pending) return;
 
-    while (ch->outlen > 0) {
-        size_t remaining = ch->outlen;
+    while (xbuf_size(&ch->out) > 0) {
+        size_t remaining = xbuf_size(&ch->out);
         int chunk = (remaining > INT_MAX) ? INT_MAX : (int)remaining;
-        int n = send(ch->fd, ch->outbuf, chunk, 0);
+        int n = send(ch->fd, ch->out.data + ch->out.off, chunk, 0);
         if (n > 0) {
-            buffer_consume(ch->outbuf, &ch->outlen, (size_t)n);
+            xbuf_consume(&ch->out, (size_t)n);
             continue;
         }
         if (n < 0 && socket_check_eagain()) return;
@@ -356,63 +453,59 @@ static void flush_output(xChannel* ch) {
     }
 }
 
-static int queue_or_send_raw(xChannel* ch, const char* data, size_t len) {
-    if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
-    if (!data && len > 0) return -1;
-    if (len == 0) return 0;
-    if (has_pending_file(ch)) return -1;
-
-    if (ch->connect_pending || ch->outlen > 0 || !ch->connected) {
-        if (!buffer_append(&ch->outbuf, &ch->outlen, &ch->outcap, data, len)) {
+/* Atomically queue or send a (head, body) pair. Either segment may be empty.
+** Returns -2 when the send buffer is already at/over its backpressure max. */
+static int queue_or_send_iov(xChannel* ch,
+                             const char* a, size_t alen,
+                             const char* b, size_t blen) {
+    if ((!a && alen > 0) || (!b && blen > 0)) return -1;
+    if (alen == 0 && blen == 0) return 0;                                 
+    int rc = check_send_limit(ch, alen, blen);
+    if (rc != 0) return rc;
+    
+    /* Anything in the queue must drain first to preserve ordering. */
+    if (ch->connect_pending || xbuf_size(&ch->out) > 0 || !ch->connected) {
+        size_t queued = xbuf_size(&ch->out);
+        if (alen > 0 && !xbuf_append(&ch->out, a, alen)) {
             xchannel_close(ch, "out_of_memory");
             return -1;
         }
-        if (ch->connect_pending) {
-            if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
-                                xchannel_connect_event, xchannel_error_event, ch) != 0) {
-                xchannel_close(ch, "poll_error");
-                return -1;
-            }
-        } else {
-            if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
-                                xchannel_write_event, xchannel_error_event, ch) != 0) {
-                xchannel_close(ch, "poll_error");
-                return -1;
-            }
+        if (blen > 0 && !xbuf_append(&ch->out, b, blen)) {
+            xchannel_close(ch, "out_of_memory");
+            return -1;
         }
-        xpoll_set_client_data(ch->fd, ch);
-        return 0;
+        if (queued == 0)
+            return arm_writable(ch, ch->connect_pending);
+        else
+            return 0;
     }
 
-    size_t off = 0;
-    while (off < len) {
-        size_t remaining = len - off;
-        int chunk = (remaining > INT_MAX) ? INT_MAX : (int)remaining;
-        int n = send(ch->fd, data + off, chunk, 0);
-        if (n > 0) {
-            off += (size_t)n;
-            continue;
-        }
-        if (n < 0 && socket_check_eagain()) break;
+    size_t total = alen + blen;
+    size_t sent = 0;
+    if (try_send_iov(ch->fd, a, alen, b, blen, &sent) < 0) {
         xchannel_close(ch, "write_error");
         return -1;
     }
 
-    if (off < len) {
-        if (!buffer_append(&ch->outbuf, &ch->outlen, &ch->outcap,
-                           data + off, len - off)) {
+    if (sent >= total) return 0;
+
+    if (sent < alen) {
+        if (!xbuf_append(&ch->out, a + sent, alen - sent)) {
             xchannel_close(ch, "out_of_memory");
             return -1;
         }
-        if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
-                            xchannel_write_event, xchannel_error_event, ch) != 0) {
-            xchannel_close(ch, "poll_error");
+        if (blen > 0 && !xbuf_append(&ch->out, b, blen)) {
+            xchannel_close(ch, "out_of_memory");
             return -1;
         }
-        xpoll_set_client_data(ch->fd, ch);
+    } else {
+        size_t b_skip = sent - alen;
+        if (!xbuf_append(&ch->out, b + b_skip, blen - b_skip)) {
+            xchannel_close(ch, "out_of_memory");
+            return -1;
+        }
     }
-
-    return 0;
+    return arm_writable(ch, false);
 }
 
 static bool finish_connect(xChannel* ch) {
@@ -438,11 +531,16 @@ static bool finish_connect(xChannel* ch) {
         return false;
     }
 
-    if (ch->connect_cb && !ch->closed) {
-        ch->connect_cb(ch, ch->userdata);
-    }
-    if (!ch->closed) {
+    if(!ch->closed) {
+        if (ch->connect_cb) {
+            ch->connect_cb(ch, ch->userdata);
+        }
         flush_output(ch);
+
+        if (xbuf_size(&ch->out) > 0 || has_pending_file(ch)) {
+            if (arm_writable(ch, false) != 0)
+                return false;
+        }
     }
     return !ch->closed;
 }
@@ -455,18 +553,24 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
 
     xchannel_retain(ch);
 
-    char buf[XCHANNEL_READ_CHUNK];
     bool close_after = false;
     const char* close_reason = NULL;
 
+    int retry = 0;
     while (!ch->closed) {
-        int n = recv(ch->fd, buf, (int)sizeof(buf), 0);
+        if (!xbuf_reserve(&ch->in, XCHANNEL_READ_CHUNK)) {
+            xchannel_close(ch, "out_of_memory");
+            break;
+        }
+        size_t space = ch->in.cap - ch->in.len;
+        int chunk = (space > INT_MAX) ? INT_MAX : (int)space;
+        int n = recv(ch->fd, ch->in.data + ch->in.len, chunk, 0);
         if (n > 0) {
-            if (!buffer_append(&ch->inbuf, &ch->inlen, &ch->incap, buf, (size_t)n)) {
-                xchannel_close(ch, "out_of_memory");
-                break;
-            }
-            continue;
+            ch->in.len += (size_t)n;
+            if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max) break;
+            if (++retry < 3)
+                continue;
+            else break;
         }
         if (n == 0) {
             close_after = true;
@@ -479,7 +583,21 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
         break;
     }
 
-    if (!ch->closed) process_input(ch);
+    bool over_before = !ch->closed
+        && ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max;
+    if (over_before) xpoll_del_event(ch->fd, XPOLL_READABLE);
+
+    int n = process_input(ch);
+    if (n==0 && over_before)
+        xchannel_close(ch, "over_consume_error"); 
+    if (over_before && !ch->closed && xbuf_size(&ch->in) <= ch->in.max) {
+        if (xpoll_add_event(ch->fd, XPOLL_READABLE,
+                            xchannel_read_event, NULL,
+                            xchannel_error_event, ch) != 0) {
+            xchannel_close(ch, "poll_error");
+        }
+    }
+
     if (close_after && !ch->closed) xchannel_close(ch, close_reason);
 
     xchannel_release(ch);
@@ -526,6 +644,8 @@ xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg) {
     ch->connect_pending = false;
     ch->frame = XCHANNEL_FRAME_RAW;
     ch->max_packet = XCHANNEL_DEFAULT_MAX_PACKET;
+    ch->in.max = XCHANNEL_DEFAULT_BUFFER_MAX;
+    ch->out.max = XCHANNEL_DEFAULT_BUFFER_MAX;
 #ifdef __linux__
     ch->file_fd = -1;
 #endif
@@ -594,13 +714,20 @@ void xchannel_set_max_packet(xChannel* ch, size_t max_packet) {
     if (ch && max_packet > 0) ch->max_packet = max_packet;
 }
 
+void xchannel_set_max_send(xChannel* ch, size_t max) {
+    if (ch) ch->out.max = max;
+}
+
+void xchannel_set_max_recv(xChannel* ch, size_t max) {
+    if (ch) ch->in.max = max;
+}
+
 int xchannel_attach(xChannel* ch) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
     if (xpoll_add_event(ch->fd, XPOLL_READABLE,
                         xchannel_read_event, NULL, xchannel_error_event, ch) != 0) {
         return -1;
     }
-    xpoll_set_client_data(ch->fd, ch);
     ch->attached = true;
     ch->connected = true;
     return 0;
@@ -614,7 +741,6 @@ int xchannel_attach_connect(xChannel* ch) {
                         NULL, xchannel_connect_event, xchannel_error_event, ch) != 0) {
         return -1;
     }
-    xpoll_set_client_data(ch->fd, ch);
     ch->attached = true;
     return 0;
 }
@@ -626,37 +752,26 @@ void xchannel_detach(xChannel* ch) {
 }
 
 int xchannel_send_raw(xChannel* ch, const char* data, size_t len) {
-    return queue_or_send_raw(ch, data, len);
+    return queue_or_send_iov(ch, data, len, NULL, 0);
 }
 
 int xchannel_send_packet(xChannel* ch, const char* data, size_t len) {
     if (!ch || ch->closed || (!data && len > 0)) return -1;
     if (has_pending_file(ch)) return -1;
-
+    
     if (ch->frame == XCHANNEL_FRAME_LEN32) {
-        if (len > UINT32_MAX || len > SIZE_MAX - 4) return -1;
-        char* pkt = (char*)malloc(len + 4);
-        if (!pkt) return -1;
-        write_u32be(pkt, (uint32_t)len);
-        if (len > 0) memcpy(pkt + 4, data, len);
-        int rc = queue_or_send_raw(ch, pkt, len + 4);
-        free(pkt);
-        return rc;
+        if (len > UINT32_MAX) return -1;
+        char hdr[4];
+        write_u32be(hdr, (uint32_t)len);
+        return queue_or_send_iov(ch, hdr, 4, data, len);
     }
 
     if (ch->frame == XCHANNEL_FRAME_CRLF) {
-        if (len > SIZE_MAX - 2) return -1;
-        char* pkt = (char*)malloc(len + 2);
-        if (!pkt) return -1;
-        if (len > 0) memcpy(pkt, data, len);
-        pkt[len] = '\r';
-        pkt[len + 1] = '\n';
-        int rc = queue_or_send_raw(ch, pkt, len + 2);
-        free(pkt);
-        return rc;
+        static const char trailer[2] = {'\r', '\n'};
+        return queue_or_send_iov(ch, data, len, trailer, 2);
     }
 
-    return queue_or_send_raw(ch, data, len);
+    return queue_or_send_iov(ch, data, len, NULL, 0);
 }
 
 int xchannel_send_file_raw(xChannel* ch,
@@ -666,6 +781,7 @@ int xchannel_send_file_raw(xChannel* ch,
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL || !path) return -1;
     if (!header && header_len > 0) return -1;
     if (has_pending_file(ch)) return -1;
+    // if (ch->out.max > 0 && xbuf_size(&ch->out) >= ch->out.max) return -2;
     if (offset < 0) offset = 0;
 
 #ifdef __linux__
@@ -684,7 +800,7 @@ int xchannel_send_file_raw(xChannel* ch,
     if (length < 0 || length > available) length = available;
     if (length == 0) {
         close(fd);
-        return queue_or_send_raw(ch, header, header_len);
+        return queue_or_send_iov(ch, header, header_len, NULL, 0);
     }
 #else
     FILE* fp = fopen(path, "rb");
@@ -712,7 +828,7 @@ int xchannel_send_file_raw(xChannel* ch,
     if (length < 0 || length > available) length = available;
     if (length == 0) {
         fclose(fp);
-        return queue_or_send_raw(ch, header, header_len);
+        return queue_or_send_iov(ch, header, header_len, NULL, 0);
     }
 #ifdef _WIN32
     if (_fseeki64(fp, offset, SEEK_SET) != 0) {
@@ -724,8 +840,7 @@ int xchannel_send_file_raw(xChannel* ch,
     }
 #endif
 
-    if (!buffer_append(&ch->outbuf, &ch->outlen, &ch->outcap,
-                       header ? header : "", header_len)) {
+    if (header_len > 0 && !xbuf_append(&ch->out, header, header_len)) {
 #ifdef __linux__
         close(fd);
 #else
@@ -745,13 +860,8 @@ int xchannel_send_file_raw(xChannel* ch,
     ch->file_remaining = length;
 
     flush_output(ch);
-    if (!ch->closed && (ch->outlen > 0 || has_pending_file(ch))) {
-        if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
-                            xchannel_write_event, xchannel_error_event, ch) != 0) {
-            xchannel_close(ch, "poll_error");
-            return -1;
-        }
-        xpoll_set_client_data(ch->fd, ch);
+    if (!ch->closed && (xbuf_size(&ch->out) > 0 || has_pending_file(ch))) {
+        if (arm_writable(ch, false) != 0) return -1;
     }
     return ch->closed ? -1 : 0;
 }
