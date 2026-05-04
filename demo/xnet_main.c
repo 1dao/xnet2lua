@@ -14,6 +14,8 @@
 **   xnet.exe demo/xlua_main.lua
 */
 
+#include "xpoll.h"
+
 #define LUA_IMPL
 #include "../3rd/minilua.h"
 
@@ -24,6 +26,7 @@
 #include "xargs.h"
 #include "xlog.h"
 #include "xthread.h"
+#include "xtimer.h"
 
 #ifndef XNET_WITH_HTTP
 #define XNET_WITH_HTTP 1
@@ -37,6 +40,7 @@ LUA_API int luaopen_cmsgpack(lua_State *L);
 LUA_API int luaopen_xthread(lua_State *L);
 LUA_API int luaopen_xnet(lua_State *L);
 LUA_API int luaopen_xutils(lua_State *L);
+LUA_API int luaopen_xtimer(lua_State *L);
 
 typedef struct {
     lua_State* L;
@@ -124,6 +128,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xutils", luaopen_xutils, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
     lua_pop(L, 1);
 }
 
@@ -262,7 +269,42 @@ static MainLuaData* main_init(void) {
         }
     }
 
+    /* Auto-init xpoll if the script started a timer pool but skipped xnet.init.
+    ** xpoll gives us a precise sleep-with-wakeup mechanism for the auto-update
+    ** loop below. We track this so we balance the teardown ourselves and don't
+    ** double-uninit anything the script set up via xnet.init. */
+    if (g_running && xtimer_inited() && !xpoll_inited()) {
+        if (socket_init() == 0) {
+            if (xpoll_init() == 0) {
+                xthread_wakeup_init();
+            } else {
+                socket_cleanup();
+            }
+        }
+    }
+
     return data;
+}
+
+/* Auto-drive xtimer + xpoll. Returns the residual wait that the caller still
+** needs to honour (zero if xpoll already slept). */
+#define XNET_AUTO_WAIT_CAP 16
+
+static int main_auto_drive(int max_wait_ms) {
+    int wait_ms = (max_wait_ms > XNET_AUTO_WAIT_CAP) ? XNET_AUTO_WAIT_CAP : max_wait_ms;
+    if (wait_ms < 0) wait_ms = 0;
+
+    if (xtimer_inited()) {
+        int next = xtimer_update();
+        if (next > 0 && next < wait_ms) wait_ms = next;
+        /* next == 0 means heap empty or all timers due; let I/O take the full slice. */
+    }
+
+    if (xpoll_inited()) {
+        xpoll_poll(wait_ms);
+        return 0;
+    }
+    return wait_ms;
 }
 
 static void main_update(MainLuaData* data) {
@@ -280,7 +322,8 @@ static void main_update(MainLuaData* data) {
         }
     }
 
-    xthread_update(data->tick_ms);
+    int residual = main_auto_drive(data->tick_ms);
+    xthread_update(residual);
 }
 
 static void main_uninit(MainLuaData* data) {
@@ -295,6 +338,14 @@ static void main_uninit(MainLuaData* data) {
             lua_settop(L, base);
             if (g_exit_code == 0) g_exit_code = 1;
         }
+    }
+
+    /* Auto-cleanup any subsystem the script started but forgot to tear down.
+    ** Each *_uninit is internally idempotent. */
+    if (xtimer_inited()) xtimer_uninit();
+    if (xpoll_inited()) {
+        xthread_wakeup_uninit();
+        xpoll_uninit();
     }
 
     if (data->L) {

@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "xpoll.h"
 
 /* Use embedded minilua when building with xlua_test */
 #if defined(LUA_EMBEDDED)
@@ -43,11 +44,13 @@
 
 #include "xthread.h"
 #include "xlog.h"
+#include "xtimer.h"
 
 LUALIB_API int luaopen_cmsgpack(lua_State* L);
 LUALIB_API int luaopen_xthread(lua_State* L);
 LUALIB_API int luaopen_xnet(lua_State* L);
 LUALIB_API int luaopen_xutils(lua_State* L);
+LUALIB_API int luaopen_xtimer(lua_State* L);
 
 /* ============================================================================
 ** Registry keys (per lua_State)
@@ -70,6 +73,7 @@ typedef struct {
     int update_ref;              /* lifecycle: update callback reference */
     int uninit_ref;              /* lifecycle: uninit callback reference */
     int sentinel_ref;            /* GC protection reference (keeps ThreadData alive) */
+    int auto_xpoll;       /* runner brought up xpoll on the script's behalf */
 } ThreadData;
 
 /* Forward declaration */
@@ -688,6 +692,10 @@ static void lua_thread_on_init(xThread* thr) {
     luaL_requiref(L, "xutils", luaopen_xutils, 1);
     lua_pop(L, 1);
 
+    /* Open per-thread timer module. */
+    luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
+    lua_pop(L, 1);
+
     /* Load the script in THIS THREAD'S own Lua state
     ** Script returns the definition table with callbacks */
     XLOGI("lua_thread_on_init: loading script '%s' for thread %d", td->script_path, xthread_get_id(thr));
@@ -769,22 +777,50 @@ static void lua_thread_on_init(xThread* thr) {
         }
     }
 
+    /* If the script started a timer pool but never called xnet.init, bring up
+    ** xpoll so the auto-update loop has a precise sleep-with-wakeup mechanism.
+    ** Track this so we balance the teardown without disturbing anything the
+    ** script may have set up itself via xnet.init. */
+    if (xtimer_inited() && !xpoll_inited()) {
+        if (socket_init() == 0) {
+            if (xpoll_init() == 0) {
+                xthread_wakeup_init();
+                td->auto_xpoll = 1;
+            } else {
+                socket_cleanup();
+            }
+        }
+    }
+
     XLOGI("lua_thread_on_init: thread %d fully initialized", xthread_get_id(thr));
 }
 
+#define XTHR_AUTO_WAIT_CAP 16
+
 static void lua_thread_on_update(xThread* thr) {
     ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
-    if (!td || td->update_ref == LUA_NOREF || !td->L) {
-        return;
-    }
+    if (!td || !td->L) return;
 
     lua_State* L = td->L;
-    int base = lua_gettop(L);
 
-    lua_rawgeti(L, LUA_REGISTRYINDEX, td->update_ref);
-    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-        XLOGE("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
-        lua_settop(L, base);
+    if (td->update_ref != LUA_NOREF) {
+        int base = lua_gettop(L);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, td->update_ref);
+        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+            XLOGE("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
+            lua_settop(L, base);
+        }
+    }
+
+    /* Auto-drive timers and xpoll for scripts that don't define their own
+    ** __update body (and as a safety net for ones that do). */
+    int wait_ms = XTHR_AUTO_WAIT_CAP;
+    if (xtimer_inited()) {
+        int next = xtimer_update();
+        if (next > 0 && next < wait_ms) wait_ms = next;
+    }
+    if (xpoll_inited()) {
+        xpoll_poll(wait_ms);
     }
 }
 
@@ -803,6 +839,17 @@ static void lua_thread_on_cleanup(xThread* thr) {
             XLOGE("lua_thread_on_cleanup: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
             lua_settop(L, base);
         }
+    }
+
+    /* Auto-cleanup. Always reclaim xtimer if still up (idempotent and harmless).
+    ** Only tear down xpoll if the runner brought it up - otherwise the script
+    ** owns it via xnet.init. */
+    if (xtimer_inited()) xtimer_uninit();
+    if (td->auto_xpoll) {
+        xthread_wakeup_uninit();
+        xpoll_uninit();
+        socket_cleanup();
+        td->auto_xpoll = 0;
     }
 
     if (td->L) {

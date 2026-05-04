@@ -171,9 +171,14 @@ void xtimer_uninit() {
     }
 }
 
-void xtimer_update() {
+int xtimer_inited() {
+    return _cur != NULL;
+}
+
+int xtimer_update() {
     if (_cur)
-        xtimer_poll(_cur);
+        return xtimer_poll(_cur);
+    return 0;
 }
 
 int xtimer_last() {
