@@ -23,12 +23,12 @@ local function __init()
         print('[XTIMER-TEST] tick at ' .. xtimer.now_ms())
     end, -1, 'tick')
 
-    -- one-shot to cancel the infinite timer and stop the runner
-    xtimer.add(500, function()
+    -- delay(): one-shot convenience; cancel the infinite timer and stop.
+    xtimer.delay(500, function()
         print('[XTIMER-TEST] cancelling tick & stopping')
         if handles.tick then handles.tick:del() end
         xthread.stop(0)
-    end, 1, 'shutdown')
+    end, 'shutdown')
 end
 
 -- No __update / __uninit needed: once xtimer.init() has been called the

@@ -54,8 +54,9 @@ static inline uint64_t time_day_us() {
     uli.LowPart = ft.dwLowDateTime;
     uli.HighPart = ft.dwHighDateTime;
 
-    // Convert 100-nanosecond intervals to microseconds
-    return (uli.QuadPart / 10);
+    // FILETIME is 100ns ticks since 1601-01-01 UTC. Convert to microseconds
+    // and shift the epoch to 1970-01-01 to match Unix time.
+    return (uli.QuadPart / 10) - 11644473600000000ULL;
 }
 
 static inline uint64_t time_day_ms() {
