@@ -10,25 +10,25 @@ local function __init()
     -- one-shot
     handles.once = xtimer.add(50, function(self)
         print('[XTIMER-TEST] once fired, active=' .. tostring(self:active()))
-    end, 1, 'once')
+    end, 1)
 
     -- repeat 3 times
     handles.three = xtimer.add(80, function()
         count = count + 1
         print('[XTIMER-TEST] three #' .. count)
-    end, 3, 'three')
+    end, 3)
 
     -- infinite, will be cancelled after a few ticks
     handles.tick = xtimer.add(120, function()
         print('[XTIMER-TEST] tick at ' .. xtimer.now_ms())
-    end, -1, 'tick')
+    end, -1)
 
     -- delay(): one-shot convenience; cancel the infinite timer and stop.
     xtimer.delay(500, function()
         print('[XTIMER-TEST] cancelling tick & stopping')
         if handles.tick then handles.tick:del() end
         xthread.stop(0)
-    end, 'shutdown')
+    end)
 end
 
 -- No __update / __uninit needed: once xtimer.init() has been called the

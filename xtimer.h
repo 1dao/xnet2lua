@@ -18,7 +18,10 @@ int  xtimer_update();   // drives expiries; returns ms until next expiry (0 if n
 int  xtimer_last();
 void xtimer_show();
 
-xtimerHandler xtimer_add(int interval_ms, const char* name, fnOnTime callback, void* ud, int repeat_num);
+xtimerHandler xtimer_add(int interval_ms,
+                         fnOnTime callback,
+                         void* ud,
+                         int repeat_num);
 void          xtimer_del(xtimerHandler handler);
 
 // utils
