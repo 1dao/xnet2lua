@@ -215,8 +215,8 @@ void xheapmin_refresh(xHeapMin* heap, xHeapMinNode* node, uint64_t new_key) {
 void xheapmin_print(xHeapMin* heap) {
     printf("堆状态: 大小=%d, 容量=%d\n", heap->size, heap->capacity);
     for (int i = 0; i < heap->size; i++) {
-        printf("  [%d] key=%lld, heap_index=%d\n",
-            i, heap->data[i]->key, heap->data[i]->heap_index);
+        printf("  [%d] key=%llu, heap_index=%d\n",
+            i, (unsigned long long)heap->data[i]->key, heap->data[i]->heap_index);
     }
 }
 
