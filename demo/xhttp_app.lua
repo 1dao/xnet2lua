@@ -68,6 +68,16 @@ router.reg('head', '/head', function()
     return text(200, 'head-body-not-sent')
 end)
 
+-- Path-param demo: GET /api/user/:id  -> echoes the captured id.
+router.reg('get', '/api/user/:id', function(req)
+    return text(200, 'user_id=' .. tostring(req.params.id) .. '\n')
+end)
+
+-- Wildcard demo: GET /static/*path  -> echoes the captured tail.
+router.reg('get', '/static/*path', function(req)
+    return text(200, 'static=' .. tostring(req.params.path) .. '\n')
+end)
+
 function M.handle(req)
     return router.handle(req)
 end

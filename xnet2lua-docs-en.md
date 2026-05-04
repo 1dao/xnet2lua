@@ -167,7 +167,12 @@ return {
 
 ### 3.2 __thread_handle Message Distribution Template
 
-This is a recommended message distribution pattern (compatible with both POST and RPC modes):
+> 💡 **Recommended**: use the `demo/xthread_base.lua` module to skip this
+> boilerplate entirely — see [3.3 xthread_base module](#33-xthread_base-module-recommended).
+> The hand-written template below is here only for readers who want to see the
+> underlying protocol or need fully custom dispatch.
+
+A by-hand message distribution pattern (compatible with both POST and RPC modes):
 
 ```lua
 _stubs = {}         -- Registered message handlers
@@ -207,7 +212,72 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
 end
 ```
 
-### 3.3 Exit
+### 3.3 xthread_base module (recommended)
+
+`demo/xthread_base.lua` packages the §3.2 boilerplate (`_stubs /
+_thread_replys / __thread_handle` plus the coroutine wrapping and RPC reply
+routing) into a small module so thread scripts only have to declare actual
+business handlers.
+
+```lua
+-- worker.lua
+local xth = dofile('demo/xthread_base.lua').new('MYAPP')
+
+-- Plain POST handler: called directly, no coroutine.
+xth.register('print_msg', function(text)
+    print('[MYAPP]', text)
+end)
+
+-- POST handler that needs to RPC out: auto-wrapped in a coroutine, may yield.
+xth.register_co('do_lookup', function(key)
+    local ok, val = xthread.rpc(xthread.REDIS, 'xredis_call', 'GET', key)
+    print('lookup:', ok, val)
+end)
+
+-- RPC handler: return values become the reply (true, ret1, ret2, ...).
+-- Errors become (false, errmsg). Always runs in a coroutine, may yield freely.
+xth.register_rpc('add', function(a, b)
+    return a + b
+end)
+
+local function __init()  print('init')   end
+local function __update() xnet.poll(10)  end
+local function __uninit() print('uninit') end
+
+return xth.thread_def({
+    __init    = __init,
+    __update  = __update,
+    __uninit  = __uninit,
+    -- __tick_ms = 10,                   -- optional, override default tick
+})
+```
+
+**API summary:**
+
+| Method | Purpose |
+|---|---|
+| `M.new(prefix)` | Create a fresh instance; `prefix` is the stderr log tag |
+| `xth.register(pt, h)` | POST handler, **no** coroutine; `h(arg1, arg2, ...)` direct call |
+| `xth.register_co(pt, h)` | POST handler auto-wrapped in a coroutine so it can RPC out |
+| `xth.register_rpc(pt, h)` | RPC handler; return value becomes the reply, error becomes `(false, err)` |
+| `xth.set_log_prefix(s)` | Change the log prefix |
+| `xth.set_unknown_post(fn)` | Fallback `fn(pt, ...)` when no POST handler matches |
+| `xth.set_unknown_rpc(fn)` | Fallback `fn(reply_router, co_id, sk, pt, ...)` when no RPC handler matches |
+| `xth.set_handler_error(fn)` | Top-level error in a `register_co` coroutine: `fn(pt, err)` |
+| `xth.current_request()` | The req object owned by the calling RPC coroutine (advanced) |
+| `xth.thread_def{...}` | Returns the table given to the C runtime, with `__thread_handle` injected |
+
+**Mapping from §3.2 hand-written template:**
+
+- The legacy `xthread.register(pt, h)` ≈ `xth.register_co` (most common shape) or the more precise `xth.register` / `xth.register_rpc`.
+- `_stubs` / `_thread_replys` are kept inside the module — no globals needed.
+- `__thread_handle` is auto-injected by `xth.thread_def`.
+
+See `demo/xlua_main.lua` and `demo/xlua_thread.lua` for an actual migration:
+running `./demo/xnet demo/xlua_main.lua` exercises the full POST + RPC + nested
+RPC-back-to-MAIN test suite using `xthread_base` end-to-end.
+
+### 3.4 Exit
 
 ```lua
 -- Normal exit (exit code 0)
@@ -777,6 +847,19 @@ router.head(path, handler)
 -- Generic register (supports any method)
 router.reg(method, path, handler)  -- method is case-insensitive
 router.route(method, path, handler) -- alias
+
+-- Path parameters / wildcard
+--   :name      matches a single path segment (no '/'), bound to req.params.name
+--   *name      only valid as the last segment; matches the rest of the path,
+--                bound to req.params.name (anonymous '*' binds to req.params.path)
+-- Static routes still take the fast dictionary path; dynamic routes are scanned
+-- in registration order on miss.
+router.get('/api/user/:id', function(req)
+    return { status = 200, body = req.params.id }
+end)
+router.get('/static/*path', function(req)
+    return { status = 200, body = req.params.path }
+end)
 
 -- Register a single static file
 router.reg_static_file(rel_path, disk_path, opts)

@@ -7,6 +7,7 @@ if M then return M end
 
 M = {
     routes = {},
+    dyn_routes = {},
     log_prefix = 'XHTTP',
 }
 rawset(_G, ROUTER_KEY, M)
@@ -76,6 +77,7 @@ local default_file_response = M.file_response
 function M.reset(opts)
     opts = opts or {}
     M.routes = {}
+    M.dyn_routes = {}
     M.not_found = opts.not_found
     M.file_response = opts.file_response or default_file_response
     M.log_prefix = opts.log_prefix or 'XHTTP'
@@ -90,10 +92,99 @@ function M.config(opts)
     return M
 end
 
+-- Compile a route pattern into a list of segments.
+-- Returns nil if the pattern is fully static (no params).
+-- Otherwise returns { segs = {...}, names = {...}, has_wild = bool, raw = path }
+-- where segs[i] is one of:
+--   { kind = 'lit', val = '<text>' }
+--   { kind = 'param', name = '<name>' }
+--   { kind = 'wild',  name = '<name>' }   -- only valid as last segment
+local function compile_pattern(path)
+    local has_dyn = false
+    local segs = {}
+    local names = {}
+    local has_wild = false
+    -- Empty path or root '/' is fully static.
+    for part in tostring(path):gmatch('[^/]+') do
+        local first = part:sub(1, 1)
+        if first == ':' then
+            local name = part:sub(2)
+            if name == '' then
+                error(string.format("router: empty :param name in %q", path))
+            end
+            if has_wild then
+                error(string.format("router: pattern after wildcard in %q", path))
+            end
+            segs[#segs + 1] = { kind = 'param', name = name }
+            names[#names + 1] = name
+            has_dyn = true
+        elseif first == '*' then
+            if has_wild then
+                error(string.format("router: multiple wildcards in %q", path))
+            end
+            local name = part:sub(2)
+            if name == '' then name = 'path' end
+            segs[#segs + 1] = { kind = 'wild', name = name }
+            names[#names + 1] = name
+            has_dyn = true
+            has_wild = true
+        else
+            if has_wild then
+                error(string.format("router: literal after wildcard in %q", path))
+            end
+            segs[#segs + 1] = { kind = 'lit', val = part }
+        end
+    end
+    if not has_dyn then return nil end
+    return { segs = segs, names = names, has_wild = has_wild, raw = path }
+end
+
+local function split_segments(path)
+    local out = {}
+    for part in tostring(path or ''):gmatch('[^/]+') do
+        out[#out + 1] = part
+    end
+    return out
+end
+
+local function match_pattern(pat, req_segs)
+    local segs = pat.segs
+    local n_pat = #segs
+    local n_req = #req_segs
+    if pat.has_wild then
+        if n_req < n_pat - 1 then return nil end
+    else
+        if n_req ~= n_pat then return nil end
+    end
+    local params = {}
+    for i = 1, n_pat do
+        local s = segs[i]
+        if s.kind == 'lit' then
+            if req_segs[i] ~= s.val then return nil end
+        elseif s.kind == 'param' then
+            local v = req_segs[i]
+            if not v then return nil end
+            params[s.name] = v
+        else -- wild: must be last; consume rest
+            local parts = {}
+            for j = i, n_req do parts[#parts + 1] = req_segs[j] end
+            params[s.name] = table.concat(parts, '/')
+        end
+    end
+    return params
+end
+
 function M.reg(method, path, handler)
     method = string.upper(tostring(method or ''))
-    M.routes[method] = M.routes[method] or {}
-    M.routes[method][path] = handler
+    local pat = compile_pattern(path)
+    if pat then
+        M.dyn_routes[method] = M.dyn_routes[method] or {}
+        local list = M.dyn_routes[method]
+        list[#list + 1] = { pattern = pat, handler = handler }
+    else
+        M.routes[method] = M.routes[method] or {}
+        M.routes[method][path] = handler
+    end
     return M
 end
 
@@ -161,11 +252,26 @@ M.static_dir = M.reg_path
 
 function M.handle(self_or_req, maybe_req)
     local req = maybe_req or self_or_req
-    local method_routes = M.routes[string.upper(tostring(req.method or ''))]
+    local method = string.upper(tostring(req.method or ''))
+    local method_routes = M.routes[method]
     local handler = method_routes and method_routes[req.path]
     if handler then
+        req.params = req.params or {}
         return handler(req)
     end
+    local dyn_list = M.dyn_routes[method]
+    if dyn_list then
+        local req_segs = split_segments(req.path)
+        for i = 1, #dyn_list do
+            local entry = dyn_list[i]
+            local params = match_pattern(entry.pattern, req_segs)
+            if params then
+                req.params = params
+                return entry.handler(req)
+            end
+        end
+    end
+    req.params = req.params or {}
     if M.not_found then
         return M.not_found(req)
     end

@@ -164,7 +164,11 @@ return {
 
 ### 3.2 `__thread_handle` 消息分发模板
 
-这是推荐的消息分发写法（兼容 POST 和 RPC 两种模式）：
+> 💡 **推荐**：直接使用 `demo/xthread_base.lua` 模块，可省去本节模板代码。
+> 见 [3.3 xthread_base 模块](#33-xthread_base-模块推荐)。下面的手写模板仅作为
+> 想了解底层协议或需要完全自定义分发行为时的参考。
+
+这是手写消息分发的写法（兼容 POST 和 RPC 两种模式）：
 
 ```lua
 _stubs = {}         -- 注册的消息处理函数表
@@ -204,7 +208,71 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
 end
 ```
 
-### 3.3 退出程序
+### 3.3 `xthread_base` 模块（推荐）
+
+`demo/xthread_base.lua` 把 §3.2 的样板代码（`_stubs / _thread_replys /
+__thread_handle` 与协程包装、RPC 回复路由）封装成一个小模块，让线程脚本只
+关心真正的业务 handler。
+
+```lua
+-- worker.lua
+local xth = dofile('demo/xthread_base.lua').new('MYAPP')
+
+-- 普通 POST handler：直接调用，不进协程
+xth.register('print_msg', function(text)
+    print('[MYAPP]', text)
+end)
+
+-- POST handler 但需要在内部 RPC 出去：自动包进协程，可以 yield
+xth.register_co('do_lookup', function(key)
+    local ok, val = xthread.rpc(xthread.REDIS, 'xredis_call', 'GET', key)
+    print('lookup:', ok, val)
+end)
+
+-- RPC handler：返回值自动作为 reply (true, ret1, ret2, ...) 发回；抛错则发
+-- (false, errmsg)。handler 始终运行在协程里，可以多次 yield。
+xth.register_rpc('add', function(a, b)
+    return a + b
+end)
+
+local function __init()  print('init')   end
+local function __update() xnet.poll(10)  end
+local function __uninit() print('uninit') end
+
+return xth.thread_def({
+    __init    = __init,
+    __update  = __update,
+    __uninit  = __uninit,
+    -- __tick_ms = 10,                   -- 可选，覆盖默认 tick
+})
+```
+
+**API 一览：**
+
+| 方法 | 用途 |
+|---|---|
+| `M.new(prefix)` | 新建一个实例；`prefix` 用于 stderr 日志 |
+| `xth.register(pt, h)` | POST handler，**不** 进协程；`h(arg1, arg2, ...)` 直接调用 |
+| `xth.register_co(pt, h)` | POST handler，自动包进协程，可 yield 做 RPC |
+| `xth.register_rpc(pt, h)` | RPC handler，返回值即 reply；`(false, err)` 表示失败 |
+| `xth.set_log_prefix(s)` | 修改日志前缀 |
+| `xth.set_unknown_post(fn)` | 未匹配到 POST handler 时的回退 `fn(pt, ...)` |
+| `xth.set_unknown_rpc(fn)` | 未匹配到 RPC handler 时的回退 `fn(reply_router, co_id, sk, pt, ...)` |
+| `xth.set_handler_error(fn)` | `register_co` 协程顶层抛错的回调 `fn(pt, err)` |
+| `xth.current_request()` | 当前 RPC 协程对应的 req 对象（少数高级用法） |
+| `xth.thread_def{...}` | 返回给 C runtime 的表，自动注入 `__thread_handle` |
+
+**与 §3.2 手写模板的对应关系：**
+
+- 旧的 `xthread.register(pt, h)` ≈ `xth.register_co` （兼容用法）或更精确的 `xth.register` / `xth.register_rpc`。
+- 旧的 `_stubs` / `_thread_replys` 由模块内部维护，不再需要全局变量。
+- `__thread_handle` 由 `xth.thread_def` 自动注入。
+
+参考 `demo/xlua_main.lua` 与 `demo/xlua_thread.lua` 的实际迁移示例
+（执行 `./demo/xnet demo/xlua_main.lua` 可跑通完整的 POST + RPC + 反向 RPC
+测试套件）。
+
+### 3.4 退出程序
 
 ```lua
 -- 正常退出（退出码 0）
@@ -850,6 +918,18 @@ router.head(path, handler)
 -- 通用注册（支持任意 method）
 router.reg(method, path, handler)  -- method 不区分大小写
 router.route(method, path, handler) -- 同上（别名）
+
+-- 路径参数 / 通配符
+--   :name      匹配单个路径段（不含 '/'），绑定到 req.params.name
+--   *name      只能作为最后一段，匹配剩余全部路径，绑定到 req.params.name
+--                （写成 '*' 时匿名通配，绑定到 req.params.path）
+-- 静态路由仍走快速字典；动态路由失配时按注册顺序线性匹配。
+router.get('/api/user/:id', function(req)
+    return { status = 200, body = req.params.id }
+end)
+router.get('/static/*path', function(req)
+    return { status = 200, body = req.params.path }
+end)
 
 -- 注册单个静态文件
 router.reg_static_file(rel_path, disk_path, opts)

@@ -4,7 +4,7 @@
 ** in __thread storage, so each Lua state has its own timer pool). The
 ** standard pattern in a thread script:
 **
-**   local timer = xtimer.add(1000, function(self) ... end, -1, "tick")
+**   local timer = xtimer.add(1000, function(self) ... end, -1)
 **   ...
 **   timer:del()                -- cancel
 **
@@ -171,7 +171,7 @@ static int l_xtimer_show(lua_State* L) {
 ** top of the Lua stack. callback_idx is the absolute stack index of the Lua
 ** callback function; the caller is responsible for type-checking it. */
 static int xtimer_create_lua(lua_State* L, const char* fname, int interval_ms,
-                             int callback_idx, int repeat_num, const char* name) {
+                             int callback_idx, int repeat_num) {
     LuaTimer* t = (LuaTimer*)lua_newuserdata(L, sizeof(*t));
     t->L = L;
     t->handle = NULL;
@@ -187,7 +187,7 @@ static int xtimer_create_lua(lua_State* L, const char* fname, int interval_ms,
     lua_pushvalue(L, callback_idx);
     t->callback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-    t->handle = xtimer_add(interval_ms, name, timer_callback_bridge, t, repeat_num);
+    t->handle = xtimer_add(interval_ms, timer_callback_bridge, t, repeat_num);
     if (!t->handle) {
         lua_timer_release_refs(t);
         return luaL_error(L, "%s: xtimer_add failed", fname);
@@ -199,14 +199,13 @@ static int l_xtimer_add(lua_State* L) {
     int interval_ms = (int)luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
     int repeat_num = (int)luaL_optinteger(L, 3, 1);
-    const char* name = luaL_optstring(L, 4, NULL);
 
     if (interval_ms < 0)
         return luaL_error(L, "xtimer.add: interval_ms must be >= 0");
     if (repeat_num != -1 && repeat_num < 1)
         return luaL_error(L, "xtimer.add: repeat_num must be -1 (infinite) or >= 1");
 
-    return xtimer_create_lua(L, "xtimer.add", interval_ms, 2, repeat_num, name);
+    return xtimer_create_lua(L, "xtimer.add", interval_ms, 2, repeat_num);
 }
 
 /* xtimer.delay(interval_ms, callback, [name]) -> timer
@@ -215,12 +214,10 @@ static int l_xtimer_add(lua_State* L) {
 static int l_xtimer_delay(lua_State* L) {
     int interval_ms = (int)luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
-    const char* name = luaL_optstring(L, 3, NULL);
-
     if (interval_ms < 0)
         return luaL_error(L, "xtimer.delay: interval_ms must be >= 0");
 
-    return xtimer_create_lua(L, "xtimer.delay", interval_ms, 2, 1, name);
+    return xtimer_create_lua(L, "xtimer.delay", interval_ms, 2, 1);
 }
 
 static int l_xtimer_del(lua_State* L) {
