@@ -133,22 +133,23 @@ void xtimer_print(xTimerSet* tm) {
     if (!tm) return;
 
     printf("\n=== 定时器管理器状态 ===\n");
-    printf("当前时间: %lld\n", tm->current_time);
+    printf("当前时间: %llu\n", (unsigned long long)tm->current_time);
     printf("活动定时器数量: %d\n", xheapmin_size(tm->timer_heap));
 
     xTimerNode* next_timer = (xTimerNode*)xheapmin_peek(tm->timer_heap);
     if (next_timer) {
-        printf("下一个到期定时器: ID=%d, 名称=%s, %lldms后到期\n",
+        printf("下一个到期定时器: ID=%d, 名称=%s, %llums后到期\n",
             next_timer->id, next_timer->name,
-            next_timer->base.key - tm->current_time);
+            (unsigned long long)(next_timer->base.key - tm->current_time));
     }
 
     printf("所有定时器:\n");
     for (int i = 0; i < tm->timer_heap->size; i++) {
         xTimerNode* timer = (xTimerNode*)tm->timer_heap->data[i];
-        printf("  [%d] ID=%d, 名称=%s, 过期时间=%lld (%lldms后), 重复=%d, 堆索引=%d\n",
-            i, timer->id, timer->name, timer->base.key,
-            timer->base.key - tm->current_time,
+        printf("  [%d] ID=%d, 名称=%s, 过期时间=%llu (%llums后), 重复=%d, 堆索引=%d\n",
+            i, timer->id, timer->name,
+            (unsigned long long)timer->base.key,
+            (unsigned long long)(timer->base.key - tm->current_time),
             timer->repeat_interval, timer->base.heap_index);
     }
 }
