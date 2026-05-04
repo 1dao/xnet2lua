@@ -1,7 +1,6 @@
 #ifndef XPOLL_H
 #define XPOLL_H
 
-#include "xsock.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -25,6 +24,7 @@ extern "C" {
 #   define XPOLL_BACKEND_POLL
 #   include <poll.h>
 #endif
+#include "xsock.h"
 
 /* ── Event mask flags ──────────────────────────────────────────────────── */
 #define XPOLL_NONE      0
@@ -43,6 +43,7 @@ typedef void (*xFileProc)(SOCKET_T fd, int mask, void *clientData);
 /* ── Public API ─────────────────────────────────────────────────────────── */
 int         xpoll_init(void);
 void        xpoll_uninit(void);
+int         xpoll_inited(void);   /* 1 if this thread has an active poll loop */
 xPollState* xpoll_get_default(void);
 
 int  xpoll_resize(int setsize);

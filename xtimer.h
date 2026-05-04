@@ -13,7 +13,8 @@ typedef void* xtimerHandler;
 // api
 void xtimer_init(int cap);
 void xtimer_uninit();
-void xtimer_update();
+int  xtimer_inited();   // 1 if this thread has an active timer pool, 0 otherwise
+int  xtimer_update();   // drives expiries; returns ms until next expiry (0 if none / due)
 int  xtimer_last();
 void xtimer_show();
 
@@ -90,10 +91,6 @@ static inline uint64_t time_day_ms() {
     return time_day_us() / 1000;
 }
 #endif
-
-// Keep backward compatibility
-static inline uint64_t time_get_ms() { return time_day_ms(); }
-static inline uint64_t time_get_us() { return time_day_us(); }
 
 static inline void time_get_dt(uint64_t millis, char out[24]) {
     // 转换为秒和毫秒
