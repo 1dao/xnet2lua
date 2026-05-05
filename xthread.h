@@ -9,6 +9,20 @@
 ** Wakeup strategy (selected at runtime by xthread_wakeup_init):
 **   xpoll_get_default() != NULL  →  socketpair fd registered in xpoll
 **   xpoll_get_default() == NULL  →  pthread_cond_signal / Windows SetEvent
+**
+** Task queue backend (selected at compile time):
+**   default            →  mutex-guarded singly-linked list with a
+**                          pre-allocated task pool per thread.
+**   -DXTHREAD_MPSCQ    →  lock-free MPSC queue (xmpsc_queue.h). Producers
+**                          push without taking a lock; the single owning
+**                          thread drains via xmpsc_pop. Each pushed node is
+**                          malloc'd individually (the per-thread task pool
+**                          slab is not allocated in this mode). Backpressure
+**                          becomes soft (atomic counter, may transiently
+**                          overshoot under contention). xthread_post_reply
+**                          still bypasses the cap. Public API is unchanged;
+**                          all callers continue to use xthread_post /
+**                          xthread_post_reply / xthread_set_queue_max.
 */
 
 #include <stdbool.h>
