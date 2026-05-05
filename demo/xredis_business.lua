@@ -2,45 +2,22 @@
 -- Each business thread calls Redis through the shared XTHR_REDIS service thread.
 
 local xredis = dofile('demo/xredis.lua')
+local router = dofile('demo/xrouter.lua')
+router.set_log_prefix('XREDIS-BIZ')
 
 local MAIN_ID = xthread.MAIN
-
-_stubs = {}
-_thread_replys = {}
-
-local unpack_args = table.unpack or unpack
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        io.stderr:write('[XREDIS-BIZ] unexpected RPC message: ' .. tostring(k3) .. '\n')
-        return
-    end
-
-    local h = _stubs[k1]
-    if not h then
-        if k1 then
-            io.stderr:write('[XREDIS-BIZ] no handler for pt=' .. tostring(k1) .. '\n')
-        end
-        return
-    end
-
-    local args = { n = select('#', ...) + 2, k2, k3, ... }
-    local co = coroutine.create(function()
-        h(unpack_args(args, 1, args.n))
-    end)
-    local ok, err = coroutine.resume(co)
-    if not ok then
-        xthread.post(MAIN_ID, 'xredis_business_done', xthread.current_id(), false, tostring(err))
-    end
-end
 
 local function finish(ok, msg)
     xthread.post(MAIN_ID, 'xredis_business_done', xthread.current_id(), ok, msg)
 end
+
+-- Surface coroutine-top-level errors as a failed business result so the main
+-- thread always gets a `xredis_business_done` POST.
+router.set_handler_error(function(_, err) finish(false, tostring(err)) end)
+
+-- Mirror the legacy `xthread.register(pt, h)` API onto router.register so
+-- existing handlers below don't change shape.
+xthread.register = router.register
 
 local function array_equals(actual, expected)
     if type(actual) ~= 'table' or #actual ~= #expected then
@@ -332,5 +309,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

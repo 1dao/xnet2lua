@@ -9,60 +9,15 @@ local compute_thread_running = false
 
 print('[MAIN] Current thread id = ' .. xthread.current_id())
 
--- Default sync thread message handler (copied from thread_router.lua)
--- This handles POST and RPC dispatch to registered stubs
--- All handlers run in coroutines so they can yield for nested RPC calls
-_stubs = {}
-_thread_replys = {}
+-- Cross-thread message dispatch is provided by xrouter (per-Lua-state
+-- singleton); the script keeps its usual return-table shape and just plugs
+-- router.handle into __thread_handle.
+local router = dofile('demo/xrouter.lua')
+router.set_log_prefix('MAIN')
 
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if not reply_router then
-        -- POST形式消息 [k1:pt]
-        local h = _stubs[k1]
-        if not h then
-            if not k1 then return end -- quit signal
-            io.stderr:write('[MAIN] thread message pt handle not found! pt: ' .. tostring(k1) .. '\n')
-        else
-            -- Run POST handler in coroutine so it can do RPC if needed
-            local co = coroutine.create(function(...)
-                h(k2, k3, ...)
-            end)
-            coroutine.resume(co, ...)
-        end
-        return
-    end
-
-    -- RPC形式消息 [k1:co, k2:sk, k3:pt]
-    local reply = _thread_replys[reply_router]
-    if not reply then
-        io.stderr:write('[MAIN] thread message reply_router not found! reply_router: ' .. tostring(reply_router) .. ' pt: ' .. tostring(k3) .. '\n')
-        return
-    end
-    local h = _stubs[k3]
-    if not h then
-        io.stderr:write('[MAIN] thread message pt handle not found! reply_router: ' .. tostring(reply_router) .. ' pt: ' .. tostring(k3) .. '\n')
-        if not reply(k1, k2, k3, false, 'pt handle not found!') then
-            io.stderr:write('[MAIN] thread message route failed!\n')
-        end
-        return
-    end
-
-    -- Run RPC handler in coroutine so it can do nested RPC calls (which require yield)
-    local co = coroutine.create(function(...)
-        -- Capture all results from pcall
-        if not reply(k1, k2, k3, pcall(h, ...)) then
-            io.stderr:write('[MAIN] thread message route failed! reply_router: ' .. tostring(reply_router) .. ' pt: ' .. tostring(k3) .. '\n')
-        end
-    end)
-    coroutine.resume(co, ...)
-end
-
--- RPC handler: reverse a string (called back from COMPUTE)
-xthread.register('reverse_string', function(s)
+-- Handler: reverse a string. Called back from COMPUTE via RPC, but the
+-- registration is calling-convention-agnostic.
+router.register('reverse_string', function(s)
     print('[MAIN] reverse_string() called: ' .. s)
     local reversed = string.reverse(s)
     return reversed
@@ -206,16 +161,12 @@ local function __uninit()
 end
 
 -- -----------------------------------------------------------------------------
--- Return the definition table following the same convention as xlua_thread.lua
+-- Return the definition table following the same convention as xlua_thread.lua.
+-- router.handle is exported by xrouter as the dispatcher closure.
 -- -----------------------------------------------------------------------------
-local function sinking()
-    return {
-        __init = __init,
-        __update = __update,
-        __uninit = __uninit,
-        __thread_handle = __thread_handle,
-    }
-end
-
--- sinking
-do return sinking() end
+return {
+    __init = __init,
+    __update = __update,
+    __uninit = __uninit,
+    __thread_handle = router.handle,
+}
