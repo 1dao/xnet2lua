@@ -783,13 +783,13 @@ int xpoll_poll(int timeout_ms) {
 /* ── epoll backend ────────────────────────────────────────────────────── */
 #if defined(XPOLL_BACKEND_EPOLL)
 
+int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
 #if defined(XPOLL_WITH_IO_URING)
     num_processed += _uring_drain(loop);
     if (num_processed > 0) return num_processed;
     if (loop->uring_ready) maxevents++;
 #endif
 
-    int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
     if (maxevents > loop->setsize) maxevents = loop->setsize;
     num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, timeout_ms);
 
