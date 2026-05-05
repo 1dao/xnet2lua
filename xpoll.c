@@ -37,6 +37,11 @@
 #include "xpoll.h"
 #include "xhash.h"
 
+#if defined(XPOLL_WITH_IO_URING)
+#   include <liburing.h>
+#   include <poll.h>
+#endif
+
 /* ── Default initial capacity ─────────────────────────────────────────── */
 #define XPOLL_SETSIZE 1024
 
@@ -51,6 +56,19 @@ typedef struct xPoolFD {
     void       *clientData;
 } xPoolFD;
 
+#if defined(XPOLL_WITH_IO_URING)
+struct xPollRequest {
+    SOCKET_T          fd;
+    int               op;
+    int               mask;
+    int               flags;
+    void             *buffer;
+    size_t            length;
+    xPollCompleteProc completeProc;
+    void             *clientData;
+};
+#endif
+
 /* ── Internal state ───────────────────────────────────────────────────── */
 struct xPollState {
     xhash      *fd_map;       /* fd -> xPoolFD*                           */
@@ -62,6 +80,11 @@ struct xPollState {
 #if defined(XPOLL_BACKEND_EPOLL)
     int                  epfd;
     struct epoll_event  *ep_events;   /* result buffer for epoll_wait     */
+#if defined(XPOLL_WITH_IO_URING)
+    struct io_uring      uring;
+    int                  uring_fd;
+    int                  uring_ready;
+#endif
 
 #elif defined(XPOLL_BACKEND_KQUEUE)
     int            kqfd;
@@ -87,6 +110,189 @@ struct xPollState {
 /* ═══════════════════════════════════════════════════════════════════════
  *  fd_map helpers
  * ═══════════════════════════════════════════════════════════════════════ */
+
+#if defined(XPOLL_WITH_IO_URING)
+static int _uring_poll_events_from_mask(int mask) {
+    int events = 0;
+    if (mask & XPOLL_READABLE) events |= POLLIN;
+    if (mask & XPOLL_WRITABLE) events |= POLLOUT;
+    if (mask & XPOLL_ERROR)    events |= POLLERR;
+    if (mask & XPOLL_CLOSE)    events |= POLLHUP;
+#ifdef POLLRDHUP
+    if (mask & XPOLL_CLOSE)    events |= POLLRDHUP;
+#endif
+    return events;
+}
+
+static int _uring_mask_from_poll_events(int events) {
+    int mask = 0;
+    if (events & POLLIN)  mask |= XPOLL_READABLE;
+    if (events & POLLOUT) mask |= XPOLL_WRITABLE;
+    if (events & POLLERR) mask |= XPOLL_ERROR;
+    if (events & POLLHUP) mask |= XPOLL_CLOSE;
+#ifdef POLLNVAL
+    if (events & POLLNVAL) mask |= XPOLL_ERROR | XPOLL_CLOSE;
+#endif
+#ifdef POLLRDHUP
+    if (events & POLLRDHUP) mask |= XPOLL_CLOSE;
+#endif
+    return mask;
+}
+
+static int _uring_mask_from_completion(const xPollRequest *req, int res) {
+    if (!req) return XPOLL_NONE;
+    if (res < 0) return XPOLL_ERROR;
+
+    if (req->op == XPOLL_OP_POLL)
+        return _uring_mask_from_poll_events(res);
+    if (req->op == XPOLL_OP_RECV)
+        return res == 0 ? XPOLL_CLOSE : XPOLL_READABLE;
+    if (req->op == XPOLL_OP_SEND)
+        return XPOLL_WRITABLE;
+    return XPOLL_NONE;
+}
+
+static int _uring_drain(xPollState *loop) {
+    if (!loop || !loop->uring_ready) return 0;
+
+    int processed = 0;
+    struct io_uring_cqe *cqe = NULL;
+    while (io_uring_peek_cqe(&loop->uring, &cqe) == 0 && cqe) {
+        xPollRequest *req = (xPollRequest*)(uintptr_t)cqe->user_data;
+        if (req) {
+            xPollCompletion completion;
+            memset(&completion, 0, sizeof(completion));
+            completion.fd      = req->fd;
+            completion.op      = req->op;
+            completion.res     = cqe->res;
+            completion.flags   = cqe->flags;
+            completion.mask    = _uring_mask_from_completion(req, cqe->res);
+            completion.buffer  = req->buffer;
+            completion.length  = req->length;
+            completion.request = req;
+
+            xPollCompleteProc proc = req->completeProc;
+            void *clientData = req->clientData;
+            if (proc) proc(&completion, clientData);
+            free(req);
+            processed++;
+        }
+        io_uring_cqe_seen(&loop->uring, cqe);
+        cqe = NULL;
+    }
+    return processed;
+}
+
+static int _uring_attach_to_epoll(xPollState *loop) {
+    struct epoll_event ee;
+    memset(&ee, 0, sizeof(ee));
+    ee.events = EPOLLIN;
+    ee.data.fd = loop->uring_fd;
+    if (epoll_ctl(loop->epfd, EPOLL_CTL_ADD, loop->uring_fd, &ee) < 0)
+        return -1;
+    return 0;
+}
+
+static int _uring_loop_init(xPollState *loop) {
+    if (!loop) return -1;
+    loop->uring_fd = -1;
+    loop->uring_ready = 0;
+
+    int rc = io_uring_queue_init((unsigned)XPOLL_SETSIZE, &loop->uring, 0);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+
+    loop->uring_fd = loop->uring.ring_fd;
+    loop->uring_ready = 1;
+    if (_uring_attach_to_epoll(loop) != 0) {
+        io_uring_queue_exit(&loop->uring);
+        loop->uring_ready = 0;
+        loop->uring_fd = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void _uring_loop_uninit(xPollState *loop) {
+    if (!loop || !loop->uring_ready) return;
+    _uring_drain(loop);
+    io_uring_queue_exit(&loop->uring);
+    loop->uring_ready = 0;
+    loop->uring_fd = -1;
+}
+
+static xPollRequest* _uring_request_new(SOCKET_T fd, int op, int mask,
+                                        int flags, void *buffer, size_t length,
+                                        xPollCompleteProc completeProc,
+                                        void *clientData) {
+    xPollRequest *req = (xPollRequest*)calloc(1, sizeof(*req));
+    if (!req) return NULL;
+    req->fd = fd;
+    req->op = op;
+    req->mask = mask;
+    req->flags = flags;
+    req->buffer = buffer;
+    req->length = length;
+    req->completeProc = completeProc;
+    req->clientData = clientData;
+    return req;
+}
+
+static xPollRequest* _uring_submit_request(xPollRequest *req) {
+    xPollState *loop = _xpoll;
+    if (!req) {
+        errno = ENOMEM;
+        return NULL;
+    }
+    if (!loop || !loop->uring_ready) {
+        free(req);
+        errno = ENOSYS;
+        return NULL;
+    }
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->uring);
+    if (!sqe) {
+        int rc = io_uring_submit(&loop->uring);
+        if (rc < 0) {
+            free(req);
+            errno = -rc;
+            return NULL;
+        }
+        sqe = io_uring_get_sqe(&loop->uring);
+        if (!sqe) {
+            free(req);
+            errno = EAGAIN;
+            return NULL;
+        }
+    }
+
+    if (req->op == XPOLL_OP_RECV) {
+        io_uring_prep_recv(sqe, (int)req->fd, req->buffer,
+                           (unsigned)req->length, req->flags);
+    } else if (req->op == XPOLL_OP_SEND) {
+        io_uring_prep_send(sqe, (int)req->fd, req->buffer,
+                           (unsigned)req->length, req->flags);
+    } else if (req->op == XPOLL_OP_POLL) {
+        io_uring_prep_poll_add(sqe, (int)req->fd,
+                               _uring_poll_events_from_mask(req->mask));
+    } else {
+        free(req);
+        errno = EINVAL;
+        return NULL;
+    }
+
+    io_uring_sqe_set_data(sqe, req);
+    int rc = io_uring_submit(&loop->uring);
+    if (rc < 0) {
+        free(req);
+        errno = -rc;
+        return NULL;
+    }
+    return req;
+}
+#endif
 
 static inline long long _fd_key(SOCKET_T fd) {
 #if defined(_WIN32)
@@ -201,6 +407,14 @@ int xpoll_init(void) {
         malloc(sizeof(struct epoll_event) * XPOLL_SETSIZE);
     if (!loop->ep_events) { close(loop->epfd); goto fail; }
 
+#if defined(XPOLL_WITH_IO_URING)
+    if (_uring_loop_init(loop) != 0) {
+        free(loop->ep_events);
+        close(loop->epfd);
+        goto fail;
+    }
+#endif
+
 #elif defined(XPOLL_BACKEND_KQUEUE)
 
     loop->kqfd = kqueue();
@@ -247,6 +461,9 @@ void xpoll_uninit(void) {
     if (!loop) return;
 
 #if defined(XPOLL_BACKEND_EPOLL)
+#if defined(XPOLL_WITH_IO_URING)
+    _uring_loop_uninit(loop);
+#endif
     if (loop->epfd >= 0) close(loop->epfd);
     free(loop->ep_events);
 #elif defined(XPOLL_BACKEND_KQUEUE)
@@ -566,6 +783,12 @@ int xpoll_poll(int timeout_ms) {
 /* ── epoll backend ────────────────────────────────────────────────────── */
 #if defined(XPOLL_BACKEND_EPOLL)
 
+#if defined(XPOLL_WITH_IO_URING)
+    num_processed += _uring_drain(loop);
+    if (num_processed > 0) return num_processed;
+    if (loop->uring_ready) maxevents++;
+#endif
+
     int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
     if (maxevents > loop->setsize) maxevents = loop->setsize;
     num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, timeout_ms);
@@ -579,6 +802,13 @@ int xpoll_poll(int timeout_ms) {
     for (int i = 0; i < num_ready; i++) {
         struct epoll_event *e = &loop->ep_events[i];
         SOCKET_T sfd = (SOCKET_T)e->data.fd;
+
+#if defined(XPOLL_WITH_IO_URING)
+        if (loop->uring_ready && (int)sfd == loop->uring_fd) {
+            num_processed += _uring_drain(loop);
+            continue;
+        }
+#endif
 
         xPoolFD *fe = _fe_get(loop, sfd);
         if (!fe || fe->mask == XPOLL_NONE) continue;
@@ -755,9 +985,86 @@ void* xpoll_get_client_data(SOCKET_T fd) {
     return fe ? fe->clientData : NULL;
 }
 
+#if defined(XPOLL_WITH_IO_URING)
+int xpoll_uring_enabled(void) {
+    xPollState *loop = _xpoll;
+    return (loop && loop->uring_ready) ? 1 : 0;
+}
+
+xPollRequest* xpoll_submit_recv(SOCKET_T fd, void *buf, size_t len, int flags,
+                                xPollCompleteProc completeProc,
+                                void *clientData) {
+    if (!buf || len == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return _uring_submit_request(
+        _uring_request_new(fd, XPOLL_OP_RECV, XPOLL_READABLE, flags,
+                           buf, len, completeProc, clientData));
+}
+
+xPollRequest* xpoll_submit_send(SOCKET_T fd, const void *buf, size_t len,
+                                int flags,
+                                xPollCompleteProc completeProc,
+                                void *clientData) {
+    if (!buf || len == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return _uring_submit_request(
+        _uring_request_new(fd, XPOLL_OP_SEND, XPOLL_WRITABLE, flags,
+                           (void*)buf, len, completeProc, clientData));
+}
+
+xPollRequest* xpoll_submit_poll(SOCKET_T fd, int mask,
+                                xPollCompleteProc completeProc,
+                                void *clientData) {
+    if ((mask & XPOLL_ALL) == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    return _uring_submit_request(
+        _uring_request_new(fd, XPOLL_OP_POLL, mask, 0,
+                           NULL, 0, completeProc, clientData));
+}
+
+int xpoll_cancel_request(xPollRequest *request) {
+    xPollState *loop = _xpoll;
+    if (!loop || !loop->uring_ready || !request) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&loop->uring);
+    if (!sqe) {
+        int rc = io_uring_submit(&loop->uring);
+        if (rc < 0) {
+            errno = -rc;
+            return -1;
+        }
+        sqe = io_uring_get_sqe(&loop->uring);
+        if (!sqe) {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
+
+    io_uring_prep_cancel(sqe, request, 0);
+    io_uring_sqe_set_data(sqe, NULL);
+    int rc = io_uring_submit(&loop->uring);
+    if (rc < 0) {
+        errno = -rc;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 /* Return the active backend name */
 const char* xpoll_name(void) {
-#if   defined(XPOLL_BACKEND_EPOLL)
+#if   defined(XPOLL_WITH_IO_URING)
+    return "epoll+io_uring";
+#elif defined(XPOLL_BACKEND_EPOLL)
     return "epoll";
 #elif defined(XPOLL_BACKEND_KQUEUE)
     return "kqueue";

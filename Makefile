@@ -4,8 +4,10 @@ LIB_NAME = xsock
 CC = gcc
 AR = ar
 ARFLAGS = rcs
-# -MMD -MP for automatic header dependency tracking
+# -DXTHREAD_MPSCQ for using MPSCQ instead of the default queue implementation
+# -MMD -MP for automatic header dependency tracking  
 CFLAGS = -Wall -Wextra -O2 -I. -MMD -MP
+WITH_IO_URING ?= 0
 
 OBJ_DIR = obj
 
@@ -24,6 +26,12 @@ else
     TARGET_LIB = lib$(LIB_NAME).a
     RM = rm -rf
     MKDIR = mkdir -p
+endif
+
+ifeq ($(WITH_IO_URING),1)
+ifneq ($(OS),Windows_NT)
+    CFLAGS += -DXPOLL_USE_IO_URING -DXCHANNEL_USE_IO_URING
+endif
 endif
 
 # 3. Source Files (Ensure these files exist in the same directory)

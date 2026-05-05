@@ -8,6 +8,10 @@
 #include <string.h>
 #include <stdio.h>
 
+#if defined(XCHANNEL_USE_IO_URING) && defined(XPOLL_WITH_IO_URING)
+#define XCHANNEL_WITH_IO_URING 1
+#endif
+
 #ifdef __linux__
 #include <sys/sendfile.h>
 #include <sys/stat.h>
@@ -48,6 +52,13 @@ struct xChannel {
     bool connected;
     bool connect_pending;
 
+#if defined(XCHANNEL_WITH_IO_URING)
+    bool read_pending;
+    bool write_pending;
+    xPollRequest* read_req;
+    xPollRequest* write_req;
+#endif
+
     xChannelFrame frame;
     size_t max_packet;
 
@@ -76,6 +87,12 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_write_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_connect_event(SOCKET_T fd, int mask, void* clientData);
 static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData);
+#if defined(XCHANNEL_WITH_IO_URING)
+static int xchannel_uring_arm_read(xChannel* ch);
+static int xchannel_uring_arm_write(xChannel* ch);
+static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData);
+static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientData);
+#endif
 
 static inline size_t xbuf_size(const xBuffer* b) {
     return b->len - b->off;
@@ -222,6 +239,19 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
     ch->connected = false;
     ch->connect_pending = false;
 
+#if defined(XCHANNEL_WITH_IO_URING)
+    if (ch->read_req) {
+        xpoll_cancel_request(ch->read_req);
+        ch->read_req = NULL;
+    }
+    ch->read_pending = false;
+    if (ch->write_req) {
+        xpoll_cancel_request(ch->write_req);
+        ch->write_req = NULL;
+    }
+    ch->write_pending = false;
+#endif
+
     if (ch->fd != INVALID_SOCKET_VAL) {
         xpoll_del_event(ch->fd, XPOLL_ALL);
         xsock_close(ch->fd);
@@ -363,6 +393,10 @@ static int try_send_iov(SOCKET_T fd,
 }
 
 static int arm_writable(xChannel* ch, bool while_connecting) {
+#if defined(XCHANNEL_WITH_IO_URING)
+    (void)while_connecting;
+    return xchannel_uring_arm_write(ch);
+#else
     xFileProc writable = while_connecting ? xchannel_connect_event
                                           : xchannel_write_event;
     if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
@@ -371,7 +405,50 @@ static int arm_writable(xChannel* ch, bool while_connecting) {
         return -1;
     }
     return 0;
+#endif
 }
+
+#if defined(XCHANNEL_WITH_IO_URING)
+static int xchannel_uring_arm_read(xChannel* ch) {
+    if (!ch || ch->closed || !ch->attached ||
+        ch->fd == INVALID_SOCKET_VAL || ch->read_pending) {
+        return 0;
+    }
+    if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max)
+        return 0;
+
+    xchannel_retain(ch);
+    ch->read_pending = true;
+    ch->read_req = xpoll_submit_poll(ch->fd, XPOLL_READABLE | XPOLL_CLOSE,
+                                     xchannel_uring_read_done, ch);
+    if (!ch->read_req) {
+        ch->read_pending = false;
+        xchannel_release(ch);
+        xchannel_close(ch, "poll_error");
+        return -1;
+    }
+    return 0;
+}
+
+static int xchannel_uring_arm_write(xChannel* ch) {
+    if (!ch || ch->closed || !ch->attached ||
+        ch->fd == INVALID_SOCKET_VAL || ch->write_pending) {
+        return 0;
+    }
+
+    xchannel_retain(ch);
+    ch->write_pending = true;
+    ch->write_req = xpoll_submit_poll(ch->fd, XPOLL_WRITABLE | XPOLL_CLOSE,
+                                      xchannel_uring_write_done, ch);
+    if (!ch->write_req) {
+        ch->write_pending = false;
+        xchannel_release(ch);
+        xchannel_close(ch, "poll_error");
+        return -1;
+    }
+    return 0;
+}
+#endif
 
 static void flush_output(xChannel* ch) {
     if (!ch || ch->closed || ch->connect_pending) return;
@@ -591,17 +668,25 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
 
     bool over_before = !ch->closed
         && ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max;
+#if !defined(XCHANNEL_WITH_IO_URING)
     if (over_before) xpoll_del_event(ch->fd, XPOLL_READABLE);
+#endif
 
     int n = process_input(ch);
     if (n==0 && over_before)
         xchannel_close(ch, "over_consume_error"); 
     if (over_before && !ch->closed && xbuf_size(&ch->in) <= ch->in.max) {
+#if defined(XCHANNEL_WITH_IO_URING)
+        if (xchannel_uring_arm_read(ch) != 0) {
+            xchannel_close(ch, "poll_error");
+        }
+#else
         if (xpoll_add_event(ch->fd, XPOLL_READABLE,
                             xchannel_read_event, NULL,
                             xchannel_error_event, ch) != 0) {
             xchannel_close(ch, "poll_error");
         }
+#endif
     }
 
     if (close_after && !ch->closed) xchannel_close(ch, close_reason);
@@ -638,6 +723,66 @@ static void xchannel_error_event(SOCKET_T fd, int mask, void* clientData) {
     xchannel_close(ch, "socket_error");
     xchannel_release(ch);
 }
+
+#if defined(XCHANNEL_WITH_IO_URING)
+static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData) {
+    xChannel* ch = (xChannel*)clientData;
+    if (!ch) return;
+
+    if (!ev || ev->request != ch->read_req) {
+        xchannel_release(ch);
+        return;
+    }
+
+    ch->read_pending = false;
+    ch->read_req = NULL;
+
+    if (!ch->closed && ch->attached) {
+        if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
+            xchannel_close(ch, "socket_error");
+        } else if (ev->mask & (XPOLL_READABLE | XPOLL_CLOSE)) {
+            xchannel_read_event(ch->fd, ev->mask, ch);
+        }
+
+        if (!ch->closed && ch->attached &&
+            (ch->in.max == 0 || xbuf_size(&ch->in) <= ch->in.max)) {
+            xchannel_uring_arm_read(ch);
+        }
+    }
+
+    xchannel_release(ch);
+}
+
+static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientData) {
+    xChannel* ch = (xChannel*)clientData;
+    if (!ch) return;
+
+    if (!ev || ev->request != ch->write_req) {
+        xchannel_release(ch);
+        return;
+    }
+
+    ch->write_pending = false;
+    ch->write_req = NULL;
+
+    if (!ch->closed && ch->attached) {
+        if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
+            xchannel_close(ch, "socket_error");
+        } else if (ch->connect_pending) {
+            xchannel_connect_event(ch->fd, ev->mask, ch);
+        } else if (ev->mask & (XPOLL_WRITABLE | XPOLL_CLOSE)) {
+            xchannel_write_event(ch->fd, ev->mask, ch);
+        }
+
+        if (!ch->closed && ch->attached &&
+            (ch->connect_pending || xbuf_size(&ch->out) > 0 || has_pending_file(ch))) {
+            xchannel_uring_arm_write(ch);
+        }
+    }
+
+    xchannel_release(ch);
+}
+#endif
 
 xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg) {
     xChannel* ch = (xChannel*)calloc(1, sizeof(*ch));
@@ -679,6 +824,18 @@ void xchannel_destroy(xChannel* ch) {
         ch->attached = false;
         ch->connected = false;
         ch->connect_pending = false;
+#if defined(XCHANNEL_WITH_IO_URING)
+        if (ch->read_req) {
+            xpoll_cancel_request(ch->read_req);
+            ch->read_req = NULL;
+        }
+        ch->read_pending = false;
+        if (ch->write_req) {
+            xpoll_cancel_request(ch->write_req);
+            ch->write_req = NULL;
+        }
+        ch->write_pending = false;
+#endif
         if (ch->fd != INVALID_SOCKET_VAL) {
             xpoll_del_event(ch->fd, XPOLL_ALL);
             xsock_close(ch->fd);
@@ -730,6 +887,15 @@ void xchannel_set_max_recv(xChannel* ch, size_t max) {
 
 int xchannel_attach(xChannel* ch) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
+#if defined(XCHANNEL_WITH_IO_URING)
+    ch->attached = true;
+    ch->connected = true;
+    if (xchannel_uring_arm_read(ch) != 0) {
+        ch->attached = false;
+        return -1;
+    }
+    return 0;
+#else
     if (xpoll_add_event(ch->fd, XPOLL_READABLE,
                         xchannel_read_event, NULL, xchannel_error_event, ch) != 0) {
         return -1;
@@ -737,24 +903,48 @@ int xchannel_attach(xChannel* ch) {
     ch->attached = true;
     ch->connected = true;
     return 0;
+#endif
 }
 
 int xchannel_attach_connect(xChannel* ch) {
     if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) return -1;
     ch->connect_pending = true;
     ch->connected = false;
+#if defined(XCHANNEL_WITH_IO_URING)
+    ch->attached = true;
+    if (xchannel_uring_arm_write(ch) != 0) {
+        ch->attached = false;
+        return -1;
+    }
+    return 0;
+#else
     if (xpoll_add_event(ch->fd, XPOLL_WRITABLE,
                         NULL, xchannel_connect_event, xchannel_error_event, ch) != 0) {
         return -1;
     }
     ch->attached = true;
     return 0;
+#endif
 }
 
 void xchannel_detach(xChannel* ch) {
     if (!ch || ch->fd == INVALID_SOCKET_VAL) return;
+#if defined(XCHANNEL_WITH_IO_URING)
+    ch->attached = false;
+    if (ch->read_req) {
+        xpoll_cancel_request(ch->read_req);
+        ch->read_req = NULL;
+    }
+    ch->read_pending = false;
+    if (ch->write_req) {
+        xpoll_cancel_request(ch->write_req);
+        ch->write_req = NULL;
+    }
+    ch->write_pending = false;
+#else
     xpoll_del_event(ch->fd, XPOLL_ALL);
     ch->attached = false;
+#endif
 }
 
 int xchannel_send_raw(xChannel* ch, const char* data, size_t len) {
