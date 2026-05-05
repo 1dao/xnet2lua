@@ -386,6 +386,11 @@ int xtimer_inited() {
     return _cur != NULL;
 }
 
+int xtimer_count() {
+    if (!_cur || !_cur->timer_heap) return 0;
+    return _cur->timer_heap->size;
+}
+
 int xtimer_update() {
     if (_cur) {
         return xtimer_poll(_cur);

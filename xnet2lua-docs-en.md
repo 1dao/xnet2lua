@@ -1066,11 +1066,11 @@ xnet2lua reserves space for thread IDs in the range 0–99, where 0–9 are spec
 | `xthread.COMPUTE` | 6 | Compute thread |
 | `xthread.NATS` | 7 | NATS message queue thread |
 | `xthread.HTTP` | 8 | HTTP/HTTPS service thread |
-| `xthread.WORKER_GRP1` | 10 | Worker group 1 start (10–29)|
-| `xthread.WORKER_GRP2` | 30 | Worker group 2 start (30–49)|
-| `xthread.WORKER_GRP3` | 50 | Worker group 3 start (50–59)|
-| `xthread.WORKER_GRP4` | 60 | Worker group 4 start (60–69)|
-| `xthread.WORKER_GRP5` | 70 | Worker group 5 start (70–99)|
+| `xthread.WORKER_GRP1` | 20 | Worker group 1 start (20–39)|
+| `xthread.WORKER_GRP2` | 40 | Worker group 2 start (40–59)|
+| `xthread.WORKER_GRP3` | 60 | Worker group 3 start (60–79)|
+| `xthread.WORKER_GRP4` | 80 | Worker group 4 start (80–99)|
+| `xthread.WORKER_GRP5` | 100| Worker group 5 start (100–119)|
 
 **Recommendation:** Use business thread IDs in the 100+ range to avoid conflicts with reserved IDs (note `XTHR_MAX = 100`; after changing this, rebuild all code using thread).
 

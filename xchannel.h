@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "xsock.h"
 
@@ -61,6 +62,10 @@ void      xchannel_set_max_packet(xChannel* ch, size_t max_packet);
 **       drains it back below max. */
 void      xchannel_set_max_send(xChannel* ch, size_t max);
 void      xchannel_set_max_recv(xChannel* ch, size_t max);
+
+void      xchannel_get_stats(xChannel* ch,
+                              size_t* send_buf, size_t* recv_buf,
+                              uint64_t* bytes_sent, uint64_t* bytes_recv);
 
 int       xchannel_set_framing(xChannel* ch, const xChannelConfig* cfg);
 

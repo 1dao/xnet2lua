@@ -274,6 +274,10 @@ xPollState* xpoll_get_default(void) {
     return _xpoll;
 }
 
+int xpoll_fd_count(void) {
+    return _xpoll ? _xpoll->nfds : 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════
  *  xpoll_resize
  * ═══════════════════════════════════════════════════════════════════════ */

@@ -1175,6 +1175,32 @@ int xthread_post_deadline(int target_id, XThreadFunc func,
     return err;
 }
 
+int xthread_get_queue_depth(int id) {
+    xThread* thr = xthread_get(id);
+    if (!thr) return -1;
+#ifdef XTHREAD_MPSCQ
+    return atomic_load(&thr->pending_tasks);
+#else
+    xnet_mutex_lock(&thr->queue.lock);
+    int depth = thr->queue.size;
+    xnet_mutex_unlock(&thr->queue.lock);
+    return depth;
+#endif
+}
+
+int xthread_get_queue_max(int id) {
+    xThread* thr = xthread_get(id);
+    if (!thr) return -1;
+#ifdef XTHREAD_MPSCQ
+    return thr->max_pending_tasks;
+#else
+    xnet_mutex_lock(&thr->queue.lock);
+    int max = thr->queue.max_size;
+    xnet_mutex_unlock(&thr->queue.lock);
+    return max;
+#endif
+}
+
 int xthread_set_queue_max(int target_id, int new_max) {
     xThread* target = xthread_get(target_id);
     if (!target) return -1;
