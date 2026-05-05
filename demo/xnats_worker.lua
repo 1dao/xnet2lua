@@ -243,7 +243,7 @@ local function start_incoming_rpc(msg, values)
     end
 
     local co = coroutine.create(function()
-        local called = pack_values(pcall(xthread.rpc, tid, pt, unpack_args(values, 7, values.n)))
+        local called = pack_values(pcall(xthread.rpc, tid, pt, 0, unpack_args(values, 7, values.n)))
         if not called[1] then
             publish_response(msg.reply, req_id, false, called[2])
             return
@@ -583,7 +583,16 @@ xthread.register('xnats_publish', function(pt, ...)
     local co = coroutine.running()
     local req = rpc_context[co]
     if not req then
-        return false, 'xnats rpc context missing'
+        req = {
+            kind = 'publish',
+            pt = tostring(pt),
+            args = { n = select('#', ...), ... },
+        }
+        local ok, err = send_request(req)
+        if not ok then
+            print('[XNATS-WORKER] publish failed: ' .. tostring(err))
+        end
+        return
     end
 
     req.kind = 'publish'

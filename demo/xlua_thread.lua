@@ -29,6 +29,16 @@ router.register('add', function(a, b)
     return a + b, "1", "2", "3", "4"
 end)
 
+-- Handler: deliberately blocks this worker for a short time. Used by the
+-- main-thread RPC timeout smoke test.
+router.register('sleep_ms', function(ms)
+    ms = tonumber(ms) or 0
+    local deadline = xtimer.now_ms() + ms
+    while xtimer.now_ms() < deadline do
+    end
+    return 'slept:' .. tostring(ms)
+end)
+
 -- Handler: multiply, then call back to main thread via RPC. All handlers run
 -- in a coroutine, so xthread.rpc can yield freely.
 router.register('multiply_and_callback', function(a, b)
@@ -36,7 +46,7 @@ router.register('multiply_and_callback', function(a, b)
     local product = a * b
     -- RPC back to MAIN thread to verify reverse call works
     local main_id = xthread.MAIN
-    local ok, reversed = xthread.rpc(main_id, 'reverse_string', tostring(product))
+    local ok, reversed = xthread.rpc(main_id, 'reverse_string', 0, tostring(product))
     if ok then
         print('[COMPUTE] Reverse result from MAIN: ' .. tostring(reversed))
         return product, reversed
