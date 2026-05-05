@@ -77,7 +77,7 @@ set "OBJDIR=.obj-msvc"
 set "XNET_EXE=xnet.exe"
 set "THREAD_EXE=xthread_test.exe"
 
-set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c"
+set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c"
 set "XNET_SOURCES=xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
 set "THREAD_SOURCES=xthread_test.c"
 

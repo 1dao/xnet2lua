@@ -14,6 +14,7 @@ typedef void* xtimerHandler;
 void xtimer_init(int cap);
 void xtimer_uninit();
 int  xtimer_inited();   // 1 if this thread has an active timer pool, 0 otherwise
+int  xtimer_count();    // number of active timers in this thread's pool
 int  xtimer_update();   // drives expiries; returns ms until next expiry (0 if none / due)
 int  xtimer_last();
 void xtimer_show();

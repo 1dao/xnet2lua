@@ -63,6 +63,9 @@ struct xChannel {
     bool file_pending;
     long long file_remaining;
 
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+
     xChannelConnectProc connect_cb;
     xChannelPacketProc packet_cb;
     xChannelCloseProc close_cb;
@@ -379,6 +382,7 @@ static void flush_output(xChannel* ch) {
         int n = send(ch->fd, ch->out.data + ch->out.off, chunk, 0);
         if (n > 0) {
             xbuf_consume(&ch->out, (size_t)n);
+            ch->bytes_sent += (size_t)n;
             continue;
         }
         if (n < 0 && socket_check_eagain()) return;
@@ -486,6 +490,7 @@ static int queue_or_send_iov(xChannel* ch,
         xchannel_close(ch, "write_error");
         return -1;
     }
+    ch->bytes_sent += sent;
 
     if (sent >= total) return 0;
 
@@ -567,6 +572,7 @@ static void xchannel_read_event(SOCKET_T fd, int mask, void* clientData) {
         int n = recv(ch->fd, ch->in.data + ch->in.len, chunk, 0);
         if (n > 0) {
             ch->in.len += (size_t)n;
+            ch->bytes_recv += (size_t)n;
             if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max) break;
             if (++retry < 3)
                 continue;
@@ -871,4 +877,14 @@ void xchannel_close(xChannel* ch, const char* reason) {
     xchannel_retain(ch);
     close_internal(ch, reason, true);
     xchannel_release(ch);
+}
+
+void xchannel_get_stats(xChannel* ch,
+                        size_t* send_buf, size_t* recv_buf,
+                        uint64_t* bytes_sent, uint64_t* bytes_recv) {
+    if (!ch) return;
+    if (send_buf)   *send_buf   = xbuf_size(&ch->out);
+    if (recv_buf)   *recv_buf   = xbuf_size(&ch->in);
+    if (bytes_sent) *bytes_sent = ch->bytes_sent;
+    if (bytes_recv) *bytes_recv = ch->bytes_recv;
 }

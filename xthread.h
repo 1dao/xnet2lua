@@ -177,6 +177,11 @@ int xthread_post_deadline(int target_id, XThreadFunc func,
 int xthread_post_reply(int target_id, XThreadFunc func,
                        const void* arg, size_t arg_len);
 
+/* Read a thread's task queue metrics (thread-safe, lock-free read).
+** Returns -1 when the thread id is not registered. */
+int xthread_get_queue_depth(int id);
+int xthread_get_queue_max  (int id);
+
 /* Set the queue backpressure cap for a specific thread.
 **   new_max  > 0  → xthread_post returns -2 once queue size >= new_max
 **   new_max == 0  → unlimited (cap disabled)

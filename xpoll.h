@@ -59,6 +59,7 @@ int  xpoll_poll(int timeout_ms);
 int   xpoll_get_fd(SOCKET_T fd);
 void  xpoll_set_client_data(SOCKET_T fd, void *clientData);
 void* xpoll_get_client_data(SOCKET_T fd);
+int   xpoll_fd_count(void);
 
 const char* xpoll_name(void);
 

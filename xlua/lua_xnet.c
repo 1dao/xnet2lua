@@ -20,6 +20,7 @@
 #include "xchannel.h"
 #include "xpoll.h"
 #include "xthread.h"
+#include "xtimer.h"
 #include "xlog.h"
 #include "lua_xnet_tls.h"
 
@@ -54,6 +55,17 @@ typedef struct LuaNetListener {
 } LuaNetListener;
 
 static int g_socket_started = 0;
+
+/* Per-thread stats accumulators (updated on connection close). */
+#ifdef _MSC_VER
+static __declspec(thread) int      g_conn_count   = 0;
+static __declspec(thread) uint64_t g_acc_sent     = 0;
+static __declspec(thread) uint64_t g_acc_recv     = 0;
+#else
+static __thread int      g_conn_count   = 0;
+static __thread uint64_t g_acc_sent     = 0;
+static __thread uint64_t g_acc_recv     = 0;
+#endif
 
 static void listener_accept_cb(SOCKET_T fd, int mask, void* clientData);
 static void listener_accept_fd_cb(SOCKET_T fd, int mask, void* clientData);
@@ -260,6 +272,13 @@ static void lua_conn_close_cb(xChannel* ch, const char* reason, void* ud) {
         }
     }
 
+    if (!c->closed) {
+        uint64_t bs = 0, br = 0;
+        xchannel_get_stats(ch, NULL, NULL, &bs, &br);
+        g_acc_sent += bs;
+        g_acc_recv += br;
+        g_conn_count--;
+    }
     c->closed = true;
     if (c->ch == ch) {
         xchannel_set_userdata(ch, NULL);
@@ -536,6 +555,7 @@ static int l_xnet_attach(lua_State* L) {
 
     LuaNetConn* c = push_conn(L, ch, LUA_NOREF, ip, port);
     ref_from_stack(L, 2, &c->handler_ref);
+    g_conn_count++;
     lua_conn_connect_cb(ch, c);
     if (!c->closed && c->ch && xchannel_attach(c->ch) != 0) {
         xchannel_close(c->ch, "poll_error");
@@ -712,6 +732,36 @@ static int l_xnet_poll(lua_State* L) {
     return 1;
 }
 
+static int l_xnet_get_stats(lua_State* L) {
+    int cur_id = xthread_current_id();
+    lua_createtable(L, 0, 7);
+
+    lua_pushinteger(L, xpoll_fd_count());
+    lua_setfield(L, -2, "fd_count");
+
+    lua_pushinteger(L, g_conn_count < 0 ? 0 : g_conn_count);
+    lua_setfield(L, -2, "conn_count");
+
+    lua_pushinteger(L, (lua_Integer)g_acc_sent);
+    lua_setfield(L, -2, "bytes_sent");
+
+    lua_pushinteger(L, (lua_Integer)g_acc_recv);
+    lua_setfield(L, -2, "bytes_recv");
+
+    lua_pushinteger(L, xtimer_count());
+    lua_setfield(L, -2, "timer_count");
+
+    int qdepth = xthread_get_queue_depth(cur_id);
+    lua_pushinteger(L, qdepth < 0 ? 0 : qdepth);
+    lua_setfield(L, -2, "queue_depth");
+
+    int qmax = xthread_get_queue_max(cur_id);
+    lua_pushinteger(L, qmax < 0 ? 0 : qmax);
+    lua_setfield(L, -2, "queue_max");
+
+    return 1;
+}
+
 static int l_xnet_name(lua_State* L) {
     lua_pushstring(L, xpoll_name());
     return 1;
@@ -848,7 +898,9 @@ static int l_xnet_connect(lua_State* L) {
 
     LuaNetConn* c = push_conn(L, ch, LUA_NOREF, host, port);
     ref_from_stack(L, 3, &c->handler_ref);
+    g_conn_count++;
     if (xchannel_attach_connect(ch) != 0) {
+        g_conn_count--;
         conn_destroy_channel(c);
         conn_unref_lua(c);
         lua_pushnil(L);
@@ -879,11 +931,12 @@ static const luaL_Reg listener_methods[] = {
 };
 
 static const luaL_Reg xnet_funcs[] = {
-    { "init",    l_xnet_init },
-    { "uninit",  l_xnet_uninit },
-    { "poll",    l_xnet_poll },
-    { "name",    l_xnet_name },
-    { "listen",  l_xnet_listen },
+    { "init",      l_xnet_init },
+    { "uninit",    l_xnet_uninit },
+    { "poll",      l_xnet_poll },
+    { "name",      l_xnet_name },
+    { "get_stats", l_xnet_get_stats },
+    { "listen",    l_xnet_listen },
     { "listen_fd", l_xnet_listen_fd },
     { "connect", l_xnet_connect },
     { "attach",  l_xnet_attach },
