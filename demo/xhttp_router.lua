@@ -27,6 +27,7 @@ local CONTENT_TYPES = {
     svg = 'image/svg+xml',
     txt = 'text/plain; charset=utf-8',
     webp = 'image/webp',
+    
 }
 
 local function lower(s)
