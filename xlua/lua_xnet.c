@@ -126,6 +126,7 @@ static bool push_handler(lua_State* L, int handler_ref,
     return true;
 }
 
+
 static void conn_unref_lua(LuaNetConn* c) {
     if (!c || !c->L) return;
     ref_unref(c->L, &c->handler_ref);
@@ -143,6 +144,22 @@ static void conn_destroy_channel(LuaNetConn* c) {
 static int conn_send_packet_c(LuaNetConn* c, const char* data, size_t len) {
     if (!c || !c->ch || c->closed) return -1;
     return xchannel_send_packet(c->ch, data, len);
+}
+
+static int push_send_result(lua_State* L, LuaNetConn* c, int rc) {
+    if (rc == 0) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua_pushboolean(L, 0);
+    if (rc == -2) {
+        lua_pushstring(L, "send buffer full");
+    } else if (!c || c->closed || !c->ch || xchannel_is_closed(c->ch)) {
+        lua_pushstring(L, "closed");
+    } else {
+        lua_pushstring(L, "write_error");
+    }
+    return 2;
 }
 
 static size_t packet_consumed_return(lua_State* L, int idx, size_t max_len) {
@@ -449,17 +466,17 @@ static int l_conn_send(lua_State* L) {
     LuaNetConn* c = check_conn(L, 1);
     size_t len = 0;
     const char* data = luaL_checklstring(L, 2, &len);
-    lua_pushboolean(L, conn_send_packet_c(c, data, len) == 0);
-    return 1;
+    return push_send_result(L, c, conn_send_packet_c(c, data, len));
 }
 
 static int l_conn_send_raw(lua_State* L) {
     LuaNetConn* c = check_conn(L, 1);
     size_t len = 0;
     const char* data = luaL_checklstring(L, 2, &len);
-    lua_pushboolean(L, c->ch && !c->closed &&
-                       xchannel_send_raw(c->ch, data, len) == 0);
-    return 1;
+    int rc = (c && c->ch && !c->closed)
+        ? xchannel_send_raw(c->ch, data, len)
+        : -1;
+    return push_send_result(L, c, rc);
 }
 
 static int l_conn_send_file_response(lua_State* L) {
@@ -470,10 +487,11 @@ static int l_conn_send_file_response(lua_State* L) {
     lua_Integer offset = luaL_optinteger(L, 4, 0);
     lua_Integer length = luaL_optinteger(L, 5, -1);
 
-    lua_pushboolean(L, c->ch && !c->closed &&
-                       xchannel_send_file_raw(c->ch, header, header_len, path,
-                           (long long)offset, (long long)length) == 0);
-    return 1;
+    int rc = (c && c->ch && !c->closed)
+        ? xchannel_send_file_raw(c->ch, header, header_len, path,
+                                 (long long)offset, (long long)length)
+        : -1;
+    return push_send_result(L, c, rc);
 }
 
 static int l_conn_send_packet(lua_State* L) {

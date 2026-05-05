@@ -1234,6 +1234,11 @@ void        xthread_set_userdata(xThread* thr, void* data) { if (thr) thr->userd
 xThreadPool* xthread_pool_create(int group_id, int strategy, const char* name) {
     xThreadPool* pool = (xThreadPool*)calloc(1, sizeof(xThreadPool));
     if (!pool) return NULL;
+    if (strategy == XTHSTRATEGY_LEAST_QUEUE) {
+        XLOGW("ThreadPool[%s]: LEAST_QUEUE is temporarily disabled, fallback to ROUND_ROBIN",
+              name ? name : "unnamed");
+        strategy = XTHSTRATEGY_ROUND_ROBIN;
+    }
     pool->group_id = group_id;
     pool->strategy = strategy;
     pool->name     = name;
