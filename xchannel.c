@@ -739,7 +739,7 @@ static void xchannel_uring_read_done(const xPollCompletion* ev, void* clientData
 
     if (!ch->closed && ch->attached) {
         if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
-            xchannel_close(ch, "socket_error");
+            xchannel_error_event(ch->fd, XPOLL_ERROR, ch);
         } else if (ev->mask & (XPOLL_READABLE | XPOLL_CLOSE)) {
             xchannel_read_event(ch->fd, ev->mask, ch);
         }
@@ -767,7 +767,7 @@ static void xchannel_uring_write_done(const xPollCompletion* ev, void* clientDat
 
     if (!ch->closed && ch->attached) {
         if (ev->res < 0 || (ev->mask & XPOLL_ERROR)) {
-            xchannel_close(ch, "socket_error");
+            xchannel_error_event(ch->fd, XPOLL_ERROR, ch);
         } else if (ch->connect_pending) {
             xchannel_connect_event(ch->fd, ev->mask, ch);
         } else if (ev->mask & (XPOLL_WRITABLE | XPOLL_CLOSE)) {
