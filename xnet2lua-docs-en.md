@@ -167,8 +167,8 @@ return {
 
 ### 3.2 __thread_handle Message Distribution Template
 
-> 💡 **Recommended**: use the `demo/xthread_base.lua` module to skip this
-> boilerplate entirely — see [3.3 xthread_base module](#33-xthread_base-module-recommended).
+> 💡 **Recommended**: use the `demo/xrouter.lua` module to skip this
+> boilerplate entirely — see [3.3 xrouter module](#33-xrouter-module-recommended).
 > The hand-written template below is here only for readers who want to see the
 > underlying protocol or need fully custom dispatch.
 
@@ -212,70 +212,104 @@ local function __thread_handle(reply_router, k1, k2, k3, ...)
 end
 ```
 
-### 3.3 xthread_base module (recommended)
+### 3.3 xrouter module (recommended)
 
-`demo/xthread_base.lua` packages the §3.2 boilerplate (`_stubs /
-_thread_replys / __thread_handle` plus the coroutine wrapping and RPC reply
-routing) into a small module so thread scripts only have to declare actual
-business handlers.
+`demo/xrouter.lua` packages the §3.2 boilerplate (`_stubs / _thread_replys /
+__thread_handle` plus the coroutine wrapping and RPC reply routing) into a
+small module.
+
+**Two core design principles:**
+
+1. **Unified register**: the registration site does **not** care whether
+   the caller will reach this `pt` via POST or RPC — both shapes use the
+   same `register(pt, h)`. Dispatch decides what to do based on whether
+   `reply_router` is set:
+   - Caller used `xthread.post(...)` → handler runs, return values discarded.
+   - Caller used `xthread.rpc(...)`  → handler runs, return values become
+     the reply `(ok=true, ret...)`; raised errors become `(ok=false, errmsg)`.
+
+   Every handler runs in a coroutine, so **any** handler may yield (e.g.
+   internally call `xthread.rpc` out into another thread).
+
+2. **Per-Lua-state singleton**: every `dofile('demo/xrouter.lua')` in the
+   same thread returns the **same table** (same caching pattern as
+   xhttp_router's `__xnet_xhttp_router`), so registrations spread across
+   many files all accumulate into one router.
+
+The thread script keeps the §3.1 standard return-table shape; **only the
+`__thread_handle` field changes — it is now `router.handle`**.
 
 ```lua
 -- worker.lua
-local xth = dofile('demo/xthread_base.lua').new('MYAPP')
+local router = dofile('demo/xrouter.lua')
+router.set_log_prefix('MYAPP')                    -- optional
 
--- Plain POST handler: called directly, no coroutine.
-xth.register('print_msg', function(text)
+-- One register API. The site doesn't care whether the caller uses POST or RPC.
+router.register('print_msg', function(text)
     print('[MYAPP]', text)
 end)
 
--- POST handler that needs to RPC out: auto-wrapped in a coroutine, may yield.
-xth.register_co('do_lookup', function(key)
+router.register('add', function(a, b)
+    return a + b                                  -- becomes the reply on RPC
+end)
+
+router.register('do_lookup', function(key)
     local ok, val = xthread.rpc(xthread.REDIS, 'xredis_call', 'GET', key)
-    print('lookup:', ok, val)
+    return val                                    -- handler may yield freely
 end)
 
--- RPC handler: return values become the reply (true, ret1, ret2, ...).
--- Errors become (false, errmsg). Always runs in a coroutine, may yield freely.
-xth.register_rpc('add', function(a, b)
-    return a + b
-end)
+-- Registrations may live in other files — they get the SAME router:
+dofile('demo/handlers/login.lua')        -- inside: router.register(...)
+dofile('demo/handlers/inventory.lua')    -- inside: router.register(...)
 
-local function __init()  print('init')   end
-local function __update() xnet.poll(10)  end
-local function __uninit() print('uninit') end
+local function __init()   assert(xnet.init())     end
+local function __update() xnet.poll(10)            end
+local function __uninit() xnet.uninit()            end
 
-return xth.thread_def({
-    __init    = __init,
-    __update  = __update,
-    __uninit  = __uninit,
-    -- __tick_ms = 10,                   -- optional, override default tick
-})
+return {
+    __init   = __init,
+    __update = __update,
+    __uninit = __uninit,
+    __thread_handle = router.handle,    -- ← this is the only line that changes
+}
 ```
 
 **API summary:**
 
 | Method | Purpose |
 |---|---|
-| `M.new(prefix)` | Create a fresh instance; `prefix` is the stderr log tag |
-| `xth.register(pt, h)` | POST handler, **no** coroutine; `h(arg1, arg2, ...)` direct call |
-| `xth.register_co(pt, h)` | POST handler auto-wrapped in a coroutine so it can RPC out |
-| `xth.register_rpc(pt, h)` | RPC handler; return value becomes the reply, error becomes `(false, err)` |
-| `xth.set_log_prefix(s)` | Change the log prefix |
-| `xth.set_unknown_post(fn)` | Fallback `fn(pt, ...)` when no POST handler matches |
-| `xth.set_unknown_rpc(fn)` | Fallback `fn(reply_router, co_id, sk, pt, ...)` when no RPC handler matches |
-| `xth.set_handler_error(fn)` | Top-level error in a `register_co` coroutine: `fn(pt, err)` |
-| `xth.current_request()` | The req object owned by the calling RPC coroutine (advanced) |
-| `xth.thread_def{...}` | Returns the table given to the C runtime, with `__thread_handle` injected |
+| `dofile('demo/xrouter.lua')` | Returns the router singleton (same object on every call within a Lua state) |
+| `router.register(pt, h)` | Register handler; usable from both POST and RPC; runs in a coroutine, may yield |
+| `router.reset(opts)` | Wipe all handlers and callbacks (for tests / explicit teardown) |
+| `router.set_log_prefix(s)` | Change the log prefix |
+| `router.set_unknown_post(fn)` | Fallback `fn(pt, ...)` when no handler matches a POST |
+| `router.set_unknown_rpc(fn)` | Fallback `fn(reply_router, co_id, sk, pt, ...)` when no handler matches an RPC |
+| `router.set_handler_error(fn)` | Top-level error in a POST-side coroutine: `fn(pt, err)` (RPC errors auto-reply, no callback) |
+| `router.current_request()` | Returns req when the calling coroutine is serving an RPC, nil otherwise |
+| `router.handle` | Dispatcher closure — assign directly to `__thread_handle` |
+
+**Hot-reload friendliness:**
+
+- `router` and `router.handle` are stable singletons → the C runtime's
+  cached `__thread_handle` ref keeps pointing at the same dispatcher across
+  reloads.
+- Re-running the worker script just **overwrites handlers in place** via
+  `router.register` on the existing stub table; new handlers fire on the
+  next message.
+- In-flight `rpc_context` survives a reload — already-yielded coroutines
+  still see their reply path intact.
+- Call `router.reset()` only when you explicitly want to wipe state
+  (typically not part of reload).
 
 **Mapping from §3.2 hand-written template:**
 
-- The legacy `xthread.register(pt, h)` ≈ `xth.register_co` (most common shape) or the more precise `xth.register` / `xth.register_rpc`.
+- The legacy `xthread.register(pt, h)` ≈ `router.register`.
 - `_stubs` / `_thread_replys` are kept inside the module — no globals needed.
-- `__thread_handle` is auto-injected by `xth.thread_def`.
+- `__thread_handle` is plugged in directly as `router.handle`; the return-table shape stays the same as §3.1.
 
 See `demo/xlua_main.lua` and `demo/xlua_thread.lua` for an actual migration:
 running `./demo/xnet demo/xlua_main.lua` exercises the full POST + RPC + nested
-RPC-back-to-MAIN test suite using `xthread_base` end-to-end.
+RPC-back-to-MAIN test suite using `xrouter` end-to-end.
 
 ### 3.4 Exit
 
