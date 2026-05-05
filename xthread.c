@@ -15,6 +15,9 @@
 #include "xpoll.h"      /* xPollState, xpoll_get_default, xpoll_add/del_event, SOCKET_T */
 #include "xmutex.h"
 #include "xlog.h"
+#ifdef XTHREAD_MPSCQ
+#include "xmpsc_queue.h"
+#endif
 
 #include <stdatomic.h>
 #include <stdalign.h>
@@ -67,6 +70,9 @@ typedef union xAlignMax {
 ** process_tasks for per-thread timeout dispatch. 0 means "skip timeout
 ** check" (used by xthread_post_reply — replies are never dropped). */
 typedef struct xthrTask {
+#ifdef XTHREAD_MPSCQ
+    xMPSCNode node;
+#endif
     XThreadFunc      func;
     struct xthrTask* next;
     uint32_t         arg_len;       /* 0 = pointer semantics                  */
@@ -105,6 +111,12 @@ typedef struct {
 } xQueue;
 
 struct xThread {
+#ifdef XTHREAD_MPSCQ
+    xMPSCQueue   task_queue;        /* lock-free MPSC node list                */
+    atomic_int   pending_tasks;     /* current depth (soft backpressure)       */
+    int          max_pending_tasks; /* 0 = unlimited                           */
+    atomic_int   notify_pending;    /* 0 = idle, 1 = wakeup already in flight  */
+#endif
     int          id;
     char         name[16];  /* fixed-size name buffer, no allocation needed */
     atomic_bool  running;
@@ -259,7 +271,14 @@ static bool xqueue_init(xQueue* q) {
     q->max_size = XTHREAD_QUEUE_MAX_DEFAULT;
     xnet_mutex_init(&q->lock);
 
+    /* In MPSC mode the task list (head/tail/size/freelist) is unused —
+    ** xQueue is kept only for its wakeup primitives (event/cond). Skip the
+    ** ~70KB task slab to avoid wasted memory across many threads. */
+#ifdef XTHREAD_MPSCQ
+    if (!xqueue_pool_init(q, 0)) {
+#else
     if (!xqueue_pool_init(q, XTHREAD_TASK_POOL_SIZE)) {
+#endif
         xnet_mutex_uninit(&q->lock);
         return false;
     }
@@ -327,6 +346,7 @@ static void xqueue_uninit(xQueue* q) {
     xnet_mutex_uninit(&q->lock);
 }
 
+#ifndef XTHREAD_MPSCQ
 /* Try to take a task node from the freelist while holding q->lock.
 ** Returns NULL if pool is empty (caller must malloc one outside the lock). */
 static xthrTask* xqueue_freelist_take_locked(xQueue* q) {
@@ -343,7 +363,9 @@ static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
     q->freelist = t;
     q->freelist_count++;
 }
+#endif /* !XTHREAD_MPSCQ */
 
+#ifndef XTHREAD_MPSCQ
 /* Enqueue a task.
 **
 ** ignore_max:
@@ -412,21 +434,14 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
         memcpy(task->arg_buf, arg, arg_len);   /* inline copy */
     }
 
-    /* Re-enter the lock to enqueue and re-check max_size (the queue may have
-    ** filled up between our first check and now). */
+    /* Enqueue node (outside the lock — this node is private to us). 
+    * 
+    *  The max_size parameter is used for backpressure control. 
+    *  It only needs to provide basic backpressure effects and 
+    *  does not have to strictly prevent values from exceeding max_size. 
+    *  Therefore, there is no need to add an additional judgment on max_size here.
+    * */
     xnet_mutex_lock(&q->lock);
-    if (!ignore_max && q->max_size > 0 && q->size >= q->max_size) {
-        /* Roll back: return node to freelist or free; release ext buffer. */
-        if (from_heap) {
-            xnet_mutex_unlock(&q->lock);
-            free(task);
-        } else {
-            xqueue_freelist_return_locked(q, task);
-            xnet_mutex_unlock(&q->lock);
-        }
-        if (ext_buf) free(ext_buf);
-        return -2;
-    }
     if (q->tail) { q->tail->next = task; q->tail = task; }
     else          { q->head = q->tail = task; }
     q->size++;
@@ -439,7 +454,94 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
     if (out_need_notify) *out_need_notify = need_notify;
     return 0;
 }
+#endif /* !XTHREAD_MPSCQ */
 
+#ifdef XTHREAD_MPSCQ
+/* Lock-free producer push for MPSC mode.
+**
+** ignore_max:
+**   false → soft backpressure (return -2 when pending_tasks >= max_pending_tasks)
+**   true  → bypass cap (used by reply path)
+**
+** created_sec:
+**   wall-clock second tagged on the task; 0 marks the task as exempt from
+**   per-thread timeout dispatch (used for replies).
+**
+** out_new_size    – approximate post-push depth (NULL to ignore).
+** out_need_notify – true when caller should send a wakeup signal.
+**
+** Returns: 0 success, -1 malloc failed, -2 backpressure (only when !ignore_max).
+**
+** Ordering rules:
+**   1. xmpsc_push (release CAS) MUST happen before notify_pending exchange,
+**      otherwise the consumer can wake on an empty queue and miss the task.
+**   2. pending_tasks fetch_add is a soft counter; transient drift is OK. */
+static int xmpscq_push_internal(xThread* t, XThreadFunc func,
+                                const void* arg, size_t arg_len,
+                                bool ignore_max,
+                                uint32_t created_sec,
+                                int* out_new_size, bool* out_need_notify) {
+    void* ext_buf = NULL;
+    if (arg_len > XTHREAD_TASK_ARG_INLINE) {
+        ext_buf = malloc(arg_len);
+        if (!ext_buf) return -1;
+        if (arg) memcpy(ext_buf, arg, arg_len);
+    }
+
+    if (!ignore_max && t->max_pending_tasks > 0) {
+        int pending = atomic_load(&t->pending_tasks);
+        if (pending >= t->max_pending_tasks) {
+            if (ext_buf) free(ext_buf);
+            return -2;
+        }
+    }
+
+    xthrTask* task = (xthrTask*)malloc(sizeof(xthrTask));
+    if (!task) {
+        if (ext_buf) free(ext_buf);
+        return -1;
+    }
+
+    task->func         = func;
+    task->next         = NULL;
+    task->arg_len      = (uint32_t)arg_len;
+    task->from_heap    = 1;
+    task->arg_external = ext_buf ? 1 : 0;
+    task->created_sec  = created_sec;
+    xmpsc_node_init(&task->node);
+    if (arg_len == 0) {
+        task->arg_ptr = (void*)arg;
+    } else if (ext_buf) {
+        task->arg_ptr = ext_buf;
+    } else if (arg_len > 0 && arg) {
+        memcpy(task->arg_buf, arg, arg_len);
+    }
+
+    int new_pending = atomic_fetch_add(&t->pending_tasks, 1) + 1;
+    xmpsc_push(&t->task_queue, &task->node);
+
+    bool need_notify = (atomic_exchange(&t->notify_pending, 1) == 0);
+
+    if (out_new_size)    *out_new_size    = new_pending;
+    if (out_need_notify) *out_need_notify = need_notify;
+    return 0;
+}
+
+/* Drain remaining tasks from the MPSC queue at thread teardown.
+** Caller must guarantee no producer is still pushing. */
+static void xmpscq_drain_destroy(xThread* t) {
+    xMPSCNode* n;
+    while ((n = xmpsc_pop(&t->task_queue)) != NULL) {
+        xthrTask* task = XMPSC_CONTAINER_OF(n, xthrTask, node);
+        if (task->arg_external && task->arg_ptr) free(task->arg_ptr);
+        free(task);
+    }
+    atomic_store(&t->pending_tasks, 0);
+    atomic_store(&t->notify_pending, 0);
+}
+#endif /* XTHREAD_MPSCQ */
+
+#ifndef XTHREAD_MPSCQ
 static int xqueue_push(xQueue* q, XThreadFunc func,
                        const void* arg, size_t arg_len,
                        int* out_new_size, bool* out_need_notify) {
@@ -472,6 +574,7 @@ static xthrTask* xqueue_pop_all(xQueue* q) {
     xnet_mutex_unlock(&q->lock);
     return head;
 }
+#endif /* !XTHREAD_MPSCQ */
 
 /* Block until a task arrives or timeout elapses.
 ** Used only by threads that do NOT have an xPollState. */
@@ -512,6 +615,42 @@ static inline void* task_arg_ptr(xthrTask* t) {
     return (void*)t->arg_buf;
 }
 
+#ifdef XTHREAD_MPSCQ
+static int process_tasks(xThread* ctx) {
+    int count = 0;
+    uint32_t    timeout   = ctx->timeout_secs;
+    XThreadFunc expire_cb = ctx->on_expired;
+
+    /* Reset notify flag BEFORE draining. A producer that pushes between this
+    ** store and the next pop will set the flag back to 1 (and notify), so the
+    ** consumer is guaranteed to be woken again on the next iteration. */
+    atomic_store(&ctx->notify_pending, 0);
+
+    uint32_t now = (timeout > 0) ? (uint32_t)time(NULL) : 0;
+
+    xMPSCNode* n;
+    while ((n = xmpsc_pop(&ctx->task_queue)) != NULL) {
+        xthrTask* task = XMPSC_CONTAINER_OF(n, xthrTask, node);
+        void*     a    = task_arg_ptr(task);
+
+        bool expired = (timeout > 0) && (task->created_sec != 0)
+                       && ((now - task->created_sec) >= timeout);
+
+        if (expired && expire_cb) {
+            expire_cb(ctx, a, (int)task->arg_len);
+        } else if (task->func) {
+            task->func(ctx, a, (int)task->arg_len);
+        }
+
+        if (task->arg_external && task->arg_ptr) free(task->arg_ptr);
+        free(task);
+
+        atomic_fetch_sub(&ctx->pending_tasks, 1);
+        count++;
+    }
+    return count;
+}
+#else
 static int process_tasks(xThread* ctx) {
     int count = 0;
     xQueue*   q    = &ctx->queue;
@@ -571,6 +710,7 @@ static int process_tasks(xThread* ctx) {
     }
     return count;
 }
+#endif /* XTHREAD_MPSCQ */
 
 /* ============================================================================
 ** Wakeup notification
@@ -753,6 +893,13 @@ static bool xthread_register_main(int id, const char* name) {
     ctx->notify_rfd = INVALID_SOCKET;
     atomic_store(&ctx->running, true);
 
+#ifdef XTHREAD_MPSCQ
+    xmpsc_queue_init(&ctx->task_queue);
+    atomic_store(&ctx->pending_tasks, 0);
+    atomic_store(&ctx->notify_pending, 0);
+    ctx->max_pending_tasks = XTHREAD_QUEUE_MAX_DEFAULT;
+#endif
+
     if (!xqueue_init(&ctx->queue)) {
         free(ctx);
         xnet_mutex_unlock(&_lock);
@@ -893,6 +1040,12 @@ bool xthread_register_ex(int id, const char* name,
     ctx->notify_rfd = INVALID_SOCKET;
     atomic_store(&ctx->running, true);
 
+#ifdef XTHREAD_MPSCQ
+    xmpsc_queue_init(&ctx->task_queue);
+    atomic_store(&ctx->pending_tasks, 0);
+    atomic_store(&ctx->notify_pending, 0);
+    ctx->max_pending_tasks = XTHREAD_QUEUE_MAX_DEFAULT;
+#endif
     if (!xqueue_init(&ctx->queue)) {
         free(ctx);
         xnet_mutex_unlock(&_lock);
@@ -965,6 +1118,12 @@ void xthread_unregister(int id) {
     }
 
     xqueue_uninit(&ctx->queue);
+#ifdef XTHREAD_MPSCQ
+    /* Final drain: process_tasks already ran, but a late producer (between
+    ** running=false and our notify) could have slipped a task in. Free any
+    ** remaining nodes so we don't leak. */
+    xmpscq_drain_destroy(ctx);
+#endif
     free(ctx);
 }
 
@@ -983,9 +1142,13 @@ int xthread_update(int timeout_ms) {
     if (ctx->poll) return n;
 
     // Only wait if queue is still empty after processing tasks
+#ifdef XTHREAD_MPSCQ
+    bool empty = xmpsc_empty(&ctx->task_queue);
+#else
     xnet_mutex_lock(&ctx->queue.lock);
     bool empty = (ctx->queue.size == 0);
     xnet_mutex_unlock(&ctx->queue.lock);
+#endif
 
     if (empty) {
         xqueue_wait(&ctx->queue, timeout_ms);
@@ -1011,8 +1174,15 @@ int xthread_post(int target_id, XThreadFunc func,
 
     int  new_size    = 0;
     bool need_notify = false;
+#ifdef XTHREAD_MPSCQ
+    int err = xmpscq_push_internal(selected, func, arg, arg_len,
+                                   /*ignore_max=*/false,
+                                   /*created_sec=*/(uint32_t)time(NULL),
+                                   &new_size, &need_notify);
+#else
     int err = xqueue_push(&selected->queue, func, arg, arg_len,
-                          &new_size, &need_notify);
+                            &new_size, &need_notify);
+#endif
     if (err == 0) {
         if (group) {
             /* Update pool's load tracker */
@@ -1034,9 +1204,13 @@ int xthread_set_queue_max(int target_id, int new_max) {
     if (!target) return -1;
     if (new_max < 0) new_max = 0;
 
+#ifdef XTHREAD_MPSCQ
+    target->max_pending_tasks = new_max;
+#else
     xnet_mutex_lock(&target->queue.lock);
     target->queue.max_size = new_max;
     xnet_mutex_unlock(&target->queue.lock);
+#endif
     return 0;
 }
 
@@ -1063,8 +1237,15 @@ int xthread_post_reply(int target_id, XThreadFunc func,
 
     int  new_size    = 0;
     bool need_notify = false;
+#ifdef XTHREAD_MPSCQ
+    int err = xmpscq_push_internal(target, func, arg, arg_len,
+                                   /*ignore_max=*/true,
+                                   /*created_sec=*/0,
+                                   &new_size, &need_notify);
+#else
     int err = xqueue_push_reply(&target->queue, func, arg, arg_len,
                                 &new_size, &need_notify);
+#endif
     if (err == 0) {
         /* No pool load-tracker update for direct reply. */
         xthread_notify(target, need_notify);
