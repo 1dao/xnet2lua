@@ -7,6 +7,8 @@ CFLAGS := -Wall -Wextra -O0 -g -I..
 LDFLAGS :=
 WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
+WITH_IO_URING ?= 0
+# -DXTHREAD_MPSCQ
 XNET_DEFS := -DLUA_EMBEDDED -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
 XNET_CFLAGS :=
 XNET_HTTPS_SRC :=
@@ -31,6 +33,10 @@ ifeq ($(OS),Windows_NT)
 else
     # Linux
     LDFLAGS += -lpthread -lm
+    ifeq ($(WITH_IO_URING),1)
+        CFLAGS += -DXPOLL_USE_IO_URING -DXCHANNEL_USE_IO_URING
+        LDFLAGS += -luring
+    endif
     EXT :=
     RM := rm -f
 endif
