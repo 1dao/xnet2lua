@@ -52,7 +52,7 @@ function M.start(cfg)
 end
 
 function M.query(sql)
-    return xthread.rpc(MYSQL_ID, 'xmysql_query', sql)
+    return xthread.rpc(MYSQL_ID, 'xmysql_query', 0, sql)
 end
 
 M.call = M.query

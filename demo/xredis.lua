@@ -48,7 +48,7 @@ function M.start(cfg)
 end
 
 function M.call(cmd, ...)
-    return xthread.rpc(REDIS_ID, 'xredis_call', cmd, ...)
+    return xthread.rpc(REDIS_ID, 'xredis_call', 0, cmd, ...)
 end
 
 function M.post(cb, cmd, ...)

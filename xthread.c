@@ -15,6 +15,7 @@
 #include "xpoll.h"      /* xPollState, xpoll_get_default, xpoll_add/del_event, SOCKET_T */
 #include "xmutex.h"
 #include "xlog.h"
+#include "xtimer.h"     /* time_clock_ms for per-task deadlines */
 #ifdef XTHREAD_MPSCQ
 #include "xmpsc_queue.h"
 #endif
@@ -66,9 +67,8 @@ typedef union xAlignMax {
 ** arg_len <= INLINE     → arg_buf holds copied bytes
 ** arg_len  > INLINE     → arg_ptr holds a malloc'd copy (freed in process_tasks)
 **
-** created_sec records the wall-clock second at xthread_post time, used by
-** process_tasks for per-thread timeout dispatch. 0 means "skip timeout
-** check" (used by xthread_post_reply — replies are never dropped). */
+** deadline_ms is a monotonic absolute deadline from time_clock_ms().
+** 0 means the task never expires. */
 typedef struct xthrTask {
 #ifdef XTHREAD_MPSCQ
     xMPSCNode node;
@@ -78,8 +78,8 @@ typedef struct xthrTask {
     uint32_t         arg_len;       /* 0 = pointer semantics                  */
     uint8_t          from_heap;     /* 1 if node is malloc'd (not from pool)  */
     uint8_t          arg_external;  /* 1 if arg payload is malloc'd externally*/
-    uint16_t         _pad;          /* alignment for created_sec              */
-    uint32_t         created_sec;   /* push wall-clock seconds; 0 = bypass    */
+    uint16_t         _pad;          /* align deadline_ms                      */
+    uint64_t         deadline_ms;   /* monotonic absolute deadline; 0 = none  */
     union {
         void*        arg_ptr;       /* used when arg_len == 0 OR arg_external */
         uint8_t      arg_buf[XTHREAD_TASK_ARG_INLINE];
@@ -123,12 +123,6 @@ struct xThread {
     xQueue       queue;
     void*        userdata;
     xThreadPool* group;
-
-    /* Per-thread task expiration. Publish-once at init: set via
-    ** xthread_set_timeout before tasks flow; process_tasks reads raw.
-    ** timeout_secs == 0 disables the check. on_expired may be NULL. */
-    uint32_t     timeout_secs;
-    XThreadFunc  on_expired;
 
     /* Poll-based wakeup (NULL when not using xpoll) */
     xPollState*  poll;
@@ -372,10 +366,6 @@ static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
 **   false → standard backpressure (return -2 when q->size >= q->max_size)
 **   true  → bypass cap (used by xthread_post_reply)
 **
-** created_sec:
-**   wall-clock second to record on the task. 0 marks the task as exempt
-**   from per-thread timeout dispatch (used for replies).
-**
 ** out_new_size    – new queue depth (NULL to ignore).
 ** out_need_notify – true when caller should send a wakeup signal.
 **
@@ -386,7 +376,7 @@ static void xqueue_freelist_return_locked(xQueue* q, xthrTask* t) {
 static int xqueue_push_internal(xQueue* q, XThreadFunc func,
                                 const void* arg, size_t arg_len,
                                 bool ignore_max,
-                                uint32_t created_sec,
+                                uint64_t deadline_ms,
                                 int* out_new_size, bool* out_need_notify) {
     /* Decide whether arg payload needs an external buffer (out-of-band copy).
     ** arg_len == 0           → pointer semantics, no copy
@@ -425,7 +415,7 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
     task->arg_len      = (uint32_t)arg_len;
     task->from_heap    = from_heap ? 1 : 0;
     task->arg_external = ext_buf ? 1 : 0;
-    task->created_sec  = created_sec;
+    task->deadline_ms  = deadline_ms;
     if (arg_len == 0) {
         task->arg_ptr = (void*)arg;            /* pointer semantics */
     } else if (ext_buf) {
@@ -463,10 +453,6 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
 **   false → soft backpressure (return -2 when pending_tasks >= max_pending_tasks)
 **   true  → bypass cap (used by reply path)
 **
-** created_sec:
-**   wall-clock second tagged on the task; 0 marks the task as exempt from
-**   per-thread timeout dispatch (used for replies).
-**
 ** out_new_size    – approximate post-push depth (NULL to ignore).
 ** out_need_notify – true when caller should send a wakeup signal.
 **
@@ -479,7 +465,7 @@ static int xqueue_push_internal(xQueue* q, XThreadFunc func,
 static int xmpscq_push_internal(xThread* t, XThreadFunc func,
                                 const void* arg, size_t arg_len,
                                 bool ignore_max,
-                                uint32_t created_sec,
+                                uint64_t deadline_ms,
                                 int* out_new_size, bool* out_need_notify) {
     void* ext_buf = NULL;
     if (arg_len > XTHREAD_TASK_ARG_INLINE) {
@@ -507,7 +493,7 @@ static int xmpscq_push_internal(xThread* t, XThreadFunc func,
     task->arg_len      = (uint32_t)arg_len;
     task->from_heap    = 1;
     task->arg_external = ext_buf ? 1 : 0;
-    task->created_sec  = created_sec;
+    task->deadline_ms  = deadline_ms;
     xmpsc_node_init(&task->node);
     if (arg_len == 0) {
         task->arg_ptr = (void*)arg;
@@ -542,23 +528,22 @@ static void xmpscq_drain_destroy(xThread* t) {
 #endif /* XTHREAD_MPSCQ */
 
 #ifndef XTHREAD_MPSCQ
-static int xqueue_push(xQueue* q, XThreadFunc func,
-                       const void* arg, size_t arg_len,
-                       int* out_new_size, bool* out_need_notify) {
+static int xqueue_push_deadline(xQueue* q, XThreadFunc func,
+                                const void* arg, size_t arg_len,
+                                uint64_t deadline_ms,
+                                int* out_new_size, bool* out_need_notify) {
     return xqueue_push_internal(q, func, arg, arg_len,
                                 /*ignore_max=*/false,
-                                /*created_sec=*/(uint32_t)time(NULL),
+                                deadline_ms,
                                 out_new_size, out_need_notify);
 }
 
-/* Reply path: created_sec=0 means "never expire" — replies signal that
-** the producer has finished work and the originator must be notified. */
 static int xqueue_push_reply(xQueue* q, XThreadFunc func,
                              const void* arg, size_t arg_len,
                              int* out_new_size, bool* out_need_notify) {
     return xqueue_push_internal(q, func, arg, arg_len,
                                 /*ignore_max=*/true,
-                                /*created_sec=*/0,
+                                /*deadline_ms=*/0,
                                 out_new_size, out_need_notify);
 }
 
@@ -615,30 +600,25 @@ static inline void* task_arg_ptr(xthrTask* t) {
     return (void*)t->arg_buf;
 }
 
+static inline bool task_deadline_expired(xthrTask* t) {
+    return t->deadline_ms != 0 && time_clock_ms() >= t->deadline_ms;
+}
+
 #ifdef XTHREAD_MPSCQ
 static int process_tasks(xThread* ctx) {
     int count = 0;
-    uint32_t    timeout   = ctx->timeout_secs;
-    XThreadFunc expire_cb = ctx->on_expired;
 
     /* Reset notify flag BEFORE draining. A producer that pushes between this
     ** store and the next pop will set the flag back to 1 (and notify), so the
     ** consumer is guaranteed to be woken again on the next iteration. */
     atomic_store(&ctx->notify_pending, 0);
 
-    uint32_t now = (timeout > 0) ? (uint32_t)time(NULL) : 0;
-
     xMPSCNode* n;
     while ((n = xmpsc_pop(&ctx->task_queue)) != NULL) {
         xthrTask* task = XMPSC_CONTAINER_OF(n, xthrTask, node);
         void*     a    = task_arg_ptr(task);
 
-        bool expired = (timeout > 0) && (task->created_sec != 0)
-                       && ((now - task->created_sec) >= timeout);
-
-        if (expired && expire_cb) {
-            expire_cb(ctx, a, (int)task->arg_len);
-        } else if (task->func) {
+        if (!task_deadline_expired(task) && task->func) {
             task->func(ctx, a, (int)task->arg_len);
         }
 
@@ -655,12 +635,7 @@ static int process_tasks(xThread* ctx) {
     int count = 0;
     xQueue*   q    = &ctx->queue;
 
-    /* timeout_secs / on_expired are publish-once at init; safe to read raw. */
-    uint32_t    timeout   = ctx->timeout_secs;
-    XThreadFunc expire_cb = ctx->on_expired;
-
     xthrTask* task = xqueue_pop_all(q);
-    uint32_t now = (timeout > 0) ? (uint32_t)time(NULL) : 0;
 
     /* Locally batch pool nodes for return; free heap nodes individually. */
     xthrTask* return_head = NULL;
@@ -670,12 +645,7 @@ static int process_tasks(xThread* ctx) {
         xthrTask* next = task->next;
         void*     a    = task_arg_ptr(task);
 
-        bool expired = (timeout > 0) && (task->created_sec != 0)
-                       && ((now - task->created_sec) >= timeout);
-
-        if (expired && expire_cb) {
-            expire_cb(ctx, a, (int)task->arg_len);
-        } else if (task->func) {
+        if (!task_deadline_expired(task) && task->func) {
             task->func(ctx, a, (int)task->arg_len);
         }
 
@@ -1159,6 +1129,12 @@ int xthread_update(int timeout_ms) {
 
 int xthread_post(int target_id, XThreadFunc func,
                  const void* arg, size_t arg_len) {
+    return xthread_post_deadline(target_id, func, arg, arg_len, 0);
+}
+
+int xthread_post_deadline(int target_id, XThreadFunc func,
+                          const void* arg, size_t arg_len,
+                          uint64_t deadline_ms) {
     xThread* target = xthread_get(target_id);
     if (!target || !atomic_load(&target->running)) {
         XLOGE("xthread_post: no thread available for id=%d", target_id);
@@ -1176,12 +1152,12 @@ int xthread_post(int target_id, XThreadFunc func,
     bool need_notify = false;
 #ifdef XTHREAD_MPSCQ
     int err = xmpscq_push_internal(selected, func, arg, arg_len,
-                                   /*ignore_max=*/false,
-                                   /*created_sec=*/(uint32_t)time(NULL),
-                                   &new_size, &need_notify);
+                                    /*ignore_max=*/false,
+                                    deadline_ms,
+                                    &new_size, &need_notify);
 #else
-    int err = xqueue_push(&selected->queue, func, arg, arg_len,
-                            &new_size, &need_notify);
+    int err = xqueue_push_deadline(&selected->queue, func, arg, arg_len,
+                                   deadline_ms, &new_size, &need_notify);
 #endif
     if (err == 0) {
         if (group) {
@@ -1214,17 +1190,6 @@ int xthread_set_queue_max(int target_id, int new_max) {
     return 0;
 }
 
-/* Publish-once API: must be called during thread init, before tasks start
-** flowing in. process_tasks reads these fields raw (no lock). */
-int xthread_set_timeout(int target_id, uint32_t timeout_secs,
-                        XThreadFunc on_expired) {
-    xThread* target = xthread_get(target_id);
-    if (!target) return -1;
-    target->timeout_secs = timeout_secs;
-    target->on_expired   = on_expired;
-    return 0;
-}
-
 /* Reply path: no pool selection, no max_size cap. Sends directly to the
 ** thread identified by target_id so the reply reaches the originating thread. */
 int xthread_post_reply(int target_id, XThreadFunc func,
@@ -1239,9 +1204,9 @@ int xthread_post_reply(int target_id, XThreadFunc func,
     bool need_notify = false;
 #ifdef XTHREAD_MPSCQ
     int err = xmpscq_push_internal(target, func, arg, arg_len,
-                                   /*ignore_max=*/true,
-                                   /*created_sec=*/0,
-                                   &new_size, &need_notify);
+                                    /*ignore_max=*/true,
+                                    /*deadline_ms=*/0,
+                                    &new_size, &need_notify);
 #else
     int err = xqueue_push_reply(&target->queue, func, arg, arg_len,
                                 &new_size, &need_notify);

@@ -58,8 +58,8 @@ local function run_tests()
     -- Test 2: RPC add
     print('\n[Test 2] RPC add(123, 456) from MAIN to COMPUTE')
     do
-        print("[MAIN] multi result:", xthread.rpc(COMPUTE_THREAD_ID, 'add', 123, 456))
-        local ok, result = xthread.rpc(COMPUTE_THREAD_ID, 'add', 123, 456)
+        print("[MAIN] multi result:", xthread.rpc(COMPUTE_THREAD_ID, 'add', 0, 123, 456))
+        local ok, result = xthread.rpc(COMPUTE_THREAD_ID, 'add', 0, 123, 456)
         if ok then
             print('[MAIN] RPC result: 123 + 456 = ' .. result)
             TEST_add_result = result
@@ -69,10 +69,23 @@ local function run_tests()
         end
     end
 
-    -- Test 3: RPC with callback back to MAIN
-    print('\n[Test 3] RPC multiply_and_callback(12, 34) from MAIN to COMPUTE')
+    -- Test 3: RPC timeout should be owned by the caller-side timer.
+    print('\n[Test 3] RPC timeout sleep_ms(200) with 50ms timeout')
     do
-        local ok, product, reversed = xthread.rpc(COMPUTE_THREAD_ID, 'multiply_and_callback', 12, 34)
+        local ok, err = xthread.rpc(COMPUTE_THREAD_ID, 'sleep_ms', 50, 200)
+        if not ok and err == 'rpc timeout' then
+            print('[MAIN] RPC timeout worked: ' .. tostring(err))
+            TEST_timeout_result = true
+        else
+            print('[MAIN] RPC timeout failed: ok=' .. tostring(ok) .. ' err=' .. tostring(err))
+            TEST_timeout_result = false
+        end
+    end
+
+    -- Test 4: RPC with callback back to MAIN
+    print('\n[Test 4] RPC multiply_and_callback(12, 34) from MAIN to COMPUTE')
+    do
+        local ok, product, reversed = xthread.rpc(COMPUTE_THREAD_ID, 'multiply_and_callback', 0, 12, 34)
         if ok then
             print('[MAIN] RPC result: 12 * 34 = ' .. product)
             print('[MAIN] Reversed product from MAIN: ' .. reversed)
@@ -112,10 +125,17 @@ function check_results()
         all_ok = false
     end
 
-    if TEST_callback_result == '804' then
-        print('✓ Test 3 (Callback to MAIN) PASSED, reversed = ' .. TEST_callback_result)
+    if TEST_timeout_result == true then
+        print('✓ Test 3 (RPC timeout) PASSED')
     else
-        print('✗ Test 3 (Callback to MAIN) FAILED, expected "804", got "' .. tostring(TEST_callback_result) .. '"')
+        print('✗ Test 3 (RPC timeout) FAILED')
+        all_ok = false
+    end
+
+    if TEST_callback_result == '804' then
+        print('✓ Test 4 (Callback to MAIN) PASSED, reversed = ' .. TEST_callback_result)
+    else
+        print('✗ Test 4 (Callback to MAIN) FAILED, expected "804", got "' .. tostring(TEST_callback_result) .. '"')
         all_ok = false
     end
 

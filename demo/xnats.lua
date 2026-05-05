@@ -65,13 +65,13 @@ function M.start(cfg)
 end
 
 function M.publish(pt, ...)
-    return xthread.rpc(NATS_ID, 'xnats_publish', pt, ...)
+    return xthread.post(NATS_ID, 'xnats_publish', pt, ...)
 end
 
 M.broadcast = M.publish
 
 function M.rpc(target, pt, ...)
-    return xthread.rpc(NATS_ID, 'xnats_rpc', target, pt, ...)
+    return xthread.rpc(NATS_ID, 'xnats_rpc', 0, target, pt, ...)
 end
 
 function M.post(cb, target, pt, ...)

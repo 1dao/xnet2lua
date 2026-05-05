@@ -23,6 +23,7 @@
 
 #include "../xthread.h"
 #include "../xlog.h"
+#include "../xtimer.h"
 
 /* Test counters */
 static volatile int task_counter = 0;
@@ -614,91 +615,53 @@ static int test_backpressure(void) {
 }
 
 /* ============================================================================
-** Test 8: per-thread task timeout + on_expired callback
+** Test 8: per-task deadline drops expired queued tasks
 ** ============================================================================ */
 
-static volatile int test8_normal_count  = 0;
-static volatile int test8_expired_count = 0;
+static volatile int deadline_task_count = 0;
 
-static void test8_normal_handler(xThread* thr, void* arg, int arg_len) {
-    (void)thr; (void)arg_len;
-    test8_normal_count++;
-    free(arg);
+static void deadline_task_handler(xThread* thr, void* arg, int arg_len) {
+    (void)thr; (void)arg; (void)arg_len;
+    deadline_task_count++;
 }
 
-static void test8_expired_handler(xThread* thr, void* arg, int arg_len) {
-    (void)thr; (void)arg_len;
-    test8_expired_count++;
-    free(arg);  /* raw pointer mode — on_expired owns the free */
-}
-
-static int test_thread_timeout(void) {
+static int test_task_deadline(void) {
     printf("\n========================================\n");
-    printf("Test 8: per-thread timeout (1s) + on_expired callback\n");
+    printf("Test 8: per-task deadline drops expired tasks\n");
     printf("========================================\n");
 
-    test8_normal_count  = 0;
-    test8_expired_count = 0;
+    deadline_task_count = 0;
 
-    /* Phase 1: enable 1s timeout, post tasks, sleep 2s, drain.
-    ** All tasks should expire and be routed to on_expired. */
-    if (xthread_set_timeout(XTHR_MAIN, 1, test8_expired_handler) != 0) {
-        printf("xthread_set_timeout failed\n");
+    int expired_payload = 1;
+    if (xthread_post_deadline(XTHR_MAIN, deadline_task_handler,
+                              &expired_payload, sizeof(expired_payload),
+                              time_clock_ms() + 50) != 0) {
+        printf("post deadline task failed\n");
         return -1;
     }
 
-    const int N = 5;
-    for (int i = 0; i < N; i++) {
-        int* p = malloc(sizeof(int));
-        *p = i;
-        if (xthread_post(XTHR_MAIN, test8_normal_handler, p, 0) != 0) {
-            printf("post failed\n");
-            free(p);
-        }
-    }
-
-    sleep(2);                  /* let tasks age past 1s timeout */
-    xthread_update(0);          /* drain on this thread */
-
-    if (test8_normal_count != 0 || test8_expired_count != N) {
-        printf("[FAIL] Phase 1: normal=%d expired=%d (expected 0/%d)\n",
-               test8_normal_count, test8_expired_count, N);
-        xthread_set_timeout(XTHR_MAIN, 0, NULL);
-        return -1;
-    }
-    printf("Phase 1 OK: normal=%d  expired=%d\n",
-           test8_normal_count, test8_expired_count);
-
-    /* Phase 2: disable timeout. Same delay, tasks must NOT expire. */
-    xthread_set_timeout(XTHR_MAIN, 0, NULL);
-
-    int n_before = test8_normal_count;
-    int e_before = test8_expired_count;
-
-    const int M = 3;
-    for (int i = 0; i < M; i++) {
-        int* p = malloc(sizeof(int));
-        *p = i;
-        if (xthread_post(XTHR_MAIN, test8_normal_handler, p, 0) != 0) {
-            printf("post failed\n");
-            free(p);
-        }
-    }
-    sleep(2);
+    usleep(120 * 1000);
     xthread_update(0);
-
-    int n_delta = test8_normal_count  - n_before;
-    int e_delta = test8_expired_count - e_before;
-
-    if (n_delta != M || e_delta != 0) {
-        printf("[FAIL] Phase 2: normal_delta=%d expired_delta=%d (expected %d/0)\n",
-               n_delta, e_delta, M);
+    if (deadline_task_count != 0) {
+        printf("[FAIL] expired deadline task ran, count=%d\n", deadline_task_count);
         return -1;
     }
-    printf("Phase 2 OK: normal_delta=%d  expired_delta=%d\n", n_delta, e_delta);
 
-    printf("Test 8 done: phase1 expired %d/%d, phase2 normal %d/%d\n",
-           test8_expired_count, N, n_delta, M);
+    int live_payload = 2;
+    if (xthread_post_deadline(XTHR_MAIN, deadline_task_handler,
+                              &live_payload, sizeof(live_payload),
+                              time_clock_ms() + 2000) != 0) {
+        printf("post live deadline task failed\n");
+        return -1;
+    }
+
+    xthread_update(0);
+    if (deadline_task_count != 1) {
+        printf("[FAIL] live deadline task did not run, count=%d\n", deadline_task_count);
+        return -1;
+    }
+
+    printf("Test 8 done: expired dropped, live executed\n");
     return 0;
 }
 
@@ -755,7 +718,7 @@ int main(int argc, char** argv) {
         goto cleanup;
     }
 
-    if (test_thread_timeout() != 0) {
+    if (test_task_deadline() != 0) {
         ret = -1;
         goto cleanup;
     }

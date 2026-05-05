@@ -158,6 +158,15 @@ void xthread_wakeup_uninit(void);
 int xthread_post(int target_id, XThreadFunc func,
                  const void* arg, size_t arg_len);
 
+/* Asynchronously post with a per-task absolute deadline in monotonic
+** milliseconds. deadline_ms == 0 means no deadline. If a task is still queued
+** when its deadline is reached, the target thread drops it without invoking
+** func. For arg_len == 0, the raw pointer remains caller-owned and cannot be
+** released by the queue when a task is dropped. */
+int xthread_post_deadline(int target_id, XThreadFunc func,
+                          const void* arg, size_t arg_len,
+                          uint64_t deadline_ms);
+
 /* Reply path: post directly to target_id (no pool load balancing) and
 ** bypass the queue's max_size cap. Use this for RPC reply or any path
 ** where delivery MUST succeed under load.
@@ -167,28 +176,6 @@ int xthread_post(int target_id, XThreadFunc func,
 ** Returns: 0 success, -1 malloc failed. Never returns -2. */
 int xthread_post_reply(int target_id, XThreadFunc func,
                        const void* arg, size_t arg_len);
-
-/* Set per-thread task timeout. When a task has been queued for at least
-** timeout_secs (measured from xthread_post call to process_tasks dispatch),
-** process_tasks invokes on_expired(thr, arg, arg_len) instead of the
-** original task->func, then releases the task as usual.
-**
-**   timeout_secs == 0 → disable expiration (default; on_expired is ignored).
-**   on_expired == NULL → expired tasks are dropped silently.
-**     NOTE: in raw pointer mode (arg_len == 0) the arg pointer is leaked
-**     unless on_expired frees it.
-**
-** xthread_post_reply tasks NEVER expire — reply delivery is guaranteed by
-** design (a reply means the producer has finished its work and the
-** originating thread must be notified).
-**
-** Publish-once contract: call this during thread init, before tasks start
-** flowing in. process_tasks reads timeout_secs / on_expired without a lock,
-** so changing them while the thread is processing tasks is racy.
-**
-** Returns: 0 success, -1 thread not found. */
-int xthread_set_timeout(int target_id, uint32_t timeout_secs,
-                        XThreadFunc on_expired);
 
 /* Set the queue backpressure cap for a specific thread.
 **   new_max  > 0  → xthread_post returns -2 once queue size >= new_max

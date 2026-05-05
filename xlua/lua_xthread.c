@@ -21,9 +21,10 @@
 ** metatable __index hook registered by xthread.init().
 **
 ** Wakeup flow:
-**   xthread.rpc(target, pt, ...)
+**   xthread.rpc(target, pt, timeout_ms, ...)
+**     -> Lua wrapper calls C rpc(..., timeout_ms, ...)
 **     -> pack + xthread_post(target, thread_message_handler)
-**     -> lua_yield(coroutine, 0)               [coroutine suspends]
+**     -> coroutine.yield() in Lua              [coroutine suspends]
 **   target thread: handler runs -> calls reply(co_id, ...)
 **   reply (C closure): packs @async_resume, xthread_post(caller, ...)
 **   caller thread: @async_resume detected -> pending_pop(co_id) -> lua_resume
@@ -32,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 #include "xpoll.h"
 
 /* Use embedded minilua when building with xlua_test */
@@ -60,6 +62,9 @@ LUALIB_API int luaopen_xtimer(lua_State* L);
 #define XTHREAD_HANDLER_KEY "xthread.handler"    /* Lua message handler func  */
 #define XTHREAD_PENDING_KEY "xthread.pending"    /* {[co_id] = coroutine}     */
 #define XTHREAD_COID_KEY    "xthread.next_co_id" /* integer auto-increment    */
+#ifndef LUA_OK
+#define LUA_OK 0
+#endif
 
 /* ============================================================================
 ** ThreadData - Stores per-thread Lua state and callback references
@@ -188,6 +193,24 @@ static lua_State* pending_pop(lua_State* L, lua_Integer co_id, bool keep_ref) {
         lua_pop(L, 2);         /* pop nil and pending table */
     }
     return co;
+}
+
+static int xthread_resume_coroutine(lua_State* co, lua_State* from,
+                                    int nargs, int* nresults) {
+#if defined(LUAJIT_VERSION_NUM) || (defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502)
+    (void)from;
+    int base = lua_gettop(co) - nargs;
+    int status = lua_resume(co, nargs);
+    if (nresults) {
+        if (status == LUA_OK || status == LUA_YIELD)
+            *nresults = lua_gettop(co) - base;
+        else
+            *nresults = 0;
+    }
+    return status;
+#else
+    return lua_resume(co, from, nargs, nresults);
+#endif
 }
 
 /* ============================================================================
@@ -367,7 +390,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
             XLOGD("xthread: @async_resume looking up co_id=%lld in thread %d pending table", (long long)co_id, xthread_current_id());
             lua_State* co = pending_pop(L, co_id, true);
             if (!co) {
-                XLOGE("xthread: @async_resume co_id=%lld not found", (long long)co_id);
+                XLOGD("xthread: @async_resume co_id=%lld not found (late reply or timeout)", (long long)co_id);
                 lua_settop(L, base);
                 return;
             }
@@ -380,7 +403,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
             lua_xmove(L, co, nresume);     /* move n values from top of L to co */
 
             int nresults = 0;
-            int status = lua_resume(co, L, nresume, &nresults);
+            int status = xthread_resume_coroutine(co, L, nresume, &nresults);
             if (status != LUA_OK && status != LUA_YIELD) {
                 XLOGE("xthread: coroutine error: %s", lua_tostring(co, -1));
                 lua_settop(co, 0);
@@ -507,7 +530,7 @@ static int l_xthread_init(lua_State* L) {
               "call xthread.init(handler) or ensure __thread_handle exists", xthread_get_id(thr));
     }
 
-    /* Initialise pending-RPC table and co_id counter */
+    /* Initialise pending-RPC tables and co_id counter */
     lua_newtable(L);
     lua_setfield(L, LUA_REGISTRYINDEX, XTHREAD_PENDING_KEY);
     lua_pushinteger(L, 0);
@@ -574,39 +597,56 @@ static int l_xthread_post(lua_State* L) {
     return 1;
 }
 
-/* xthread.rpc(target_id, pt, ...)   [must be called from a coroutine]
+/* xthread.rpc(target_id, pt, timeout_ms, ...)
 **
-** Yields the calling coroutine; resumes with (ok, results...) when the
-** target thread has executed the handler and replied.
+** Starts an RPC and returns (true, co_id) or (false, err). This function does
+** not yield; the public Lua wrapper performs coroutine.yield() so LuaJIT does
+** not need to yield from a C frame.
 **
 ** Wire format sent to target: pack(reply_router, co_id, 0, pt, args...)
 **   reply_router = "xthread:<caller_id>"
-**
-** Errors: raises if not in a coroutine, or if the post fails.
 */
 static int l_xthread_rpc(lua_State* L) {
     int target_id = (int)luaL_checkinteger(L, 1);
     luaL_checkstring(L, 2); /* pt */
+    lua_Integer timeout_ms_i = luaL_checkinteger(L, 3);
     int top = lua_gettop(L);
 
-    if (!lua_isyieldable(L))
-        return luaL_error(L, "xthread.rpc: must be called from a coroutine");
+    if (timeout_ms_i < 0) timeout_ms_i = 0;
+    if (timeout_ms_i > INT_MAX) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: timeout_ms too large");
+        return 2;
+    }
 
     int caller_id = xthread_current_id();
-    if (caller_id <= 0)
-        return luaL_error(L, "xthread.rpc: calling thread not registered");
+    if (caller_id <= 0) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: calling thread not registered");
+        return 2;
+    }
 
     xThread* caller_thr = xthread_current();
     ThreadData* caller_td = (ThreadData*)xthread_get_userdata(caller_thr);
-    if (!caller_td || !caller_td->L)
-        return luaL_error(L, "xthread.rpc: xthread.init() not called on this thread");
+    if (!caller_td || !caller_td->L) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: xthread.init() not called on this thread");
+        return 2;
+    }
 
     lua_State* main_L = caller_td->L;
+    if (L == main_L) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: must be called from a coroutine");
+        return 2;
+    }
 
     /* Generate a unique co_id and store the coroutine */
     lua_Integer co_id = next_co_id(main_L);
     if (!pending_put(main_L, co_id, L)) { /* L is the coroutine; main_L holds registry */
-        return luaL_error(L, "xthread.rpc: pending table not initialized");
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: pending table not initialized");
+        return 2;
     }
 
     /* Build reply_router: "xthread:<caller_id>" */
@@ -617,32 +657,84 @@ static int l_xthread_rpc(lua_State* L) {
     lua_pushstring(L, reply_router);
     lua_pushinteger(L, co_id);
     lua_pushinteger(L, 0); /* sk = 0 (unused in xthread, kept for Lua compat) */
-    for (int i = 2; i <= top; i++)
-        lua_pushvalue(L, i); /* pt, args */
-    /* nargs = 3 + (top-1) = top+2 */
-    lua_Integer pkt_len = pack_to_lua_stack(L, top + 2);
+    lua_pushvalue(L, 2); /* pt */
+    for (int i = 4; i <= top; i++)
+        lua_pushvalue(L, i); /* args */
+    /* nargs = 3 + pt + (top-3) = top+1 */
+    lua_Integer pkt_len = pack_to_lua_stack(L, top + 1);
     if (pkt_len < 0) {
         pending_pop(main_L, co_id, false); /* roll back */
-        return luaL_error(L, "xthread.rpc: cmsgpack.pack failed");
+        lua_settop(L, top);
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.rpc: cmsgpack.pack failed");
+        return 2;
     }
 
     {
         size_t tmp;
         const char* pkt_data = lua_tolstring(L, -1, &tmp);
-        int rpc_err = xthread_post(target_id, thread_message_handler,
-                                   pkt_data, (size_t)pkt_len);
+        uint64_t deadline_ms = timeout_ms_i > 0
+            ? time_clock_ms() + (uint64_t)timeout_ms_i
+            : 0;
+        int rpc_err = xthread_post_deadline(target_id, thread_message_handler,
+                                            pkt_data, (size_t)pkt_len,
+                                            deadline_ms);
         lua_pop(L, 1);
         if (rpc_err != 0) {
             pending_pop(main_L, co_id, false); /* roll back */
+            lua_settop(L, top);
+            lua_pushboolean(L, 0);
             if (rpc_err == -2) {
-                return luaL_error(L, "xthread.rpc: thread %d queue full", target_id);
+                lua_pushfstring(L, "xthread.rpc: thread %d queue full", target_id);
+            } else {
+                lua_pushfstring(L, "xthread.rpc: thread %d unavailable", target_id);
             }
-            return luaL_error(L, "xthread.rpc: thread %d unavailable", target_id);
+            return 2;
         }
     }
 
-    /* Yield; thread_message_handler on caller thread will resume us */
-    return lua_yield(L, 0);
+    lua_pushboolean(L, 1);
+    lua_pushinteger(L, co_id);
+    return 2;
+}
+
+static int l_xthread_rpc_timeout(lua_State* L) {
+    lua_Integer co_id = luaL_checkinteger(L, 1);
+    int top = lua_gettop(L);
+
+    /* Post a synthetic REPLY to self. Resume still happens in the normal
+    ** thread_message_handler intercept path, not inside timer callback. */
+    lua_pushnil(L);                    /* reply_router */
+    lua_pushstring(L, "@async_resume");
+    lua_pushinteger(L, co_id);
+    lua_pushinteger(L, 0);             /* sk */
+    lua_pushstring(L, "rpc_timeout");  /* req_pt */
+    lua_pushboolean(L, 0);             /* ok=false */
+    lua_pushstring(L, "rpc timeout");
+
+    lua_Integer pkt_len = pack_to_lua_stack(L, 7);
+    if (pkt_len < 0) {
+        lua_settop(L, top);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    int self_id = xthread_current_id();
+    if (self_id <= 0) {
+        lua_pop(L, 1); /* packed string */
+        lua_settop(L, top);
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    size_t tmp = 0;
+    const char* pkt_data = lua_tolstring(L, -1, &tmp);
+    int err = xthread_post_reply(self_id, thread_message_handler,
+                                 pkt_data, (size_t)pkt_len);
+    lua_pop(L, 1);
+    lua_settop(L, top);
+    lua_pushboolean(L, err == 0);
+    return 1;
 }
 
 /* xthread.current_id()  →  integer */
@@ -1009,12 +1101,52 @@ static int l_xthread_shutdown_thread(lua_State* L) {
 static const luaL_Reg xthread_funcs[] = {
     { "init",             l_xthread_init },
     { "post",             l_xthread_post },
-    { "rpc",              l_xthread_rpc  },
+    { "rpc",              l_xthread_rpc },
+    { "_rpc_timeout",     l_xthread_rpc_timeout },
     { "current_id",       l_current_id   },
     { "create_thread",    l_xthread_create_thread },
     { "shutdown_thread",  l_xthread_shutdown_thread },
     { NULL, NULL }
 };
+
+static const char* XTHREAD_LUA_WRAPPERS =
+"local xthread = ...\n"
+"local c_rpc = xthread.rpc\n"
+"local _rpc_timeout = xthread._rpc_timeout\n"
+"local _rpc_timers = {}\n"
+"local _unpack = table.unpack or unpack\n"
+"local function _pack(...)\n"
+"    return { n = select('#', ...), ... }\n"
+"end\n"
+"local function rpc_wait(timeout_ms, target_id, pt, ...)\n"
+"    local running, ismain = coroutine.running()\n"
+"    if not running or ismain then\n"
+"        return false, 'xthread.rpc: must be called from a coroutine'\n"
+"    end\n"
+"    timeout_ms = tonumber(timeout_ms) or 0\n"
+"    local ok, co_id_or_err = c_rpc(target_id, pt, timeout_ms, ...)\n"
+"    if not ok then return false, co_id_or_err end\n"
+"    local co_id = co_id_or_err\n"
+"    local timer = nil\n"
+"    if timeout_ms > 0 then\n"
+"        timer = xtimer.delay(timeout_ms, function()\n"
+"            _rpc_timers[co_id] = nil\n"
+"            _rpc_timeout(co_id)\n"
+"        end)\n"
+"        _rpc_timers[co_id] = timer\n"
+"    end\n"
+"    local r = _pack(coroutine.yield())\n"
+"    local t = _rpc_timers[co_id]\n"
+"    if t then\n"
+"        _rpc_timers[co_id] = nil\n"
+"        t:del()\n"
+"    end\n"
+"    return _unpack(r, 1, r.n)\n"
+"end\n"
+"function xthread.rpc(target_id, pt, timeout_ms, ...)\n"
+"    return rpc_wait(timeout_ms, target_id, pt, ...)\n"
+"end\n"
+"return xthread\n";
 
 static const struct { const char* name; int val; } THREAD_CONSTS[] = {
     { "MAIN",        XTHR_MAIN        },
@@ -1056,6 +1188,15 @@ LUALIB_API int luaopen_xthread(lua_State* L) {
         lua_pushinteger(L, THREAD_CONSTS[i].val);
         lua_setfield(L, -2, THREAD_CONSTS[i].name);
     }
+
+    if (luaL_loadstring(L, XTHREAD_LUA_WRAPPERS) != LUA_OK) {
+        return lua_error(L);
+    }
+    lua_pushvalue(L, -2); /* module table */
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        return lua_error(L);
+    }
+    lua_pop(L, 1); /* wrapper returned module */
 
     return 1; /* return module table */
 }
