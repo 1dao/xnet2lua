@@ -81,8 +81,8 @@ typedef void (*XThreadFunc)(xThread* thr, void* arg, int arg_len);
 
 /* Thread-group load-balancing strategy */
 typedef enum {
-    XTHSTRATEGY_LEAST_QUEUE = 0,  /* fewest queued tasks (default) */
-    XTHSTRATEGY_ROUND_ROBIN,      /* cyclic                        */
+    XTHSTRATEGY_LEAST_QUEUE = 0,  /* temporarily disabled          */
+    XTHSTRATEGY_ROUND_ROBIN,      /* cyclic (default)              */
     XTHSTRATEGY_RANDOM            /* random                        */
 } ThreadSelStrategy;
 

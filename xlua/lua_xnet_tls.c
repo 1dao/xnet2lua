@@ -88,6 +88,7 @@ static bool push_handler(lua_State* L, int handler_ref,
     return true;
 }
 
+
 static size_t packet_consumed_return(lua_State* L, int idx, size_t max_len) {
     if (lua_type(L, idx) != LUA_TNUMBER) return 0;
     lua_Number n = lua_tonumber(L, idx);
@@ -114,6 +115,7 @@ typedef struct LuaTlsConn {
     char* outbuf;
     size_t outlen;
     size_t outcap;
+    size_t max_send;
 
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
@@ -122,6 +124,22 @@ typedef struct LuaTlsConn {
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
 } LuaTlsConn;
+
+static int push_tls_send_result(lua_State* L, LuaTlsConn* c, int rc) {
+    if (rc == 0) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    lua_pushboolean(L, 0);
+    if (rc == -2) {
+        lua_pushstring(L, "send buffer full");
+    } else if (!c || c->closed || c->fd == INVALID_SOCKET_VAL) {
+        lua_pushstring(L, "closed");
+    } else {
+        lua_pushstring(L, "write_error");
+    }
+    return 2;
+}
 
 static int s_psa_ready = 0;
 
@@ -428,6 +446,10 @@ static void tls_flush_output(LuaTlsConn* c) {
 static int tls_send_raw_c(LuaTlsConn* c, const char* data, size_t len) {
     if (!c || c->closed || (!data && len > 0)) return -1;
     if (len == 0) return 0;
+    if (c->max_send > 0) {
+        if (c->outlen >= c->max_send) return -2;
+        if (len > c->max_send - c->outlen) return -2;
+    }
     if (!tls_append(&c->outbuf, &c->outlen, &c->outcap, data, len)) {
         tls_close_internal(c, "out_of_memory", true);
         return -1;
@@ -519,6 +541,8 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     const char* key_file = NULL;
     const char* password = NULL;
     size_t max_packet = 0;
+    size_t max_send = 0;
+    bool has_max_send = false;
 
     lua_getfield(L, cfg_idx, "cert_file");
     if (lua_isstring(L, -1)) cert_file = lua_tostring(L, -1);
@@ -549,11 +573,22 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     }
     lua_pop(L, 1);
 
+    lua_getfield(L, cfg_idx, "max_send");
+    if (lua_isnumber(L, -1)) {
+        lua_Integer ms = lua_tointeger(L, -1);
+        if (ms >= 0) {
+            max_send = (size_t)ms;
+            has_max_send = true;
+        }
+    }
+    lua_pop(L, 1);
+
     if (!cert_file || !key_file) {
         lua_pushstring(L, "xnet.attach_tls: cert_file and key_file are required");
         return -1;
     }
     if (max_packet > 0) c->max_packet = max_packet;
+    if (has_max_send) c->max_send = max_send;
 
     if (!s_psa_ready) {
         psa_status_t status = psa_crypto_init();
@@ -671,6 +706,7 @@ int l_xnet_attach_tls(lua_State* L) {
     c->closed = false;
     c->handshake_done = false;
     c->max_packet = 16u * 1024u * 1024u;
+    c->max_send = 10u * 1024u * 1024u + 4u;
     if (ip) {
         strncpy(c->peer_ip, ip, sizeof(c->peer_ip) - 1);
         c->peer_ip[sizeof(c->peer_ip) - 1] = '\0';
@@ -746,8 +782,7 @@ static int l_tls_send_raw(lua_State* L) {
     LuaTlsConn* c = check_tls_conn(L, 1);
     size_t len = 0;
     const char* data = luaL_checklstring(L, 2, &len);
-    lua_pushboolean(L, tls_send_raw_c(c, data, len) == 0);
-    return 1;
+    return push_tls_send_result(L, c, tls_send_raw_c(c, data, len));
 }
 
 static int l_tls_send_file_response(lua_State* L) {
@@ -764,7 +799,8 @@ static int l_tls_send_file_response(lua_State* L) {
     FILE* fp = fopen(path, "rb");
     if (!fp) {
         lua_pushboolean(L, 0);
-        return 1;
+        lua_pushstring(L, "open_failed");
+        return 2;
     }
 
 #ifdef _WIN32
@@ -774,7 +810,8 @@ static int l_tls_send_file_response(lua_State* L) {
 #endif
         fclose(fp);
         lua_pushboolean(L, 0);
-        return 1;
+        lua_pushstring(L, "seek_failed");
+        return 2;
     }
 
 #ifdef _WIN32
@@ -785,7 +822,8 @@ static int l_tls_send_file_response(lua_State* L) {
     if (size < 0) {
         fclose(fp);
         lua_pushboolean(L, 0);
-        return 1;
+        lua_pushstring(L, "stat_failed");
+        return 2;
     }
     if (offset > size) offset = size;
     long long remaining = size - offset;
@@ -798,10 +836,12 @@ static int l_tls_send_file_response(lua_State* L) {
 #endif
         fclose(fp);
         lua_pushboolean(L, 0);
-        return 1;
+        lua_pushstring(L, "seek_failed");
+        return 2;
     }
 
-    int ok = tls_send_raw_c(c, header, header_len) == 0;
+    int send_rc = tls_send_raw_c(c, header, header_len);
+    int ok = send_rc == 0;
     char buf[64 * 1024];
     while (ok && length > 0 && !c->closed) {
         size_t want = length > (long long)sizeof(buf)
@@ -813,7 +853,8 @@ static int l_tls_send_file_response(lua_State* L) {
             if (!ok) tls_close_internal(c, "tls_file_read_error", true);
             break;
         }
-        if (tls_send_raw_c(c, buf, got) != 0) {
+        send_rc = tls_send_raw_c(c, buf, got);
+        if (send_rc != 0) {
             ok = 0;
             break;
         }
@@ -821,8 +862,12 @@ static int l_tls_send_file_response(lua_State* L) {
     }
 
     fclose(fp);
-    lua_pushboolean(L, ok && !c->closed);
-    return 1;
+    if (ok && !c->closed) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+    if (send_rc == 0) send_rc = -1;
+    return push_tls_send_result(L, c, send_rc);
 }
 
 static int l_tls_send(lua_State* L) {
@@ -844,6 +889,13 @@ static int l_tls_set_framing(lua_State* L) {
         if (lua_isnumber(L, -1)) {
             lua_Integer mp = lua_tointeger(L, -1);
             if (mp > 0) c->max_packet = (size_t)mp;
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 2, "max_send");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer ms = lua_tointeger(L, -1);
+            if (ms >= 0) c->max_send = (size_t)ms;
         }
         lua_pop(L, 1);
     }

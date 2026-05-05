@@ -597,6 +597,30 @@ static int l_xthread_post(lua_State* L) {
     return 1;
 }
 
+/* xthread.set_queue_max(target_id, new_max)
+**
+** Set per-thread queue cap:
+**   new_max > 0 : enable cap
+**   new_max = 0 : unlimited
+** Returns: true on success, or false + error_string on failure.
+*/
+static int l_xthread_set_queue_max(lua_State* L) {
+    int target_id = (int)luaL_checkinteger(L, 1);
+    lua_Integer max_i = luaL_checkinteger(L, 2);
+    if (max_i < 0 || max_i > INT_MAX) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xthread.set_queue_max: new_max must be >= 0");
+        return 2;
+    }
+    if (xthread_set_queue_max(target_id, (int)max_i) != 0) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xthread.set_queue_max: thread %d unavailable", target_id);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* xthread.rpc(target_id, pt, timeout_ms, ...)
 **
 ** Starts an RPC and returns (true, co_id) or (false, err). This function does
@@ -1101,6 +1125,7 @@ static int l_xthread_shutdown_thread(lua_State* L) {
 static const luaL_Reg xthread_funcs[] = {
     { "init",             l_xthread_init },
     { "post",             l_xthread_post },
+    { "set_queue_max",    l_xthread_set_queue_max },
     { "rpc",              l_xthread_rpc },
     { "_rpc_timeout",     l_xthread_rpc_timeout },
     { "current_id",       l_current_id   },
