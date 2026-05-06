@@ -687,8 +687,10 @@ static int process_tasks(xThread* ctx) {
 ** ========================================================================== */
 
 /* xpoll read-end callback: drain notification bytes then dispatch tasks. */
-static void notify_read_cb(SOCKET_T fd, int mask, void* clientData) {
+static void notify_read_cb(SOCKET_T fd, int mask,
+                           void* clientData, xPollRequest* submit_arg) {
     (void)mask;
+    (void)submit_arg;
     char buf[64];
 #ifdef _WIN32
     while (recv((SOCKET)fd, buf, sizeof(buf), 0) > 0);

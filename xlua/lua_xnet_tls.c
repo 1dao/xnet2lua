@@ -143,9 +143,12 @@ static int push_tls_send_result(lua_State* L, LuaTlsConn* c, int rc) {
 
 static int s_psa_ready = 0;
 
-static void tls_read_event(SOCKET_T fd, int mask, void* clientData);
-static void tls_write_event(SOCKET_T fd, int mask, void* clientData);
-static void tls_error_event(SOCKET_T fd, int mask, void* clientData);
+static void tls_read_event(SOCKET_T fd, int mask,
+                           void* clientData, xPollRequest* submit_arg);
+static void tls_write_event(SOCKET_T fd, int mask,
+                            void* clientData, xPollRequest* submit_arg);
+static void tls_error_event(SOCKET_T fd, int mask,
+                            void* clientData, xPollRequest* submit_arg);
 
 static LuaTlsConn* check_tls_conn(lua_State* L, int idx) {
     return (LuaTlsConn*)luaL_checkudata(L, idx, LUA_XNET_TLS_META);
@@ -507,9 +510,11 @@ static void tls_read_plain(LuaTlsConn* c) {
     }
 }
 
-static void tls_read_event(SOCKET_T fd, int mask, void* clientData) {
+static void tls_read_event(SOCKET_T fd, int mask,
+                           void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     LuaTlsConn* c = (LuaTlsConn*)clientData;
     if (!c || c->closed) return;
 
@@ -518,9 +523,11 @@ static void tls_read_event(SOCKET_T fd, int mask, void* clientData) {
     if (!c->closed && c->outlen > 0) tls_flush_output(c);
 }
 
-static void tls_write_event(SOCKET_T fd, int mask, void* clientData) {
+static void tls_write_event(SOCKET_T fd, int mask,
+                            void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     LuaTlsConn* c = (LuaTlsConn*)clientData;
     if (!c || c->closed) return;
 
@@ -528,9 +535,11 @@ static void tls_write_event(SOCKET_T fd, int mask, void* clientData) {
     else tls_flush_output(c);
 }
 
-static void tls_error_event(SOCKET_T fd, int mask, void* clientData) {
+static void tls_error_event(SOCKET_T fd, int mask,
+                            void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     LuaTlsConn* c = (LuaTlsConn*)clientData;
     if (!c || c->closed) return;
     tls_close_internal(c, "socket_error", true);
