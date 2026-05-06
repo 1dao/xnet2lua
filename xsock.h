@@ -1,6 +1,12 @@
 #ifndef XSOCK_H
 #define XSOCK_H
 
+#ifndef _WIN32
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +25,7 @@
     #define SOCKET_T SOCKET
     #define CLOSE_SOCKET(s) closesocket(s)
     #define INVALID_SOCKET_VAL INVALID_SOCKET
+    #define SOCKET_ERROR_VAL SOCKET_ERROR
     #define SHUTDOWN_SOCKET(s, how) shutdown(s, how)
     #define SHUTDOWN_WR SD_SEND
     #define GET_ERRNO() WSAGetLastError()
@@ -40,19 +47,20 @@
     #define GET_ERRNO() errno
     #define INVALID_SOCKET -1
     #define INVALID_SOCKET_VAL -1
+    #define SOCKET_ERROR_VAL -1
 
     typedef int BOOL;
     #define TRUE 1
     #define FALSE 0
-
-    #ifndef INT_PTR
-    typedef intptr_t INT_PTR;
-    #endif
 #endif
 
 #if defined(__ANDROID__)
 #ifndef TCP_KEEPIDLE
 #define TCP_KEEPIDLE 4
+#endif
+
+#ifndef INT_PTR
+typedef intptr_t INT_PTR;
 #endif
 #ifndef TCP_KEEPINTVL
 #define TCP_KEEPINTVL 5
