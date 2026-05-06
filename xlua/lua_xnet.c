@@ -67,9 +67,12 @@ static __thread uint64_t g_acc_sent     = 0;
 static __thread uint64_t g_acc_recv     = 0;
 #endif
 
-static void listener_accept_cb(SOCKET_T fd, int mask, void* clientData);
-static void listener_accept_fd_cb(SOCKET_T fd, int mask, void* clientData);
-static void listener_error_cb(SOCKET_T fd, int mask, void* clientData);
+static void listener_accept_cb(SOCKET_T fd, int mask,
+                               void* clientData, xPollRequest* submit_arg);
+static void listener_accept_fd_cb(SOCKET_T fd, int mask,
+                                  void* clientData, xPollRequest* submit_arg);
+static void listener_error_cb(SOCKET_T fd, int mask,
+                              void* clientData, xPollRequest* submit_arg);
 
 static LuaNetConn* check_conn(lua_State* L, int idx) {
     return (LuaNetConn*)luaL_checkudata(L, idx, LUA_XNET_CONN_META);
@@ -348,9 +351,11 @@ static void listener_close_internal(LuaNetListener* s, const char* reason) {
     lua_settop(L, base);
 }
 
-static void listener_accept_cb(SOCKET_T fd, int mask, void* clientData) {
+static void listener_accept_cb(SOCKET_T fd, int mask,
+                               void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     LuaNetListener* s = (LuaNetListener*)clientData;
     if (!s || s->closed) return;
 
@@ -391,9 +396,11 @@ static void listener_accept_cb(SOCKET_T fd, int mask, void* clientData) {
     lua_settop(L, base);
 }
 
-static void listener_accept_fd_cb(SOCKET_T fd, int mask, void* clientData) {
+static void listener_accept_fd_cb(SOCKET_T fd, int mask,
+                                  void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     LuaNetListener* s = (LuaNetListener*)clientData;
     if (!s || s->closed) return;
 
@@ -445,9 +452,11 @@ static void listener_accept_fd_cb(SOCKET_T fd, int mask, void* clientData) {
     lua_settop(L, base);
 }
 
-static void listener_error_cb(SOCKET_T fd, int mask, void* clientData) {
+static void listener_error_cb(SOCKET_T fd, int mask,
+                              void* clientData, xPollRequest* submit_arg) {
     (void)fd;
     (void)mask;
+    (void)submit_arg;
     listener_close_internal((LuaNetListener*)clientData, "socket_error");
 }
 
