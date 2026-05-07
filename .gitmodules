@@ -1,3 +1,6 @@
 [submodule "3rd/libdeflate"]
 	path = 3rd/libdeflate
 	url = https://github.com/ebiggers/libdeflate.git
+[submodule "3rd/luajit"]
+	path = 3rd/luajit
+	url = https://github.com/LuaJIT/LuaJIT.git
