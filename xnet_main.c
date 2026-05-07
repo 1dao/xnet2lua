@@ -16,8 +16,17 @@
 
 #include "xpoll.h"
 
+#if defined(LUA_EMBEDDED)
 #define LUA_IMPL
 #include "3rd/minilua.h"
+#else
+#include "lua.h"
+#include "lauxlib.h"
+#include "lualib.h"
+#if defined(XLUA_USE_LUAJIT)
+#include "luajit.h"
+#endif
+#endif
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -27,6 +36,31 @@
 #include "xlog.h"
 #include "xthread.h"
 #include "xtimer.h"
+
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
+static void luaL_requiref(lua_State* L, const char* modname,
+                          lua_CFunction openf, int glb) {
+    lua_pushcfunction(L, openf);
+    lua_pushstring(L, modname);
+    lua_call(L, 1, 1);
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    }
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, modname);
+    lua_pop(L, 1);
+
+    if (glb) {
+        lua_pushvalue(L, -1);
+        lua_setglobal(L, modname);
+    }
+}
+#endif
 
 #ifndef XNET_WITH_HTTP
 #define XNET_WITH_HTTP 1
@@ -57,6 +91,15 @@ static const char* g_main_file = NULL;
 static int g_script_argc = 0;
 static char** g_script_argv = NULL;
 static const char* g_process_name = NULL;
+
+static void lua_runtime_post_init(lua_State* L) {
+#if defined(XLUA_USE_LUAJIT)
+    /* Explicitly keep the JIT engine enabled when running with LuaJIT. */
+    if (L) luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+#else
+    (void)L;
+#endif
+}
 
 static xArgsCFG g_arg_configs[] = {
     { 'c', "config", NULL, 0 },
@@ -232,6 +275,7 @@ static MainLuaData* main_init(void) {
 
     lua_State* L = data->L;
     luaL_openlibs(L);
+    lua_runtime_post_init(L);
     preload_modules(L);
     install_stop(L);
     set_runner_globals(L);

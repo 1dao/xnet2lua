@@ -14,16 +14,19 @@ set "BUILD_MODE=release"
 set "WITH_HTTP=1"
 set "WITH_HTTPS=1"
 set "CLEAN_ONLY=0"
+set "LUA_BACKEND=minilua"
 
 for %%A in (%*) do (
     if /I "%%~A"=="debug" set "BUILD_MODE=debug"
     if /I "%%~A"=="release" set "BUILD_MODE=release"
     if /I "%%~A"=="clean" set "CLEAN_ONLY=1"
     if /I "%%~A"=="nohttps" set "WITH_HTTPS=0"
+    if /I "%%~A"=="luajit" set "LUA_BACKEND=luajit"
+    if /I "%%~A"=="minilua" set "LUA_BACKEND=minilua"
 )
 
 echo %GREEN%[INFO]%RESET% Building demo with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% Mode=%BUILD_MODE% HTTPS=%WITH_HTTPS%
+echo %GREEN%[INFO]%RESET% Mode=%BUILD_MODE% HTTPS=%WITH_HTTPS% Lua=%LUA_BACKEND%
 
 set "VS_VCVARS="
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
@@ -80,11 +83,51 @@ set "THREAD_EXE=xthread_test.exe"
 set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c"
 set "XNET_SOURCES=..\xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
 set "THREAD_SOURCES=xthread_test.c"
+set "LUAJIT_DIR=..\3rd\luajit\src"
+set "LUAJIT_INC=..\3rd\luajit\src"
 
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DLUA_EMBEDDED /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS%"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS%"
 set "INCS=/I.."
 if "%WITH_HTTPS%"=="1" (
     set "INCS=%INCS% /I..\3rd\mbedtls3\include"
+)
+if /I "%LUA_BACKEND%"=="luajit" (
+    set "DEFS=%DEFS% /DXLUA_USE_LUAJIT=1"
+    set "INCS=%INCS% /I%LUAJIT_INC%"
+) else (
+    set "DEFS=%DEFS% /DLUA_EMBEDDED"
+)
+
+set "XNET_LUA_LIB="
+if /I "%LUA_BACKEND%"=="luajit" (
+    if exist "%LUAJIT_DIR%\lua51.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\lua51.lib"
+    if not defined XNET_LUA_LIB if exist "%LUAJIT_DIR%\luajit.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\luajit.lib"
+    if not defined XNET_LUA_LIB if exist "%LUAJIT_DIR%\libluajit.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\libluajit.lib"
+
+    if not defined XNET_LUA_LIB (
+        if exist "%LUAJIT_DIR%\msvcbuild.bat" (
+            echo %GREEN%[INFO]%RESET% LuaJIT .lib not found, running msvcbuild.bat static...
+            pushd "%LUAJIT_DIR%"
+            call msvcbuild.bat static
+            if errorlevel 1 (
+                popd
+                echo %RED%[ERROR]%RESET% Failed to build LuaJIT static library.
+                exit /b 1
+            )
+            popd
+            if exist "%LUAJIT_DIR%\lua51.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\lua51.lib"
+        )
+    )
+
+    if not defined XNET_LUA_LIB (
+        echo %RED%[ERROR]%RESET% LuaJIT static lib not found.
+        echo %YELLOW%[HINT]%RESET% Expected one of:
+        echo   %LUAJIT_DIR%\lua51.lib
+        echo   %LUAJIT_DIR%\luajit.lib
+        echo   %LUAJIT_DIR%\libluajit.lib
+        exit /b 1
+    )
+    echo %GREEN%[INFO]%RESET% LuaJIT lib: !XNET_LUA_LIB!
 )
 
 set "BASE_CFLAGS=/nologo /TC /W3 /utf-8 /std:c11 /experimental:c11atomics /wd4005 /wd4100 /wd4206 /wd4244 /wd4267 /wd4334 /wd4706 /wd4996 %DEFS% %INCS%"
@@ -179,6 +222,9 @@ set "THREAD_LIBS=ws2_32.lib"
 set "XNET_LIBS=ws2_32.lib"
 if "%WITH_HTTPS%"=="1" (
     set "XNET_LIBS=%XNET_LIBS% bcrypt.lib"
+)
+if defined XNET_LUA_LIB (
+    set "XNET_LIBS=%XNET_LIBS% %XNET_LUA_LIB%"
 )
 
 echo %GREEN%[INFO]%RESET% Linking %THREAD_EXE%...

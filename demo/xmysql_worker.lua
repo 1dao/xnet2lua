@@ -54,6 +54,125 @@ local function fail_request(req, err)
 end
 
 local MASK32 = 0xffffffff
+local TWO32 = 0x100000000
+
+local function to_u32(v)
+    v = v % TWO32
+    if v < 0 then v = v + TWO32 end
+    return v
+end
+
+local bit_band
+local bit_bor
+local bit_bxor
+local bit_bnot
+local bit_lshift
+local bit_rshift
+
+do
+    local bitlib = rawget(_G, 'bit')
+    if not bitlib then pcall(function() bitlib = require('bit') end) end
+    if not bitlib then bitlib = rawget(_G, 'bit32') end
+    if not bitlib then pcall(function() bitlib = require('bit32') end) end
+
+    if bitlib and bitlib.band and bitlib.bor and bitlib.bxor and bitlib.bnot and bitlib.lshift and bitlib.rshift then
+        bit_band = function(a, ...)
+            if a == nil then return MASK32 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = to_u32(bitlib.band(r, select(i, ...)))
+            end
+            return r
+        end
+        bit_bor = function(a, ...)
+            if a == nil then return 0 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = to_u32(bitlib.bor(r, select(i, ...)))
+            end
+            return r
+        end
+        bit_bxor = function(a, ...)
+            if a == nil then return 0 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = to_u32(bitlib.bxor(r, select(i, ...)))
+            end
+            return r
+        end
+        bit_bnot = function(a)
+            return to_u32(bitlib.bnot(a))
+        end
+        bit_lshift = function(a, n)
+            return to_u32(bitlib.lshift(a, n))
+        end
+        bit_rshift = function(a, n)
+            return to_u32(bitlib.rshift(a, n))
+        end
+    else
+        local function bit2(a, b, mode)
+            a = to_u32(a)
+            b = to_u32(b)
+            local r = 0
+            local place = 1
+            for _ = 1, 32 do
+                local abit = a % 2
+                local bbit = b % 2
+                if mode == 'and' then
+                    if abit == 1 and bbit == 1 then r = r + place end
+                elseif mode == 'or' then
+                    if abit == 1 or bbit == 1 then r = r + place end
+                else
+                    if abit ~= bbit then r = r + place end
+                end
+                a = (a - abit) / 2
+                b = (b - bbit) / 2
+                place = place * 2
+            end
+            return r
+        end
+
+        bit_band = function(a, ...)
+            if a == nil then return MASK32 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = bit2(r, select(i, ...), 'and')
+            end
+            return to_u32(r)
+        end
+        bit_bor = function(a, ...)
+            if a == nil then return 0 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = bit2(r, select(i, ...), 'or')
+            end
+            return to_u32(r)
+        end
+        bit_bxor = function(a, ...)
+            if a == nil then return 0 end
+            local r = to_u32(a)
+            for i = 1, select('#', ...) do
+                r = bit2(r, select(i, ...), 'xor')
+            end
+            return to_u32(r)
+        end
+        bit_bnot = function(a)
+            return to_u32(MASK32 - to_u32(a))
+        end
+        bit_lshift = function(a, n)
+            n = math.floor(n or 0)
+            if n <= 0 then return to_u32(a) end
+            if n >= 32 then return 0 end
+            return to_u32(to_u32(a) * (2 ^ n))
+        end
+        bit_rshift = function(a, n)
+            n = math.floor(n or 0)
+            if n <= 0 then return to_u32(a) end
+            if n >= 32 then return 0 end
+            return math.floor(to_u32(a) / (2 ^ n))
+        end
+    end
+end
 
 local function bchr(...)
     return string.char(...)
@@ -74,23 +193,23 @@ local function le_int(data, pos, n)
 end
 
 local function int1(n)
-    return bchr(n & 0xff)
+    return bchr(bit_band(n, 0xff))
 end
 
 local function int2(n)
-    return bchr(n & 0xff, (n >> 8) & 0xff)
+    return bchr(bit_band(n, 0xff), bit_band(bit_rshift(n, 8), 0xff))
 end
 
 local function int3(n)
-    return bchr(n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff)
+    return bchr(bit_band(n, 0xff), bit_band(bit_rshift(n, 8), 0xff), bit_band(bit_rshift(n, 16), 0xff))
 end
 
 local function int4(n)
-    return bchr(n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff)
+    return bchr(bit_band(n, 0xff), bit_band(bit_rshift(n, 8), 0xff), bit_band(bit_rshift(n, 16), 0xff), bit_band(bit_rshift(n, 24), 0xff))
 end
 
 local function be32(n)
-    return bchr((n >> 24) & 0xff, (n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff)
+    return bchr(bit_band(bit_rshift(n, 24), 0xff), bit_band(bit_rshift(n, 16), 0xff), bit_band(bit_rshift(n, 8), 0xff), bit_band(n, 0xff))
 end
 
 local function read_null(data, pos)
@@ -142,13 +261,13 @@ local function write_lenenc(n)
     if n <= 0xffffff then
         return int1(0xfd) .. int3(n)
     end
-    return int1(0xfe) .. int4(n & MASK32) .. int4((n >> 32) & MASK32)
+    return int1(0xfe) .. int4(bit_band(n, MASK32)) .. int4(bit_band(bit_rshift(n, 32), MASK32))
 end
 
 local function xor_string(a, b)
     local out = {}
     for i = 1, math.min(#a, #b) do
-        out[i] = bchr((byte_at(a, i) ~ byte_at(b, i)) & 0xff)
+        out[i] = bchr(bit_band(bit_bxor(byte_at(a, i), byte_at(b, i)), 0xff))
     end
     return table.concat(out)
 end
@@ -156,17 +275,21 @@ end
 local function add32(...)
     local sum = 0
     for i = 1, select('#', ...) do
-        sum = (sum + select(i, ...)) & MASK32
+        sum = to_u32(sum + select(i, ...))
     end
     return sum
 end
 
 local function rol(x, n)
-    return ((x << n) | (x >> (32 - n))) & MASK32
+    n = n % 32
+    if n == 0 then return to_u32(x) end
+    return bit_bor(bit_lshift(x, n), bit_rshift(x, 32 - n))
 end
 
 local function ror(x, n)
-    return ((x >> n) | (x << (32 - n))) & MASK32
+    n = n % 32
+    if n == 0 then return to_u32(x) end
+    return bit_bor(bit_rshift(x, n), bit_lshift(x, 32 - n))
 end
 
 local function sha1(msg)
@@ -175,7 +298,7 @@ local function sha1(msg)
     while (#msg % 64) ~= 56 do
         msg = msg .. '\0'
     end
-    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(ml & MASK32)
+    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(bit_band(ml, MASK32))
 
     local h0, h1, h2, h3, h4 =
         0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0
@@ -184,27 +307,31 @@ local function sha1(msg)
         local w = {}
         for i = 0, 15 do
             local p = chunk + i * 4
-            w[i] = ((byte_at(msg, p) << 24) | (byte_at(msg, p + 1) << 16) |
-                    (byte_at(msg, p + 2) << 8) | byte_at(msg, p + 3)) & MASK32
+            w[i] = bit_bor(
+                bit_lshift(byte_at(msg, p), 24),
+                bit_lshift(byte_at(msg, p + 1), 16),
+                bit_lshift(byte_at(msg, p + 2), 8),
+                byte_at(msg, p + 3)
+            )
         end
         for i = 16, 79 do
-            w[i] = rol((w[i - 3] ~ w[i - 8] ~ w[i - 14] ~ w[i - 16]) & MASK32, 1)
+            w[i] = rol(bit_bxor(w[i - 3], w[i - 8], w[i - 14], w[i - 16]), 1)
         end
 
         local a, b, c, d, e = h0, h1, h2, h3, h4
         for i = 0, 79 do
             local f, k
             if i < 20 then
-                f = ((b & c) | ((~b) & d)) & MASK32
+                f = bit_bor(bit_band(b, c), bit_band(bit_bnot(b), d))
                 k = 0x5a827999
             elseif i < 40 then
-                f = (b ~ c ~ d) & MASK32
+                f = bit_bxor(b, c, d)
                 k = 0x6ed9eba1
             elseif i < 60 then
-                f = ((b & c) | (b & d) | (c & d)) & MASK32
+                f = bit_bor(bit_band(b, c), bit_band(b, d), bit_band(c, d))
                 k = 0x8f1bbcdc
             else
-                f = (b ~ c ~ d) & MASK32
+                f = bit_bxor(b, c, d)
                 k = 0xca62c1d6
             end
             local temp = add32(rol(a, 5), f, e, k, w[i])
@@ -243,7 +370,7 @@ local function sha256(msg)
     while (#msg % 64) ~= 56 do
         msg = msg .. '\0'
     end
-    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(ml & MASK32)
+    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(bit_band(ml, MASK32))
 
     local h = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
@@ -254,23 +381,27 @@ local function sha256(msg)
         local w = {}
         for i = 0, 15 do
             local p = chunk + i * 4
-            w[i] = ((byte_at(msg, p) << 24) | (byte_at(msg, p + 1) << 16) |
-                    (byte_at(msg, p + 2) << 8) | byte_at(msg, p + 3)) & MASK32
+            w[i] = bit_bor(
+                bit_lshift(byte_at(msg, p), 24),
+                bit_lshift(byte_at(msg, p + 1), 16),
+                bit_lshift(byte_at(msg, p + 2), 8),
+                byte_at(msg, p + 3)
+            )
         end
         for i = 16, 63 do
-            local s0 = (ror(w[i - 15], 7) ~ ror(w[i - 15], 18) ~ (w[i - 15] >> 3)) & MASK32
-            local s1 = (ror(w[i - 2], 17) ~ ror(w[i - 2], 19) ~ (w[i - 2] >> 10)) & MASK32
+            local s0 = bit_bxor(ror(w[i - 15], 7), ror(w[i - 15], 18), bit_rshift(w[i - 15], 3))
+            local s1 = bit_bxor(ror(w[i - 2], 17), ror(w[i - 2], 19), bit_rshift(w[i - 2], 10))
             w[i] = add32(w[i - 16], s0, w[i - 7], s1)
         end
 
         local a, b, c, d, e, f, g, hh =
             h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]
         for i = 0, 63 do
-            local s1 = (ror(e, 6) ~ ror(e, 11) ~ ror(e, 25)) & MASK32
-            local ch = ((e & f) ~ ((~e) & g)) & MASK32
+            local s1 = bit_bxor(ror(e, 6), ror(e, 11), ror(e, 25))
+            local ch = bit_bxor(bit_band(e, f), bit_band(bit_bnot(e), g))
             local temp1 = add32(hh, s1, ch, K256[i + 1], w[i])
-            local s0 = (ror(a, 2) ~ ror(a, 13) ~ ror(a, 22)) & MASK32
-            local maj = ((a & b) ~ (a & c) ~ (b & c)) & MASK32
+            local s0 = bit_bxor(ror(a, 2), ror(a, 13), ror(a, 22))
+            local maj = bit_bxor(bit_band(a, b), bit_band(a, c), bit_band(b, c))
             local temp2 = add32(s0, maj)
             hh, g, f, e, d, c, b, a = g, f, e, add32(d, temp1), c, b, a, add32(temp1, temp2)
         end
@@ -370,7 +501,7 @@ local function parse_handshake(payload)
     pos = pos + 2
     local caps_high = le_int(payload, pos, 2)
     pos = pos + 2
-    local caps = (caps_high << 16) | caps_low
+    local caps = bit_bor(bit_lshift(caps_high, 16), caps_low)
     local auth_len = byte_at(payload, pos)
     pos = pos + 1
     pos = pos + 10
@@ -417,15 +548,17 @@ local function make_handshake_response(hs)
     local CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA = 0x00200000
 
     local db = config.database or ''
-    local flags = CLIENT_LONG_PASSWORD | CLIENT_LONG_FLAG | CLIENT_PROTOCOL_41 |
-        CLIENT_TRANSACTIONS | CLIENT_SECURE_CONNECTION | CLIENT_MULTI_RESULTS |
-        CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_ATTRS | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+    local flags = bit_bor(
+        CLIENT_LONG_PASSWORD, CLIENT_LONG_FLAG, CLIENT_PROTOCOL_41,
+        CLIENT_TRANSACTIONS, CLIENT_SECURE_CONNECTION, CLIENT_MULTI_RESULTS,
+        CLIENT_PLUGIN_AUTH, CLIENT_CONNECT_ATTRS, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+    )
     if db ~= '' then
-        flags = flags | CLIENT_CONNECT_WITH_DB
+        flags = bit_bor(flags, CLIENT_CONNECT_WITH_DB)
     end
 
     if hs.capabilities then
-        flags = flags & hs.capabilities
+        flags = bit_band(flags, hs.capabilities)
     end
 
     local token, err = auth_token(hs.plugin, config.password, hs.seed)
@@ -441,10 +574,10 @@ local function make_handshake_response(hs)
         config.user,
         '\0',
     }
-    if (flags & CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) ~= 0 then
+    if bit_band(flags, CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) ~= 0 then
         parts[#parts + 1] = write_lenenc(#token)
         parts[#parts + 1] = token
-    elseif (flags & CLIENT_SECURE_CONNECTION) ~= 0 then
+    elseif bit_band(flags, CLIENT_SECURE_CONNECTION) ~= 0 then
         parts[#parts + 1] = int1(#token)
         parts[#parts + 1] = token
     else
@@ -455,11 +588,11 @@ local function make_handshake_response(hs)
         parts[#parts + 1] = db
         parts[#parts + 1] = '\0'
     end
-    if (flags & CLIENT_PLUGIN_AUTH) ~= 0 then
+    if bit_band(flags, CLIENT_PLUGIN_AUTH) ~= 0 then
         parts[#parts + 1] = hs.plugin
         parts[#parts + 1] = '\0'
     end
-    if (flags & CLIENT_CONNECT_ATTRS) ~= 0 then
+    if bit_band(flags, CLIENT_CONNECT_ATTRS) ~= 0 then
         parts[#parts + 1] = write_lenenc(0)
     end
     return table.concat(parts)

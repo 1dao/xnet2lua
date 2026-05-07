@@ -38,6 +38,35 @@
 #include "../3rd/yyjson.h"
 #include "xargs.h"
 
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
+static int lua_isinteger(lua_State *L, int idx) {
+    if (!lua_isnumber(L, idx)) return 0;
+    lua_Number n = lua_tonumber(L, idx);
+    lua_Integer i = lua_tointeger(L, idx);
+    return ((lua_Number)i == n);
+}
+
+static const char *luaL_tolstring(lua_State *L, int idx, size_t *len) {
+    idx = (idx > 0 || idx <= LUA_REGISTRYINDEX) ? idx : lua_gettop(L) + idx + 1;
+    lua_getglobal(L, "tostring");
+    lua_pushvalue(L, idx);
+    lua_call(L, 1, 1);
+    return lua_tolstring(L, -1, len);
+}
+#endif
+
+static lua_Integer lua_integer_max(void) {
+    if (sizeof(lua_Integer) >= sizeof(long long)) return (lua_Integer)LLONG_MAX;
+    if (sizeof(lua_Integer) >= sizeof(long)) return (lua_Integer)LONG_MAX;
+    return (lua_Integer)INT_MAX;
+}
+
+static lua_Integer lua_integer_min(void) {
+    if (sizeof(lua_Integer) >= sizeof(long long)) return (lua_Integer)LLONG_MIN;
+    if (sizeof(lua_Integer) >= sizeof(long)) return (lua_Integer)LONG_MIN;
+    return (lua_Integer)INT_MIN;
+}
+
 #ifndef lua_absindex
 #define lua_absindex(L, i) \
     (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
@@ -224,7 +253,7 @@ static int lua_json_push_array(lua_State *L, const yyjson_val *val, int depth) {
     yyjson_val *elem = NULL;
     lua_Integer i = 1;
 
-    if (len > (size_t)LUA_MAXINTEGER) {
+    if (len > (size_t)lua_integer_max()) {
         return 0;
     }
 
@@ -281,7 +310,7 @@ static int lua_json_push_value(lua_State *L, const yyjson_val *val, int depth) {
     case YYJSON_TYPE_NUM:
         if (yyjson_is_uint(val)) {
             uint64_t n = yyjson_get_uint(val);
-            if (n <= (uint64_t)LUA_MAXINTEGER) {
+            if (n <= (uint64_t)lua_integer_max()) {
                 lua_pushinteger(L, (lua_Integer)n);
             } else {
                 lua_pushnumber(L, (lua_Number)n);
@@ -290,7 +319,7 @@ static int lua_json_push_value(lua_State *L, const yyjson_val *val, int depth) {
         }
         if (yyjson_is_sint(val)) {
             int64_t n = yyjson_get_sint(val);
-            if (n < (int64_t)LUA_MININTEGER || n > (int64_t)LUA_MAXINTEGER) {
+            if (n < (int64_t)lua_integer_min() || n > (int64_t)lua_integer_max()) {
                 lua_pushnumber(L, (lua_Number)n);
             } else {
                 lua_pushinteger(L, (lua_Integer)n);
