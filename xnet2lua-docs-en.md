@@ -56,64 +56,199 @@ xnet2lua is divided into four layers:
 
 ## 2. Building and Integration
 
-### 2.1 Build Core Static Library
+> ⚙️ **Build system reorganized.** The root Makefile now produces all three artifacts —
+> `libxsock.a`, `bin/xnet`, and `bin/xthread_test` — in a single pass. The previous
+> two-stage build (`make` at root, then `cd demo && make`) is **no longer required**.
+> A new top-level `build.bat` provides an MSVC all-source build, and **LuaJIT** is now
+> supported as an optional Lua backend.
 
-```
-# Enter project root
+### 2.1 One-shot build (GCC / MinGW / Linux / macOS)
+
+```bash
 cd xnet2lua
 
-# Build libxsock.a (core C library)
+# Default: release + minilua + HTTP + HTTPS, output goes to bin/
 make
 
-# Output: libxsock.a
+# Build a single sub-target
+make xnet            # only bin/xnet
+make xthread_test    # only bin/xthread_test
+make clean
 ```
 
-### 2.2 Build demo Executables
+Tunable variables (override on the command line as `KEY=VALUE`):
 
+| Variable | Default | Values | Effect |
+|----------|---------|--------|--------|
+| `BUILD_MODE` | `release` | `release` / `debug` | `-O2 -DNDEBUG` ↔ `-O0 -g -DDEBUG` |
+| `WITH_HTTP` | `1` | `1` / `0` | Compile HTTP code paths |
+| `WITH_HTTPS` | `1` | `1` / `0` | Compile mbedTLS / HTTPS code paths |
+| `WITH_IO_URING` | `0` | `1` / `0` | On Linux, define `XPOLL_USE_IO_URING` and `XCHANNEL_USE_IO_URING`; links `liburing` |
+| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | Use the embedded mini Lua or LuaJIT. For `luajit`, fetch the `3rd/luajit` submodule and build `libluajit.a` first |
+
+```bash
+# Examples
+make BUILD_MODE=debug
+make WITH_HTTPS=0
+make WITH_IO_URING=1                       # Linux only
+make LUA_BACKEND=luajit                    # see 2.5
 ```
-cd demo
 
-# Without HTTPS (default)
-make
+> `demo/Makefile` is now a thin wrapper: every target it knows about just forwards to
+> the root Makefile (`make -C ..`). Old paths keep working so existing scripts don't
+> break.
 
-# With HTTPS support (requires mbedTLS)
-make WITH_HTTPS=1
+### 2.2 Windows / MSVC build (`build.bat`)
 
-# Output: xnet (or xnet.exe)
+The repository root now ships `build.bat` — an **all-source** MSVC build (it does
+not consume `libxsock.a`) that auto-locates `vcvarsall.bat` and loads the x64
+toolchain. `demo/build.bat` still works but only forwards arguments to the root
+script.
+
+```bat
+:: Default release; produces bin\xnet.exe + bin\xthread_test.exe
+build.bat
+
+:: Switch to debug
+build.bat debug
+
+:: Disable HTTP / HTTPS
+build.bat nohttp
+build.bat nohttps
+
+:: Switch to the LuaJIT backend
+:: (the first run automatically calls 3rd\luajit\src\msvcbuild.bat static
+::  to produce lua51.lib if it isn't there yet)
+build.bat luajit
+
+:: Build a single target
+build.bat xnet
+build.bat xthread_test
+
+:: Run the test suites (see 2.4)
+build.bat test
+build.bat test-c
+build.bat test-lua-core
+build.bat test-lua-external
+build.bat test-lua-all
+
+:: Run a single Lua script through the freshly built xnet
+build.bat run-lua demo/xutils_main.lua
+build.bat run-lua script=demo/xnet_main.lua
+
+:: Clean
+build.bat clean
 ```
+
+Arguments compose freely, e.g. `build.bat debug luajit nohttps test-lua-core`.
 
 ### 2.3 Run demos
 
-```
-# Run TCP echo demo
-./xnet demo/xnet_main.lua
+`bin/xnet` (or `bin/xnet.exe`) is a **generic Lua runner**. The first argument is
+the Lua script to execute; subsequent `KEY=VALUE` pairs override config:
 
-# Run HTTP demo
-./xnet demo/xhttp_main.lua
-
-# Run HTTPS demo (requires WITH_HTTPS=1)
-./xnet demo/xhttps_main.lua
-
-# Run cross-thread RPC test
-./xnet demo/xlua_main.lua
-
-# Run with overrides (config items)
-./xnet demo/xnats_main.lua SERVER_NAME=game1
+```bash
+./bin/xnet demo/xnet_main.lua
+./bin/xnet demo/xhttp_main.lua
+./bin/xnet demo/xhttps_main.lua          # requires a WITH_HTTPS build
+./bin/xnet demo/xredis_main.lua
+./bin/xnet demo/xmysql_main.lua
+./bin/xnet demo/xnats_main.lua SERVER_NAME=game1
+./bin/xnet demo/xpac_main.lua
 ```
 
-### 2.4 Embedding
+CLI `KEY=VALUE` overrides win over `xnet.cfg`, but the key must be on the
+whitelist in `g_arg_configs[]` inside `xnet_main.c`. When you add a new Lua
+config option that you want to be CLI-overridable, remember to extend that array.
 
-If you want to embed xnet2lua into your own C project:
+### 2.4 Test targets
 
-1. Link libxsock.a into your executable
-2. In your C entry, call the initialization sequence below:
+The root Makefile bundles a small test harness that works on both the GCC/MinGW
+and MSVC paths:
+
+```bash
+make test                  # = test-c + test-lua-core
+make test-c                # only the C-level xthread_test binary
+make test-lua-core         # the core Lua suite:
+                           #   demo/xutils_main.lua, xtimer_main.lua, xtimerx_test.lua,
+                           #   xlua_main.lua, xnet_main.lua, xrouter_test.lua,
+                           #   xhttp_router_test.lua, xhttp_main.lua
+make test-lua-external     # scripts that need external services
+                           # (HTTPS certs, Redis, MySQL, NATS):
+                           #   demo/xhttps_main.lua, xredis_main.lua,
+                           #   xmysql_main.lua, xnats_main.lua
+make test-lua-all          # core + external
+
+# Run a single script through the freshly built bin/xnet
+make run-lua SCRIPT=demo/xnet_main.lua
+```
+
+`build.bat` accepts the same target names (`build.bat test`,
+`build.bat test-lua-core`, …) with identical semantics.
+
+### 2.5 Lua backend: minilua vs LuaJIT
+
+xnet2lua supports two Lua runtimes side by side:
+
+- **minilua** (default, `-DLUA_EMBEDDED`): the single-header `3rd/minilua.h`,
+  Lua 5.4 flavor, no external dependencies.
+- **LuaJIT** (`-DXLUA_USE_LUAJIT=1`): links against `3rd/luajit/src/libluajit.a`
+  on GCC/MinGW or `lua51.lib` on MSVC. Lua 5.1 + selected 5.2 extensions + JIT.
+
+When LuaJIT is in use, the framework calls — once per Lua state, right after
+`luaL_openlibs()`:
 
 ```c
-#define LUA_IMPL
-#include "3rd/minilua.h"    // Single-header Lua embedding; you can also use system Lua
+luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+```
+
+so the JIT is guaranteed to be on for the main thread and every worker thread.
+The handful of APIs that Lua 5.1 lacks (`luaL_requiref`, `lua_isinteger`,
+`luaL_tolstring`, plus the `LUA_MAXINTEGER` / `LUA_MININTEGER` bounds) are
+polyfilled inline in `xnet_main.c`, `xlua/lua_xthread.c`, and
+`xlua/lua_xutils.c`. **The xnet/xthread/xutils/cmsgpack binding APIs are
+identical between the two backends** — application Lua code does not need any
+module-name or signature changes.
+
+> 💡 **Note for application code**: Lua 5.4's bitwise operators `& | ~ << >>`
+> are a **syntax error** under LuaJIT (5.1). To stay portable across both
+> backends, use the `bit` library (LuaJIT bundles `bit.band` / `bit.bxor` /
+> `bit.lshift` / …). `demo/xmysql_worker.lua`'s SHA-1 / SHA-256 helpers are a
+> good template — they prefer `bit` / `bit32` if available and fall back to a
+> pure-Lua implementation otherwise.
+
+### 2.6 Embedding
+
+To embed xnet2lua into your own C project:
+
+1. Link `libxsock.a`.
+2. Pick a Lua backend and define the matching macro:
+   - `-DLUA_EMBEDDED`: include `3rd/minilua.h` directly (with `#define LUA_IMPL`
+     in exactly one `.c` file).
+   - `-DXLUA_USE_LUAJIT=1`: include `lua.h`, `lauxlib.h`, `lualib.h`, `luajit.h`
+     and link the LuaJIT static library.
+3. In your C entry point, follow this initialization sequence:
+
+```c
+#if defined(LUA_EMBEDDED)
+    #define LUA_IMPL
+    #include "3rd/minilua.h"
+#else
+    #include "lua.h"
+    #include "lauxlib.h"
+    #include "lualib.h"
+    #if defined(XLUA_USE_LUAJIT)
+        #include "luajit.h"
+    #endif
+#endif
 
 #include "xthread.h"
-#include "xlua.h"
+
+lua_State* L = luaL_newstate();
+luaL_openlibs(L);
+#if defined(XLUA_USE_LUAJIT)
+    luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+#endif
 
 // Register Lua modules
 luaL_requiref(L, "xthread",  luaopen_xthread,  1); lua_pop(L, 1);
@@ -121,7 +256,7 @@ luaL_requiref(L, "xnet",     luaopen_xnet,     1); lua_pop(L, 1);
 luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1); lua_pop(L, 1);
 luaL_requiref(L, "xutils",   luaopen_xutils,   1); lua_pop(L, 1);
 
-// Initialize thread system
+// Initialize the thread system
 xthread_init();
 ```
 

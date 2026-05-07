@@ -146,8 +146,8 @@ end
 -- ── Test 9: singleton — repeated dofile returns the SAME table ─────────────
 do
     router.reset({ log_prefix = 'T9' })
-    local r2 = dofile('demo/xrouter.lua')
-    local r3 = dofile('demo/xrouter.lua')
+    local r2 = dofile('scripts/core/share/xrouter.lua')
+    local r3 = dofile('scripts/core/share/xrouter.lua')
     check(router == r2 and r2 == r3,
           'dofile returns the same singleton across calls')
     check(router.handle == r2.handle,
@@ -160,12 +160,12 @@ do
     local hits = {}
     -- File A
     do
-        local r = dofile('demo/xrouter.lua')
+        local r = dofile('scripts/core/share/xrouter.lua')
         r.register('msg_a', function() hits.a = true end)
     end
     -- File B (separate dofile, same router)
     do
-        local r = dofile('demo/xrouter.lua')
+        local r = dofile('scripts/core/share/xrouter.lua')
         r.register('msg_b', function() hits.b = true end)
     end
     router.handle(nil, 'msg_a')
@@ -187,7 +187,7 @@ do
           're-register overwrites handler in place')
     -- handle() reference is stable across re-dofile (this is what makes
     -- reload work without touching the C-side __thread_handle ref).
-    local r2 = dofile('demo/xrouter.lua')
+    local r2 = dofile('scripts/core/share/xrouter.lua')
     check(router.handle == r2.handle,
           'router.handle is stable across re-dofile (reload-safe)')
 end

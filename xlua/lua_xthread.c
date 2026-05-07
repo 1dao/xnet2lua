@@ -42,11 +42,40 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "lualib.h"
+#if defined(XLUA_USE_LUAJIT)
+#include "luajit.h"
+#endif
 #endif
 
 #include "xthread.h"
 #include "xlog.h"
 #include "xtimer.h"
+
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
+static void luaL_requiref(lua_State* L, const char* modname,
+                          lua_CFunction openf, int glb) {
+    lua_pushcfunction(L, openf);
+    lua_pushstring(L, modname);
+    lua_call(L, 1, 1);
+
+    lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "_LOADED");
+    }
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, modname);
+    lua_pop(L, 1);
+
+    if (glb) {
+        lua_pushvalue(L, -1);
+        lua_setglobal(L, modname);
+    }
+}
+#endif
 
 LUALIB_API int luaopen_cmsgpack(lua_State* L);
 LUALIB_API int luaopen_xthread(lua_State* L);
@@ -84,6 +113,14 @@ typedef struct {
 /* Forward declaration */
 static void thread_message_handler(xThread* thr, void* arg, int arg_len);
 static int thread_data_gc(lua_State* L);
+
+static void lua_thread_runtime_post_init(lua_State* L) {
+#if defined(XLUA_USE_LUAJIT)
+    if (L) luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+#else
+    (void)L;
+#endif
+}
 
 /* ThreadData metatable name */
 static const char* THREAD_DATA_META = "xthread.ThreadData";
@@ -791,6 +828,7 @@ static void lua_thread_on_init(xThread* thr) {
 
     /* Open standard libraries */
     luaL_openlibs(L);
+    lua_thread_runtime_post_init(L);
 
     /* Preload cmsgpack (statically linked) */
     luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1);

@@ -55,64 +55,171 @@ xnet2lua 分为四层：
 
 ## 2. 编译与集成
 
-### 2.1 编译核心静态库
+> ⚙️ **构建系统已重组**：根 Makefile 现在直接构建出 `libxsock.a`、`bin/xnet`、`bin/xthread_test`
+> 三件产物，**不再需要先 `make` 再 `cd demo && make` 的两段式构建**。
+> 仓库根目录新增了 `build.bat`（MSVC 全源编译），并支持 LuaJIT 作为可选 Lua 后端。
+
+### 2.1 一键构建（GCC / MinGW / Linux / macOS）
 
 ```bash
-# 进入项目根目录
 cd xnet2lua
 
-# 编译 libxsock.a（核心 C 库）
+# 默认：release + minilua + HTTP + HTTPS，输出到 bin/
 make
 
-# 产物：libxsock.a
+# 单独构建子目标
+make xnet            # 只构建 bin/xnet
+make xthread_test    # 只构建 bin/xthread_test
+make clean
 ```
 
-### 2.2 编译 demo 可执行文件
+可调变量（命令行 `KEY=VALUE` 覆盖）：
+
+| 变量 | 默认值 | 取值 | 说明 |
+|------|--------|------|------|
+| `BUILD_MODE` | `release` | `release` / `debug` | `-O2 -DNDEBUG` ↔ `-O0 -g -DDEBUG` |
+| `WITH_HTTP` | `1` | `1` / `0` | 是否编译 HTTP 代码路径 |
+| `WITH_HTTPS` | `1` | `1` / `0` | 是否编译 mbedTLS / HTTPS 路径 |
+| `WITH_IO_URING` | `0` | `1` / `0` | Linux 下启用 `XPOLL_USE_IO_URING` 与 `XCHANNEL_USE_IO_URING`，需链接 `liburing` |
+| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | 内置 Lua 还是 LuaJIT；选 `luajit` 时需要先把 `3rd/luajit` 子模块拉下来并构建 `libluajit.a` |
 
 ```bash
-cd demo
-
-# 不带 HTTPS（默认）
-make
-
-# 带 HTTPS 支持（需要 mbedTLS）
-make WITH_HTTPS=1
-
-# 产物：xnet（或 xnet.exe）
+# 示例
+make BUILD_MODE=debug
+make WITH_HTTPS=0
+make WITH_IO_URING=1                       # Linux only
+make LUA_BACKEND=luajit                    # 详见 2.5
 ```
+
+> `demo/Makefile` 现在是一个薄壳，把同名目标转发到根 Makefile（`make -C ..`），保留旧路径以免破坏既有脚本。
+
+### 2.2 Windows / MSVC 构建（`build.bat`）
+
+仓库根目录的 `build.bat` 是**全源编译**入口（不消费 `libxsock.a`），自动定位 `vcvarsall.bat` 并加载 x64 工具链。`demo/build.bat` 仍可用，但内部仅做参数透传。
+
+```bat
+:: 默认 release，构建 bin\xnet.exe + bin\xthread_test.exe
+build.bat
+
+:: 切换 debug
+build.bat debug
+
+:: 关闭 HTTP / HTTPS
+build.bat nohttp
+build.bat nohttps
+
+:: 切换到 LuaJIT 后端
+::（首次会自动调用 3rd\luajit\src\msvcbuild.bat static 把 lua51.lib 编出来）
+build.bat luajit
+
+:: 仅构建某个目标
+build.bat xnet
+build.bat xthread_test
+
+:: 跑测试套件（详见 2.4）
+build.bat test
+build.bat test-c
+build.bat test-lua-core
+build.bat test-lua-external
+build.bat test-lua-all
+
+:: 单跑一个 Lua 脚本
+build.bat run-lua demo/xutils_main.lua
+build.bat run-lua script=demo/xnet_main.lua
+
+:: 清理
+build.bat clean
+```
+
+参数可任意组合，如 `build.bat debug luajit nohttps test-lua-core`。
 
 ### 2.3 运行 demo
 
+`bin/xnet`（或 `bin/xnet.exe`）是一个**通用 Lua 运行器**，第一个参数是要执行的 Lua 脚本，后续参数按 `KEY=VALUE` 形式覆盖配置：
+
 ```bash
-# 运行 TCP echo demo
-./xnet demo/xnet_main.lua
-
-# 运行 HTTP demo
-./xnet demo/xhttp_main.lua
-
-# 运行 HTTPS demo（需带 WITH_HTTPS=1 编译）
-./xnet demo/xhttps_main.lua
-
-# 运行跨线程 RPC 测试
-./xnet demo/xlua_main.lua
-
-# 带参数运行（覆盖配置项）
-./xnet demo/xnats_main.lua SERVER_NAME=game1
+./bin/xnet demo/xnet_main.lua
+./bin/xnet demo/xhttp_main.lua
+./bin/xnet demo/xhttps_main.lua          # 需 WITH_HTTPS 构建
+./bin/xnet demo/xredis_main.lua
+./bin/xnet demo/xmysql_main.lua
+./bin/xnet demo/xnats_main.lua SERVER_NAME=game1
+./bin/xnet demo/xpac_main.lua
 ```
 
-### 2.4 嵌入式集成
+CLI 的 `KEY=VALUE` 优先于 `xnet.cfg`，但被读取的键必须在 `xnet_main.c` 的 `g_arg_configs[]` 白名单中（新增 Lua 配置项时如果想让它支持命令行覆盖，记得同步更新该数组）。
 
-若要将 xnet2lua 嵌入自己的 C 项目，只需：
+### 2.4 测试目标
 
-1. 将 `libxsock.a` 链接进你的可执行文件
-2. 在 C 入口调用以下初始化序列：
+根 Makefile 现在内置了一组测试入口（GCC/MinGW 与 MSVC 两条路径都能跑）：
+
+```bash
+make test                  # = test-c + test-lua-core
+make test-c                # 只跑 C 层 xthread_test
+make test-lua-core         # 跑核心 Lua 用例：
+                           #   demo/xutils_main.lua, xtimer_main.lua, xtimerx_test.lua,
+                           #   xlua_main.lua, xnet_main.lua, xrouter_test.lua,
+                           #   xhttp_router_test.lua, xhttp_main.lua
+make test-lua-external     # 需要外部依赖（HTTPS/Redis/MySQL/NATS）的脚本：
+                           #   demo/xhttps_main.lua, xredis_main.lua, xmysql_main.lua, xnats_main.lua
+make test-lua-all          # core + external
+
+# 用 xnet 单跑一个脚本
+make run-lua SCRIPT=demo/xnet_main.lua
+```
+
+`build.bat` 接受同名目标（`build.bat test` / `build.bat test-lua-core` 等），选项语义一致。
+
+### 2.5 Lua 后端：minilua 与 LuaJIT
+
+xnet2lua 同时支持两种 Lua 运行时：
+
+- **minilua**（默认，`-DLUA_EMBEDDED`）：`3rd/minilua.h` 单头文件，Lua 5.4 风格，不引入外部依赖。
+- **LuaJIT**（`-DXLUA_USE_LUAJIT=1`）：链接 `3rd/luajit/src/libluajit.a`（GCC/MinGW）或 `lua51.lib`（MSVC）。Lua 5.1 + 部分 5.2 扩展 + JIT。
+
+启用 LuaJIT 时框架会在每个 Lua state 的 `luaL_openlibs()` 之后自动调用：
 
 ```c
-#define LUA_IMPL
-#include "3rd/minilua.h"    // 单头文件嵌入 Lua，也可改用系统 Lua
+luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+```
+
+确保主线程和所有 worker 线程的 JIT 都开启。Lua 5.1 缺失的若干 API（`luaL_requiref`、`lua_isinteger`、`luaL_tolstring`，以及 `LUA_MAXINTEGER`/`LUA_MININTEGER` 边界）由 `xnet_main.c`、`xlua/lua_xthread.c`、`xlua/lua_xutils.c` 内联补齐，**绑定层 API 在两种后端下完全一致**，业务代码不需要改 Lua 模块名或函数签名。
+
+> 💡 **业务代码注意**：Lua 5.4 的位运算符 `& | ~ << >>` 在 LuaJIT (5.1) 下会**语法错误**。
+> 想同时兼容两个后端，请改用 `bit` 库（LuaJIT 自带 `bit.band` / `bit.bxor` / `bit.lshift` / ...）。
+> `demo/xmysql_worker.lua` 的 SHA-1 / SHA-256 实现给出了一份完整的 fallback 模板（在
+> 检测不到 `bit`/`bit32` 时回退到纯 Lua 位运算），可直接参考。
+
+### 2.6 嵌入式集成
+
+要把 xnet2lua 嵌入自己的 C 项目：
+
+1. 链接 `libxsock.a`；
+2. 选择 Lua 后端并定义对应宏：
+   - `-DLUA_EMBEDDED`：直接 `#include "3rd/minilua.h"`（在某一个 `.c` 中 `#define LUA_IMPL`）。
+   - `-DXLUA_USE_LUAJIT=1`：`#include "lua.h" / "lauxlib.h" / "lualib.h" / "luajit.h"`，并链接 LuaJIT 静态库。
+3. 在 C 入口完成下列初始化：
+
+```c
+#if defined(LUA_EMBEDDED)
+    #define LUA_IMPL
+    #include "3rd/minilua.h"
+#else
+    #include "lua.h"
+    #include "lauxlib.h"
+    #include "lualib.h"
+    #if defined(XLUA_USE_LUAJIT)
+        #include "luajit.h"
+    #endif
+#endif
 
 #include "xthread.h"
-#include "xlua.h"
+
+lua_State* L = luaL_newstate();
+luaL_openlibs(L);
+#if defined(XLUA_USE_LUAJIT)
+    luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+#endif
 
 // 注册 Lua 模块
 luaL_requiref(L, "xthread",  luaopen_xthread,  1); lua_pop(L, 1);
