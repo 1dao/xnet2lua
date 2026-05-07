@@ -1,6 +1,3 @@
-*** Begin Patch
-*** Add File: xnet2lua-docs-en.md
----
 # xnet2lua Documentation
 
 Version: Based on [github.com/1dao/xnet2lua](https://github.com/1dao/xnet2lua)  
@@ -167,7 +164,7 @@ return {
 
 ### 3.2 __thread_handle Message Distribution Template
 
-> 💡 **Recommended**: use the `demo/xrouter.lua` module to skip this
+> 💡 **Recommended**: use the `scripts/core/share/xrouter.lua` module to skip this
 > boilerplate entirely — see [3.3 xrouter module](#33-xrouter-module-recommended).
 > The hand-written template below is here only for readers who want to see the
 > underlying protocol or need fully custom dispatch.
@@ -214,7 +211,7 @@ end
 
 ### 3.3 xrouter module (recommended)
 
-`demo/xrouter.lua` packages the §3.2 boilerplate (`_stubs / _thread_replys /
+`scripts/core/share/xrouter.lua` packages the §3.2 boilerplate (`_stubs / _thread_replys /
 __thread_handle` plus the coroutine wrapping and RPC reply routing) into a
 small module.
 
@@ -231,7 +228,7 @@ small module.
    Every handler runs in a coroutine, so **any** handler may yield (e.g.
    internally call `xthread.rpc` out into another thread).
 
-2. **Per-Lua-state singleton**: every `dofile('demo/xrouter.lua')` in the
+2. **Per-Lua-state singleton**: every `dofile('scripts/core/share/xrouter.lua')` in the
    same thread returns the **same table** (same caching pattern as
    xhttp_router's `__xnet_xhttp_router`), so registrations spread across
    many files all accumulate into one router.
@@ -241,7 +238,7 @@ The thread script keeps the §3.1 standard return-table shape; **only the
 
 ```lua
 -- worker.lua
-local router = dofile('demo/xrouter.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('MYAPP')                    -- optional
 
 -- One register API. The site doesn't care whether the caller uses POST or RPC.
@@ -278,7 +275,7 @@ return {
 
 | Method | Purpose |
 |---|---|
-| `dofile('demo/xrouter.lua')` | Returns the router singleton (same object on every call within a Lua state) |
+| `dofile('scripts/core/share/xrouter.lua')` | Returns the router singleton (same object on every call within a Lua state) |
 | `router.register(pt, h)` | Register handler; usable from both POST and RPC; runs in a coroutine, may yield |
 | `router.reset(opts)` | Wipe all handlers and callbacks (for tests / explicit teardown) |
 | `router.set_log_prefix(s)` | Change the log prefix |
@@ -718,7 +715,7 @@ xnet2lua provides a complete HTTP server implementation (Lua-based, built on xne
 
 ```lua
 -- In the main thread’s __init
-local xhttp = dofile("demo/xhttp.lua")
+local xhttp = dofile("scripts/core/server/xhttp.lua")
 
 local ok, err = xhttp.start({
     host         = "0.0.0.0",
@@ -766,7 +763,7 @@ Every worker thread will independently load the app_script, so routes are regist
 
 ```lua
 -- my_app.lua
-local router = dofile("demo/xhttp_router.lua")
+local router = dofile("scripts/core/share/xhttp_router.lua")
 
 -- Register route: GET /hello
 router.get("/hello", function(req)
@@ -867,7 +864,7 @@ return { status = 500, body = "Internal Server Error\n" }
 ### 8.5 Router API
 
 ```lua
-local router = dofile("demo/xhttp_router.lua")
+local router = dofile("scripts/core/share/xhttp_router.lua")
 
 -- Register GET route
 router.get(path, handler)
@@ -1032,7 +1029,7 @@ MYSQL_DATABASE=mydb
 
 ```lua
 -- Load configuration file (usually in the main thread’s __init at the very start)
-local ok, err = xutils.load_config("config/xnet.cfg")
+local ok, err = xutils.load_config("xnet.cfg")
 if not ok then
     io.stderr:write("Configuration load failed: " .. tostring(err) .. "\n")
 end
@@ -1254,9 +1251,9 @@ Run:
 ```lua
 -- http_server_main.lua
 
-local xhttp = dofile("demo/xhttp.lua")
+local xhttp = dofile("scripts/core/server/xhttp.lua")
 
-local CONFIG_FILE = "config/xnet.cfg"
+local CONFIG_FILE = "xnet.cfg"
 xutils.load_config(CONFIG_FILE)
 
 _stubs = {}
@@ -1302,7 +1299,7 @@ return {
 ```lua
 -- api_app.lua - Each worker loads this file independently
 
-local router = dofile("demo/xhttp_router.lua")
+local router = dofile("scripts/core/share/xhttp_router.lua")
 
 -- Cross-origin headers (optional)
 local CORS_HEADERS = {

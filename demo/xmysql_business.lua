@@ -1,7 +1,7 @@
 -- Business worker for the Lua xmysql demo.
 -- Each business thread calls MySQL through the shared XTHR_MYSQL service thread.
 
-local xmysql = dofile('demo/xmysql.lua')
+local xmysql = dofile('scripts/core/server/xmysql.lua')
 
 local MAIN_ID = xthread.MAIN
 

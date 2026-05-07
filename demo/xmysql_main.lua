@@ -2,10 +2,10 @@
 -- Main starts MySQL service thread plus business workers in __init, and closes
 -- them in __uninit. Business workers issue MySQL operations.
 
-local xmysql = dofile('demo/xmysql.lua')
+local xmysql = dofile('scripts/core/server/xmysql.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XMYSQL-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')

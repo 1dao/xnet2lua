@@ -1,11 +1,11 @@
 -- xhttp_main.lua - HTTP server demo.
 -- Main thread owns the listener and passes accepted sockets to HTTP workers.
 
-local xhttp = dofile('demo/xhttp.lua')
-local codec = dofile('demo/xhttp_codec.lua')
+local xhttp = dofile('scripts/core/server/xhttp.lua')
+local codec = dofile('scripts/core/share/xhttp_codec.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XHTTP-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')

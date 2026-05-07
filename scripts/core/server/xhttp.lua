@@ -1,6 +1,6 @@
 -- xhttp.lua - HTTP server manager.
 -- Main thread owns listen_fd and passes accepted sockets to worker threads.
--- HTTP parsing/response serialization live in demo/xhttp_codec.lua.
+-- HTTP parsing/response serialization live in scripts/core/share/xhttp_codec.lua.
 
 local M = {}
 

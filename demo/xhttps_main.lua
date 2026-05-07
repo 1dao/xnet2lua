@@ -1,10 +1,10 @@
 -- xhttps_main.lua - HTTPS server demo.
 -- Starts the same Lua HTTP app over TLS. Use openssl/curl to verify it.
 
-local xhttp = dofile('demo/xhttp.lua')
+local xhttp = dofile('scripts/core/server/xhttp.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XHTTPS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')

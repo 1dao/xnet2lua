@@ -1,5 +1,5 @@
--- demo/xtimerx_test.lua - end-to-end tests for demo/xtimerx.lua
--- Run via:  ./demo/xnet demo/xtimerx_test.lua
+-- demo/xtimerx_test.lua - end-to-end tests for scripts/core/share/xtimerx.lua
+-- Run via:  ./bin/xnet demo/xtimerx_test.lua
 --
 -- Covers:
 --   1. timer_every fires repeatedly
@@ -17,7 +17,7 @@
 -- and exits cleanly via xthread.stop.
 
 local xtimer  = require('xtimer')
-local xtimerx = dofile('demo/xtimerx.lua')
+local xtimerx = dofile('scripts/core/share/xtimerx.lua')
 
 -- ── Test infra ──────────────────────────────────────────────────────────────
 

@@ -1,8 +1,8 @@
--- demo/router_test.lua - unit tests for xhttp_router.lua path-param support.
--- Run via:  ./demo/xnet demo/router_test.lua
+-- demo/xhttp_router_test.lua - unit tests for xhttp_router.lua path-param support.
+-- Run via:  ./bin/xnet demo/xhttp_router_test.lua
 -- Exits with non-zero code if any assertion fails.
 
-local router = dofile('demo/xhttp_router.lua')
+local router = dofile('scripts/core/share/xhttp_router.lua')
 
 local fails = 0
 local function check(ok, msg)

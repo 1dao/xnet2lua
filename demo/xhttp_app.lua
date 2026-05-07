@@ -1,7 +1,7 @@
 -- xhttp_app.lua - demo HTTP application used by xhttp_main.lua.
 
-local codec = dofile('demo/xhttp_codec.lua')
-local router = dofile('demo/xhttp_router.lua')
+local codec = dofile('scripts/core/share/xhttp_codec.lua')
+local router = dofile('scripts/core/share/xhttp_router.lua')
 
 local M = {}
 
