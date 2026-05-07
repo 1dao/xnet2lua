@@ -1,7 +1,7 @@
 -- xhttp_worker.lua - worker-side HTTP connection dispatcher.
 -- HTTP parsing and response serialization live in shared Lua modules.
 
-local codec = dofile('demo/xhttp_codec.lua')
+local codec = dofile('scripts/core/share/xhttp_codec.lua')
 
 local app = nil
 local app_script = nil

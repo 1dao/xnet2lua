@@ -1,7 +1,7 @@
 -- xpac_app.lua - PAC domain management demo app.
 -- Edits ./proxy.pac from Lua through a small HTTP page.
 
-local router = dofile('demo/xhttp_router.lua')
+local router = dofile('scripts/core/share/xhttp_router.lua')
 local xutils = require('xutils')
 
 local M = {}

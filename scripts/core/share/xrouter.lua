@@ -4,35 +4,35 @@
 -- with a single unified registration API.
 --
 -- Design choice: only one `register(pt, h)`. The registration site does NOT
--- know — and should not need to know — whether the caller will reach this pt
+-- know 閳?and should not need to know 閳?whether the caller will reach this pt
 -- via POST (`xthread.post`) or RPC (`xthread.rpc`). That decision belongs to
 -- the caller. Dispatch handles both shapes:
 --
---   * Caller used POST → handler runs in a coroutine; return values are
+--   * Caller used POST 閳?handler runs in a coroutine; return values are
 --     discarded.
---   * Caller used RPC  → handler runs in a coroutine; return values become
+--   * Caller used RPC  閳?handler runs in a coroutine; return values become
 --     the reply `(ok=true, ret1, ret2, ...)`. A raised error becomes
 --     `(ok=false, errmsg)`. The handler may yield (e.g. RPC out via
---     xthread.rpc) — the reply is sent when the coroutine eventually returns.
+--     xthread.rpc) 閳?the reply is sent when the coroutine eventually returns.
 --
 -- The router is a SINGLETON per Lua state (mirrors xhttp_router): every
--- `dofile('demo/xrouter.lua')` in the same thread returns the SAME table, so
+-- `dofile('scripts/core/share/xrouter.lua')` in the same thread returns the SAME table, so
 -- registrations spread across many files all accumulate into one router.
 --
 -- Standard worker-script shape:
 --
---     local router = dofile('demo/xrouter.lua')
+--     local router = dofile('scripts/core/share/xrouter.lua')
 --     router.set_log_prefix('MYAPP')                    -- optional
 --
 --     router.register('hello', function(name) print('hi', name) end)
 --     router.register('add',   function(a, b) return a + b end)
---     dofile('demo/handlers/extra.lua')                 -- registers more on the same router
+--     dofile('scripts/core/share/handlers/extra.lua')     -- registers more on the same router
 --
 --     return {
 --         __init   = function() assert(xnet.init())     end,
 --         __update = function() xnet.poll(10)            end,
 --         __uninit = function() xnet.uninit()            end,
---         __thread_handle = router.handle,    -- ← only line that changes
+--         __thread_handle = router.handle,    -- 閳?only line that changes
 --     }
 --
 -- Reload model: re-running the worker script overwrites handlers in place on
@@ -59,7 +59,7 @@ M = {
     rpc_context      = {},   -- co -> req      (in-flight RPC requests)
     unknown_post     = nil,  -- function(pt, ...) when no handler matches a POST
     unknown_rpc      = nil,  -- function(reply_router, co_id, sk, pt, ...) for RPC misses
-    on_handler_error = nil,  -- function(pt, err) — POST-side coroutine top-level error
+    on_handler_error = nil,  -- function(pt, err) 閳?POST-side coroutine top-level error
 }
 rawset(_G, ROUTER_KEY, M)
 
@@ -67,10 +67,10 @@ local function log_err(fmt, ...)
     io.stderr:write(format_error(M.log_prefix, fmt, ...) .. '\n')
 end
 
--- ── Configuration ──────────────────────────────────────────────────────────
+-- 閳光偓閳光偓 Configuration 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
 -- Wipe ALL handlers and reset config. Useful for tests and explicit teardown.
--- For hot reload, you usually do NOT want this — just let re-running the
+-- For hot reload, you usually do NOT want this 閳?just let re-running the
 -- worker script overwrite handlers in place (in-flight rpc_context survives).
 function M.reset(opts)
     opts = opts or {}
@@ -103,7 +103,7 @@ function M.set_handler_error(fn)
     return M
 end
 
--- ── Registration ───────────────────────────────────────────────────────────
+-- 閳光偓閳光偓 Registration 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
 -- Register a handler for protocol `pt`. The handler signature is the same
 -- regardless of whether the caller dispatches via POST or RPC:
@@ -126,12 +126,11 @@ function M.current_request()
     return co and M.rpc_context[co] or nil
 end
 
--- ── Internals ──────────────────────────────────────────────────────────────
+-- 閳光偓閳光偓 Internals 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
 
 -- Resume the initial RPC coroutine. The reply itself is sent from inside
 -- the coroutine body (see dispatch_rpc) so that subsequent C-driven
--- `@async_resume` resumptions — which bypass this function entirely —
--- still cause a reply to be sent when the handler finally returns.
+-- `@async_resume` resumptions 閳?which bypass this function entirely 閳?-- still cause a reply to be sent when the handler finally returns.
 local function resume_rpc(req, ...)
     local ok, err = coroutine.resume(req.co, ...)
     if not ok then
@@ -207,14 +206,14 @@ local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
     }
     -- The coroutine body itself sends the reply on completion. This is
     -- required because nested xthread.rpc calls yield, and the C runtime
-    -- resumes us via `@async_resume` interception — bypassing our own
+    -- resumes us via `@async_resume` interception 閳?bypassing our own
     -- resume_rpc wrapper. So whatever sends the reply MUST live inside
     -- the coroutine, not around it.
     --
     -- Note we look up M.stubs[pt] OUTSIDE the coroutine; the captured `h`
     -- is the handler at registration time. If you re-register `pt`
     -- mid-call, in-flight invocations finish with the OLD handler and only
-    -- subsequent dispatches see the NEW one — this is the safe semantics.
+    -- subsequent dispatches see the NEW one 閳?this is the safe semantics.
     req.co = coroutine.create(function(...)
         local function call_handler(...) return h(...) end
         local rets = pack_values(pcall(call_handler, ...))

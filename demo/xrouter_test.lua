@@ -1,7 +1,7 @@
 -- demo/xrouter_test.lua - unit tests for xrouter.lua (singleton + unified register)
 -- Run via:  ./demo/xnet demo/xrouter_test.lua
 
-local router = dofile('demo/xrouter.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
 
 local fails = 0
 local function check(ok, msg)

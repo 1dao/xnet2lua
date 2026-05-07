@@ -1,5 +1,5 @@
 -- Regression test for xutils: load_config / get_config / scan_dir / json_*
--- Run: ./xnet.exe demo/xutils_test_main.lua
+-- Run: ./bin/xnet demo/xutils_main.lua
 -- Exits with code 0 on full pass, 1 on any failure.
 
 local xutils = require('xutils')
@@ -39,7 +39,7 @@ end
 head('load_config / get_config')
 
 -- Prepare a temp config file
-local cfg_path = 'demo/.xutils_test.cfg'
+local cfg_path = 'scripts/core/share/.xutils_test.cfg'
 do
     local f = assert(io.open(cfg_path, 'w'))
     f:write('FOO=hello\n')
@@ -60,7 +60,7 @@ eq('get_config missing => default',   xutils.get_config('NOPE', 'fallback'), 'fa
 eq('get_config missing default = false', xutils.get_config('NOPE', false), false)
 
 -- load_config of a missing file
-local bad_ok, bad_err = xutils.load_config('demo/.does_not_exist.cfg')
+local bad_ok, bad_err = xutils.load_config('scripts/core/share/.does_not_exist.cfg')
 ok('load_config missing => false', bad_ok == false)
 ok('load_config missing has err',  type(bad_err) == 'string')
 
@@ -85,7 +85,7 @@ for _, f in ipairs(files) do
 end
 ok('scan_dir contains index.html', saw_index)
 
-local nx, nx_err = xutils.scan_dir('demo/this_dir_does_not_exist_zzz')
+local nx, nx_err = xutils.scan_dir('scripts/core/share/this_dir_does_not_exist_zzz')
 ok('scan_dir missing => nil',     nx == nil)
 ok('scan_dir missing has err',    type(nx_err) == 'string')
 

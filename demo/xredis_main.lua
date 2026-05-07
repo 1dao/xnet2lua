@@ -2,10 +2,10 @@
 -- Main starts Redis service thread plus business workers in __init, and closes
 -- them in __uninit. Business workers issue Redis operations.
 
-local xredis = dofile('demo/xredis.lua')
+local xredis = dofile('scripts/core/server/xredis.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XREDIS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')

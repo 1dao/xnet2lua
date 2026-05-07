@@ -1,4 +1,4 @@
-/* demo/xnet_main.c - Generic Lua main runner for xnet/xthread demos.
+/* xnet_main.c - Generic Lua main runner for xnet/xthread demos.
 **
 ** xnet test mode:
 **   Build this file once into xnet.exe, then run any Lua test by passing the
@@ -17,7 +17,7 @@
 #include "xpoll.h"
 
 #define LUA_IMPL
-#include "../3rd/minilua.h"
+#include "3rd/minilua.h"
 
 #include <stdbool.h>
 #include <stdio.h>

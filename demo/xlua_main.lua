@@ -12,7 +12,7 @@ print('[MAIN] Current thread id = ' .. xthread.current_id())
 -- Cross-thread message dispatch is provided by xrouter (per-Lua-state
 -- singleton); the script keeps its usual return-table shape and just plugs
 -- router.handle into __thread_handle.
-local router = dofile('demo/xrouter.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('MAIN')
 
 -- Handler: reverse a string. Called back from COMPUTE via RPC, but the

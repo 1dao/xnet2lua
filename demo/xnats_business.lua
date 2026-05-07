@@ -1,7 +1,7 @@
 -- Business worker for the Lua xnats demo.
 -- NATS requests are routed to normal xthread protocol handlers.
 
-local xnats = dofile('demo/xnats.lua')
+local xnats = dofile('scripts/core/server/xnats.lua')
 
 local MAIN_ID = xthread.MAIN
 

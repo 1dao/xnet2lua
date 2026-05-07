@@ -1,8 +1,8 @@
 -- Business worker for the Lua xredis demo.
 -- Each business thread calls Redis through the shared XTHR_REDIS service thread.
 
-local xredis = dofile('demo/xredis.lua')
-local router = dofile('demo/xrouter.lua')
+local xredis = dofile('scripts/core/server/xredis.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('XREDIS-BIZ')
 
 local MAIN_ID = xthread.MAIN

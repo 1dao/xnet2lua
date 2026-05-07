@@ -1,10 +1,10 @@
 -- Main thread for the Lua xnats demo.
 -- Main starts one NATS service thread plus business workers in __init.
 
-local xnats = dofile('demo/xnats.lua')
+local xnats = dofile('scripts/core/server/xnats.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XNATS-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')

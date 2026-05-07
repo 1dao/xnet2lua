@@ -1,9 +1,9 @@
 -- xpac_main.lua - browser test entry for editing ./proxy.pac.
 
-local xhttp = dofile('demo/xhttp.lua')
+local xhttp = dofile('scripts/core/server/xhttp.lua')
 local xutils = require('xutils')
 
-local CONFIG_FILE = 'demo/xnet.cfg'
+local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
     io.stderr:write('[XPAC-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
