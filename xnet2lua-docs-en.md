@@ -1,4 +1,4 @@
-# xnet2lua Documentation
+﻿# xnet2lua Documentation
 
 Version: Based on [github.com/1dao/xnet2lua](https://github.com/1dao/xnet2lua)  
 Language: C (Core) + Lua (Scripting Layer)  
@@ -1722,3 +1722,74 @@ end
 
 - **Q: How to support more than 99 threads?**
   A: Change the `XTHR_MAX` macro in `xthread.h` and recompile. All code using xthread should be rebuilt.
+
+---
+
+## 17. xadmin Startup and Smoke Test
+
+### 17.1 Current behavior
+
+- xadmin HTTP APIs (`/api/peers`, `/api/stats`, `/api/exec`) are handled **locally in xadmin_worker**.
+- `/api/exec` performs direct `xnats.rpc(target, 'xadmin_remote_exec', script)` from worker (no main-thread relay).
+- Main thread keeps `xadmin_remote_exec` as the RPC callee; NATS workers include `MAIN + HTTP worker` so workers receive broadcast and RPC directly.
+
+### 17.2 Start NATS
+
+```powershell
+nats-server -p 4222
+```
+
+### 17.3 Build xnet (MSYS2/MinGW)
+
+```powershell
+$env:PATH = "C:\software\msys64\mingw64\bin;$env:PATH"
+make clean xnet
+```
+
+### 17.4 Start xadmin
+
+```powershell
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18090 XADMIN_HTTPS=0
+```
+
+### 17.5 API smoke test
+
+```powershell
+# 1) peers
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/peers" -Method Get
+
+# 2) stats
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/stats" -Method Get
+
+# 3) exec(self)
+$body = @{ target = "self"; script = "print('hello'); return 1+2" } | ConvertTo-Json -Compress
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+```
+
+Expected exec response:
+
+```json
+{
+  "ok": true,
+  "target": "xadmin1",
+  "stdout": "hello",
+  "result": "3"
+}
+```
+
+### 17.6 Two-node remote execution test
+
+Start a second node:
+
+```powershell
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin2 XADMIN_PORT=18091 XADMIN_HTTPS=0
+```
+
+Run remote script from `xadmin1`:
+
+```powershell
+$body = @{ target = "xadmin2"; script = "print('from xadmin2'); return 4+5" } | ConvertTo-Json -Compress
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+```
+
+Expected: `target == xadmin2` and correct `stdout/result`.

@@ -1,6 +1,6 @@
 -- xadmin_app.lua - HTTP routes for the xadmin console.
--- All long-running endpoints (peer query, script exec) return an async
--- marker that scripts/xadmin/xadmin_worker.lua hands off to the main thread.
+-- All long-running endpoints (peer query, stats, script exec) return an async
+-- marker that scripts/xadmin/xadmin_worker.lua completes locally.
 
 local router = dofile('scripts/core/share/xhttp_router.lua')
 local xutils = require('xutils')
@@ -69,9 +69,14 @@ M.router = router
 
 router.reg_path(STATIC_DIR, { index = 'index.html', index_route = '/' })
 
--- Peer list (async: main thread holds the live peer table).
+-- Peer list (async: worker-local peer cache).
 router.reg('get', '/api/peers', function()
     return { async = true, action = 'xadmin_query_peers', args = {} }
+end)
+
+-- Runtime thread stats (async: worker-local aggregation).
+router.reg('get', '/api/stats', function()
+    return { async = true, action = 'xadmin_query_stats', args = {} }
 end)
 
 -- Script execution. Body is JSON: { target = "self"|"name", script = "..." }.

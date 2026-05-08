@@ -11,7 +11,7 @@
     <aside class="sidebar">
         <div class="brand">
             <div class="brand-name">xadmin</div>
-            <div class="brand-sub" id="self-name">…</div>
+            <div class="brand-sub" id="self-name">...</div>
         </div>
         <nav class="menu">
             <button type="button" class="menu-item active" data-page="shell">
@@ -19,6 +19,9 @@
             </button>
             <button type="button" class="menu-item" data-page="peers">
                 <span class="menu-dot"></span>NATS 节点
+            </button>
+            <button type="button" class="menu-item" data-page="stats">
+                <span class="menu-dot"></span>Thread Stats
             </button>
             <button type="button" class="menu-item" data-page="about">
                 <span class="menu-dot"></span>关于
@@ -30,11 +33,10 @@
     </aside>
 
     <main class="content">
-        <!-- Page: shell -->
         <section class="page" data-page="shell" hidden>
             <header class="page-head">
                 <h1>执行 Lua 脚本</h1>
-                <div class="page-sub">脚本会在选中节点的 main 线程沙盒中运行；<code>print(...)</code> 会被捕获，返回值作为结果显示。</div>
+                <div class="page-sub">脚本会在目标节点 main 线程沙箱中运行；<code>print(...)</code> 会被捕获，返回值作为结果显示。</div>
             </header>
 
             <div class="toolbar">
@@ -59,7 +61,6 @@ return 1 + 1"></textarea>
             </div>
         </section>
 
-        <!-- Page: peers -->
         <section class="page" data-page="peers" hidden>
             <header class="page-head">
                 <h1>NATS 节点</h1>
@@ -67,12 +68,46 @@ return 1 + 1"></textarea>
             </header>
             <button type="button" id="refresh-peers-2" class="btn btn-ghost">↻ 刷新</button>
             <table class="peer-table">
-                <thead><tr><th>节点</th><th>角色</th><th>最近一次心跳 (ms)</th></tr></thead>
+                <thead><tr><th>节点</th><th>角色</th><th>最近一次心跳(ms)</th></tr></thead>
                 <tbody id="peer-rows"></tbody>
             </table>
         </section>
 
-        <!-- Page: about -->
+        <section class="page" data-page="stats" hidden>
+            <header class="page-head">
+                <h1>Thread Stats</h1>
+                <div class="page-sub">基于 <code>xthread.all_stats()</code> 的线程队列聚合视图。</div>
+            </header>
+            <div class="stats-toolbar">
+                <button type="button" id="refresh-stats" class="btn btn-ghost">↻ 刷新</button>
+                <span id="stats-at" class="stats-at"></span>
+            </div>
+            <div class="stats-cards">
+                <div class="stats-card">
+                    <div class="stats-k">Node</div>
+                    <div class="stats-v" id="stats-self">-</div>
+                </div>
+                <div class="stats-card">
+                    <div class="stats-k">Threads</div>
+                    <div class="stats-v" id="stats-thread-count">0</div>
+                </div>
+                <div class="stats-card">
+                    <div class="stats-k">Queue Depth Total</div>
+                    <div class="stats-v" id="stats-queue-total">0</div>
+                </div>
+                <div class="stats-card">
+                    <div class="stats-k">Queue Peak</div>
+                    <div class="stats-v" id="stats-queue-peak">0</div>
+                </div>
+            </div>
+            <table class="peer-table">
+                <thead>
+                    <tr><th>Thread ID</th><th>Name</th><th>Queue Depth</th><th>Queue Max</th></tr>
+                </thead>
+                <tbody id="stats-rows"></tbody>
+            </table>
+        </section>
+
         <section class="page" data-page="about" hidden>
             <header class="page-head">
                 <h1>关于 xadmin</h1>
@@ -80,7 +115,7 @@ return 1 + 1"></textarea>
             <p>xadmin 是基于 xnet2lua 的轻量管理控制台，通过 NATS 在多个 <code>SERVER_NAME</code> 进程间路由脚本执行。</p>
             <ul>
                 <li>启动：<code>bin/xnet scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1</code></li>
-                <li>认证：在 <code>xnet.cfg</code> 设置 <code>XADMIN_TOKEN=…</code> 后所有 <code>/api/exec</code> 必须带 <code>X-Xadmin-Token</code> 头</li>
+                <li>认证：在 <code>xnet.cfg</code> 设置 <code>XADMIN_TOKEN=...</code> 后所有 <code>/api/exec</code> 必须带 <code>X-Xadmin-Token</code> 头</li>
                 <li>禁止远程执行某节点：在该进程不启用 xadmin 即可（不会注册 <code>xadmin_remote_exec</code>）</li>
             </ul>
         </section>

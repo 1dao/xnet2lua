@@ -1,4 +1,4 @@
-# xnet2lua 使用文档
+﻿# xnet2lua 使用文档
 
 > 版本：基于 [github.com/1dao/xnet2lua](https://github.com/1dao/xnet2lua)  
 > 语言：C（核心） + Lua（脚本层）  
@@ -1760,3 +1760,74 @@ A: 确认安装了 MSVC 或 MinGW，Makefile 会自动检测平台并链接 `ws2
 
 **Q: 如何支持超过 99 个线程？**  
 A: 修改 `xthread.h` 中的 `XTHR_MAX` 宏并重新编译。注意修改后所有使用 xthread 的代码都需要重编。
+
+---
+
+## 17. xadmin 启动与测试（NATS smoke test）
+
+### 17.1 实现说明（当前版本）
+
+- xadmin 的 HTTP API：`/api/peers`、`/api/stats`、`/api/exec` 已改为 **worker 本地处理**。
+- `/api/exec` 在 worker 内直接调用 `xnats.rpc(target, 'xadmin_remote_exec', script)`，不再通过 main 线程中转。
+- main 线程保留 `xadmin_remote_exec` 作为被调端；NATS workers 包含 `MAIN + HTTP worker`，确保 worker 可直接收广播与 RPC。
+
+### 17.2 启动 NATS
+
+```powershell
+nats-server -p 4222
+```
+
+### 17.3 构建 xnet（MSYS2/MinGW）
+
+```powershell
+$env:PATH = "C:\software\msys64\mingw64\bin;$env:PATH"
+make clean xnet
+```
+
+### 17.4 启动 xadmin
+
+```powershell
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18090 XADMIN_HTTPS=0
+```
+
+### 17.5 API smoke test
+
+```powershell
+# 1) peers
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/peers" -Method Get
+
+# 2) stats
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/stats" -Method Get
+
+# 3) exec(self)
+$body = @{ target = "self"; script = "print('hello'); return 1+2" } | ConvertTo-Json -Compress
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+```
+
+预期 `exec` 返回：
+
+```json
+{
+  "ok": true,
+  "target": "xadmin1",
+  "stdout": "hello",
+  "result": "3"
+}
+```
+
+### 17.6 双节点远程执行测试
+
+启动第二个节点：
+
+```powershell
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin2 XADMIN_PORT=18091 XADMIN_HTTPS=0
+```
+
+在 `xadmin1` 发起远程执行：
+
+```powershell
+$body = @{ target = "xadmin2"; script = "print('from xadmin2'); return 4+5" } | ConvertTo-Json -Compress
+Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+```
+
+期望 `target` 为 `xadmin2`，且返回正确的 `stdout/result`。

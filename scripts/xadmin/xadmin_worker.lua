@@ -1,14 +1,15 @@
--- xadmin_worker.lua - HTTP worker for the xadmin console.
+﻿-- xadmin_worker.lua - HTTP worker for the xadmin console.
 --
--- This is an extended version of scripts/core/server/xhttp_worker.lua: when an app handler
--- returns a table tagged `{ async = true, ... }` the worker stashes the
--- (conn, req) pair in a `pending` table, posts a request to xthread.MAIN,
--- and returns from on_packet without sending a response. When MAIN posts
--- the matching reply back (`xadmin_peers_reply` / `xadmin_exec_reply`), the
--- worker looks up the pending entry and writes the HTTP response then.
+-- Async HTTP actions are completed locally inside this worker:
+--   * xadmin_query_peers  -> local peer cache (fed by NATS broadcast)
+--   * xadmin_query_stats  -> local xthread.all_stats aggregation
+--   * xadmin_run_script   -> direct xnats.rpc(target, '@run_script', script)
 
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
 local router = dofile('scripts/core/share/xrouter.lua')
+local xnats = dofile('scripts/core/server/xnats.lua')
+local xutils = require('xutils')
+
 router.set_log_prefix('XADMIN-WORKER')
 router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
     local _ = reply_router
@@ -28,8 +29,14 @@ local tls_config = nil
 local connections = {}
 local pending = {}
 local next_id = 0
-local MAIN_ID = xthread.MAIN
-local unpack_args = table.unpack or unpack
+
+local SELF_NAME = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'xadmin1')
+local TOKEN_REQUIRED = xutils.get_config('XADMIN_TOKEN', '') ~= ''
+local PEER_TTL_MS = tonumber(xutils.get_config('XADMIN_PEER_TTL_MS', '15000')) or 15000
+
+local function pack_values(...)
+    return { n = select('#', ...), ... }
+end
 
 local function alloc_id()
     next_id = next_id + 1
@@ -37,6 +44,33 @@ local function alloc_id()
 end
 
 function xthread.register(pt, h) return router.register(pt, h) end
+
+local function now_ms()
+    if xtimer and xtimer.now_ms then
+        return xtimer.now_ms()
+    end
+    return math.floor(os.time() * 1000)
+end
+
+local peers = {}
+
+local function note_peer(name)
+    name = tostring(name or '')
+    if name == '' then return end
+    peers[name] = now_ms()
+end
+
+local function alive_peers()
+    local cutoff = now_ms() - PEER_TTL_MS
+    local out = {}
+    for name, last in pairs(peers) do
+        if last >= cutoff then
+            out[#out + 1] = { name = name, last_seen_ms = last }
+        end
+    end
+    table.sort(out, function(a, b) return a.name < b.name end)
+    return out
+end
 
 local function load_app(path)
     app_script = path
@@ -48,39 +82,6 @@ local function load_app(path)
     else
         error('xadmin app script must return a table or function')
     end
-end
-
--- Sync dispatch. Returns the response table, or returns nil after stashing
--- pending state and posting an async request to main.
-local function dispatch_request(req, conn, send_opts)
-    if not app or type(app.handle) ~= 'function' then
-        return { status = 500, body = 'xadmin app not loaded\n' }
-    end
-    local ok, resp = pcall(app.handle, req)
-    if not ok then
-        io.stderr:write('[XADMIN-WORKER] app error: ' .. tostring(resp) .. '\n')
-        return { status = 500, body = 'internal server error\n' }
-    end
-    if type(resp) ~= 'table' or not resp.async then
-        return resp
-    end
-
-    -- Async: keep conn alive, post to main, send response later.
-    local id = alloc_id()
-    pending[id] = { conn = conn, req = req, send_opts = send_opts }
-    local args = resp.args or {}
-    local n = #args
-    local ok2, perr
-    if n == 0 then
-        ok2, perr = xthread.post(MAIN_ID, resp.action, xthread.current_id(), id)
-    else
-        ok2, perr = xthread.post(MAIN_ID, resp.action, xthread.current_id(), id, unpack_args(args, 1, n))
-    end
-    if not ok2 then
-        pending[id] = nil
-        return { status = 500, body = 'main post failed: ' .. tostring(perr) .. '\n' }
-    end
-    return nil
 end
 
 local function send_pending(id, status, body, content_type)
@@ -98,22 +99,147 @@ local function send_pending(id, status, body, content_type)
     }, p.send_opts)
 end
 
-xthread.register('xadmin_peers_reply', function(id, json_body)
-    send_pending(id, 200, json_body or '{}', 'application/json; charset=utf-8')
-end)
+local function send_json_pending(id, status, payload)
+    local body, err = xutils.json_pack(payload)
+    if not body then
+        send_pending(id, 500, 'json pack failed: ' .. tostring(err), 'text/plain; charset=utf-8')
+        return
+    end
+    send_pending(id, status or 200, body, 'application/json; charset=utf-8')
+end
 
-xthread.register('xadmin_exec_reply', function(id, ok, target, stdout, result)
-    local payload, err = require('xutils').json_pack({
+local function send_exec_reply(id, ok, target, stdout, result)
+    send_json_pending(id, ok and 200 or 500, {
         ok = ok and true or false,
         target = target or '',
         stdout = stdout or '',
         result = result or '',
     })
-    if not payload then
-        payload = '{"ok":false,"target":"' .. tostring(target or '') ..
-                  '","stdout":"","result":"json pack failed: ' .. tostring(err) .. '"}'
+end
+
+local function action_query_peers(id)
+    send_json_pending(id, 200, {
+        self = SELF_NAME,
+        peers = alive_peers(),
+        token_required = TOKEN_REQUIRED,
+    })
+end
+
+local function action_query_stats(id)
+    local threads = xthread.all_stats()
+    local summary = {
+        thread_count = 0,
+        queue_depth_total = 0,
+        queue_max_total = 0,
+        peak_queue_depth = 0,
+        peak_queue_thread_id = 0,
+        peak_queue_thread_name = '',
+    }
+    if type(threads) ~= 'table' then threads = {} end
+    summary.thread_count = #threads
+    for _, st in ipairs(threads) do
+        local qd = tonumber(st.queue_depth) or 0
+        local qm = tonumber(st.queue_max) or 0
+        summary.queue_depth_total = summary.queue_depth_total + qd
+        summary.queue_max_total = summary.queue_max_total + qm
+        if qd > summary.peak_queue_depth then
+            summary.peak_queue_depth = qd
+            summary.peak_queue_thread_id = tonumber(st.id) or 0
+            summary.peak_queue_thread_name = tostring(st.name or '')
+        end
     end
-    send_pending(id, ok and 200 or 500, payload, 'application/json; charset=utf-8')
+
+    send_json_pending(id, 200, {
+        self = SELF_NAME,
+        at_ms = now_ms(),
+        peers = alive_peers(),
+        threads = threads,
+        summary = summary,
+        token_required = TOKEN_REQUIRED,
+    })
+end
+
+local function action_run_script(id, target, script)
+    target = tostring(target or '')
+    script = tostring(script or '')
+    if target == '' or target == 'self' then
+        target = SELF_NAME
+    end
+
+    local co = coroutine.create(function()
+        local rets = pack_values(xnats.rpc(target, '@run_script', script))
+        local rpc_ok = rets[1]
+        if not rpc_ok then
+            send_exec_reply(id, false, target, '', 'rpc failed: ' .. tostring(rets[2]))
+            return
+        end
+
+        local i = 2
+        local last_bool = nil
+        while i <= rets.n and type(rets[i]) == 'boolean' do
+            last_bool = rets[i]
+            i = i + 1
+        end
+        local exec_ok = (last_bool ~= nil) and (last_bool and true or false) or true
+        local exec_stdout = rets[i]
+        local exec_result = rets[i + 1]
+        send_exec_reply(id, exec_ok, target, exec_stdout or '', exec_result or '')
+    end)
+
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        send_exec_reply(id, false, target, '', 'worker exec coroutine failed: ' .. tostring(err))
+    end
+end
+
+local function dispatch_request(req, conn, send_opts)
+    if not app or type(app.handle) ~= 'function' then
+        return { status = 500, body = 'xadmin app not loaded\n' }
+    end
+
+    local ok, resp = pcall(app.handle, req)
+    if not ok then
+        io.stderr:write('[XADMIN-WORKER] app error: ' .. tostring(resp) .. '\n')
+        return { status = 500, body = 'internal server error\n' }
+    end
+    if type(resp) ~= 'table' or not resp.async then
+        return resp
+    end
+
+    local id = alloc_id()
+    pending[id] = { conn = conn, req = req, send_opts = send_opts }
+    local args = resp.args or {}
+
+    if resp.action == 'xadmin_query_peers' then
+        action_query_peers(id)
+        return nil
+    end
+    if resp.action == 'xadmin_query_stats' then
+        action_query_stats(id)
+        return nil
+    end
+    if resp.action == 'xadmin_run_script' then
+        action_run_script(id, args[1], args[2])
+        return nil
+    end
+
+    pending[id] = nil
+    return { status = 400, body = 'unknown async action: ' .. tostring(resp.action) .. '\n' }
+end
+
+xthread.register('xadmin_announce', function(name)
+    if name and name ~= SELF_NAME then
+        note_peer(name)
+    end
+end)
+
+-- Backward-compatible alias for callers still using xadmin_remote_exec.
+xthread.register('xadmin_remote_exec', function(src)
+    local h = router.stubs['@run_script']
+    if type(h) ~= 'function' then
+        return false, '', '@run_script builtin not available'
+    end
+    return h(tostring(src or ''))
 end)
 
 local server_handler = {}
@@ -154,8 +280,7 @@ end
 
 function server_handler.on_close(conn, reason)
     connections[conn] = nil
-    -- Drop any pending entries that referenced this conn so replies don't
-    -- crash on a closed fd.
+    local _ = reason
     for id, p in pairs(pending) do
         if p.conn == conn then pending[id] = nil end
     end

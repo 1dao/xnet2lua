@@ -127,3 +127,45 @@ code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size
 }
 .peer-table th { background: var(--band); font-weight: 600; color: var(--muted); }
 .peer-table td.role-self { color: var(--blue); font-weight: 600; }
+
+/* ---- stats panel ---- */
+.stats-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+.stats-at {
+    color: var(--muted);
+    font-size: 12px;
+}
+.stats-cards {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+.stats-card {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+.stats-k {
+    color: var(--muted);
+    font-size: 12px;
+    margin-bottom: 4px;
+}
+.stats-v {
+    font-size: 20px;
+    line-height: 1.2;
+    font-weight: 700;
+    color: var(--text);
+    word-break: break-all;
+}
+
+@media (max-width: 960px) {
+    .stats-cards {
+        grid-template-columns: repeat(2, minmax(140px, 1fr));
+    }
+}
