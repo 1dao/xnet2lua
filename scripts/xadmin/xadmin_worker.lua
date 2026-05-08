@@ -1,6 +1,6 @@
 -- xadmin_worker.lua - HTTP worker for the xadmin console.
 --
--- This is an extended version of demo/xhttp_worker.lua: when an app handler
+-- This is an extended version of scripts/core/server/xhttp_worker.lua: when an app handler
 -- returns a table tagged `{ async = true, ... }` the worker stashes the
 -- (conn, req) pair in a `pending` table, posts a request to xthread.MAIN,
 -- and returns from on_packet without sending a response. When MAIN posts

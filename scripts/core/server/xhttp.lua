@@ -4,8 +4,8 @@
 
 local M = {}
 
-local DEFAULT_WORKER_SCRIPT = 'demo/xhttp_worker.lua'
-local DEFAULT_APP_SCRIPT = 'demo/xhttp_app.lua'
+local DEFAULT_WORKER_SCRIPT = 'scripts/core/server/xhttp_worker.lua'
+local DEFAULT_APP_SCRIPT = 'scripts/core/server/xhttp_app.lua'
 
 local running = false
 local listener = nil

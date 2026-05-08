@@ -1,10 +1,10 @@
 -- Business-side MySQL API.
--- MySQL I/O lives in demo/xmysql_worker.lua and uses xnet/xchannel raw mode.
+-- MySQL I/O lives in scripts/core/server/xmysql_worker.lua and uses xnet/xchannel raw mode.
 
 local M = {}
 
 local MYSQL_ID = xthread.MYSQL
-local DEFAULT_SCRIPT = 'demo/xmysql_worker.lua'
+local DEFAULT_SCRIPT = 'scripts/core/server/xmysql_worker.lua'
 
 local running = false
 

@@ -187,7 +187,7 @@ luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
 > 💡 **业务代码注意**：Lua 5.4 的位运算符 `& | ~ << >>` 在 LuaJIT (5.1) 下会**语法错误**。
 > 想同时兼容两个后端，请改用 `bit` 库（LuaJIT 自带 `bit.band` / `bit.bxor` / `bit.lshift` / ...）。
-> `demo/xmysql_worker.lua` 的 SHA-1 / SHA-256 实现给出了一份完整的 fallback 模板（在
+> `scripts/core/server/xmysql_worker.lua` 的 SHA-1 / SHA-256 实现给出了一份完整的 fallback 模板（在
 > 检测不到 `bit`/`bit32` 时回退到纯 Lua 位运算），可直接参考。
 
 ### 2.6 嵌入式集成
@@ -925,8 +925,8 @@ local ok, err = xhttp.start({
 | `key_password` | string | "" | 私钥密码（可选） |
 | `worker_count` | number | 2 | worker 线程数量 |
 | `worker_base` | number | xthread.WORKER_GRP3 | worker 线程起始 ID |
-| `worker_script` | string | "demo/xhttp_worker.lua" | worker 脚本路径 |
-| `app_script` | string | "demo/xhttp_app.lua" | 应用路由脚本路径 |
+| `worker_script` | string | "scripts/core/server/xhttp_worker.lua" | worker 脚本路径 |
+| `app_script` | string | "scripts/core/server/xhttp_app.lua" | 应用路由脚本路径 |
 | `max_request_size` | number | 16MB | 最大请求体大小（字节）|
 
 ### 8.2 编写应用路由（app_script）
