@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>xadmin · xnet 管理控制台</title>
+<link rel="stylesheet" href="app.css" />
+</head>
+<body>
+<div class="layout">
+    <aside class="sidebar">
+        <div class="brand">
+            <div class="brand-name">xadmin</div>
+            <div class="brand-sub" id="self-name">…</div>
+        </div>
+        <nav class="menu">
+            <button type="button" class="menu-item active" data-page="shell">
+                <span class="menu-dot"></span>执行脚本
+            </button>
+            <button type="button" class="menu-item" data-page="peers">
+                <span class="menu-dot"></span>NATS 节点
+            </button>
+            <button type="button" class="menu-item" data-page="about">
+                <span class="menu-dot"></span>关于
+            </button>
+        </nav>
+        <div class="sidebar-foot">
+            <span id="auth-state">无认证</span>
+        </div>
+    </aside>
+
+    <main class="content">
+        <!-- Page: shell -->
+        <section class="page" data-page="shell" hidden>
+            <header class="page-head">
+                <h1>执行 Lua 脚本</h1>
+                <div class="page-sub">脚本会在选中节点的 main 线程沙盒中运行；<code>print(...)</code> 会被捕获，返回值作为结果显示。</div>
+            </header>
+
+            <div class="toolbar">
+                <label class="toolbar-label" for="target">目标节点</label>
+                <select id="target" class="toolbar-select"></select>
+                <button type="button" id="refresh-peers" class="btn btn-ghost" title="刷新节点列表">↻</button>
+                <span class="spacer"></span>
+                <button type="button" id="run-script" class="btn btn-primary">▶ 执行</button>
+            </div>
+
+            <textarea id="script" class="script-input" spellcheck="false"
+                placeholder="-- 在此输入 Lua 脚本，按 Ctrl+Enter 执行
+print('hello from', SERVER_NAME or 'unknown')
+return 1 + 1"></textarea>
+
+            <div class="output">
+                <div class="output-head">
+                    <span>输出</span>
+                    <span id="run-meta" class="output-meta"></span>
+                </div>
+                <pre id="output" class="output-body">（尚未执行）</pre>
+            </div>
+        </section>
+
+        <!-- Page: peers -->
+        <section class="page" data-page="peers" hidden>
+            <header class="page-head">
+                <h1>NATS 节点</h1>
+                <div class="page-sub">每个 xadmin 实例每 5 秒向 NATS 广播一次 <code>xadmin_announce</code>，超过 15 秒未见即视为掉线。</div>
+            </header>
+            <button type="button" id="refresh-peers-2" class="btn btn-ghost">↻ 刷新</button>
+            <table class="peer-table">
+                <thead><tr><th>节点</th><th>角色</th><th>最近一次心跳 (ms)</th></tr></thead>
+                <tbody id="peer-rows"></tbody>
+            </table>
+        </section>
+
+        <!-- Page: about -->
+        <section class="page" data-page="about" hidden>
+            <header class="page-head">
+                <h1>关于 xadmin</h1>
+            </header>
+            <p>xadmin 是基于 xnet2lua 的轻量管理控制台，通过 NATS 在多个 <code>SERVER_NAME</code> 进程间路由脚本执行。</p>
+            <ul>
+                <li>启动：<code>bin/xnet scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1</code></li>
+                <li>认证：在 <code>xnet.cfg</code> 设置 <code>XADMIN_TOKEN=…</code> 后所有 <code>/api/exec</code> 必须带 <code>X-Xadmin-Token</code> 头</li>
+                <li>禁止远程执行某节点：在该进程不启用 xadmin 即可（不会注册 <code>xadmin_remote_exec</code>）</li>
+            </ul>
+        </section>
+    </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>

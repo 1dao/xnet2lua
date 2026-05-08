@@ -71,7 +71,7 @@ os.remove(cfg_path)
 -- ============================================================================
 head('scan_dir')
 
-local files, scan_err = xutils.scan_dir('demo/static/xpac')
+local files, scan_err = xutils.scan_dir('scripts/xpac/static')
 ok('scan_dir returns a table', type(files) == 'table', tostring(scan_err))
 ok('scan_dir at least 1 file',  #files >= 1)
 

@@ -18,7 +18,7 @@ local function to_bool(v, default)
 end
 
 local PAC_FILE = xutils.get_config('PAC_FILE', 'proxy.pac')
-local STATIC_DIR = xutils.get_config('PAC_STATIC_DIR', 'demo/static/xpac')
+local STATIC_DIR = xutils.get_config('PAC_STATIC_DIR', 'scripts/xpac/static')
 local WEB_SCHEME = to_bool(xutils.get_config('HTTPS_ENABLE', '1'), true) and 'https' or 'http'
 local HTTP_PROXY_HOST = xutils.get_config('PAC_HTTP_PROXY_HOST', '127.0.0.1')
 local HTTP_PROXY_PORT = tonumber(xutils.get_config('PAC_HTTP_PROXY_PORT', '7890')) or 7890
