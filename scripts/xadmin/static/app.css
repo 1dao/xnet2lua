@@ -1,0 +1,129 @@
+:root {
+    color-scheme: light;
+    --text: #19324a;
+    --muted: #5b6b7c;
+    --line: #dfe4ea;
+    --band: #f4f7fa;
+    --bg: #f0f2f5;
+    --blue: #2386d8;
+    --blue-d: #1968a6;
+    --green: #24b35b;
+    --red: #e94b3c;
+    --orange: #d97a1a;
+    --code-bg: #1f2937;
+    --code-fg: #e5e7eb;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+    margin: 0;
+    font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+}
+code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size: 0.95em; }
+
+.layout { display: flex; min-height: 100vh; }
+
+/* ---- sidebar ---- */
+.sidebar {
+    width: 220px;
+    background: #fff;
+    border-right: 1px solid var(--line);
+    display: flex;
+    flex-direction: column;
+    padding: 22px 0 12px;
+}
+.brand { padding: 0 20px 20px; border-bottom: 1px solid var(--line); }
+.brand-name { font-size: 22px; font-weight: 700; letter-spacing: 1px; }
+.brand-sub { font-size: 13px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+.menu { flex: 1; padding: 12px 8px; display: flex; flex-direction: column; gap: 2px; }
+.menu-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px;
+    background: transparent; border: 0;
+    color: var(--text); font: inherit; text-align: left;
+    border-radius: 6px; cursor: pointer;
+}
+.menu-item:hover { background: var(--band); }
+.menu-item.active { background: rgba(35,134,216,0.12); color: var(--blue-d); font-weight: 600; }
+.menu-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--blue); opacity: 0.6; }
+.menu-item.active .menu-dot { opacity: 1; }
+.sidebar-foot { padding: 12px 20px 0; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); }
+
+/* ---- content ---- */
+.content {
+    flex: 1; padding: 28px 36px; max-width: 1200px;
+}
+.page-head h1 { margin: 0 0 4px; font-size: 24px; }
+.page-sub { color: var(--muted); margin-bottom: 18px; font-size: 14px; }
+
+/* ---- toolbar ---- */
+.toolbar {
+    display: flex; align-items: center; gap: 10px;
+    background: #fff;
+    padding: 10px 14px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    margin-bottom: 12px;
+}
+.toolbar-label { color: var(--muted); font-size: 13px; }
+.toolbar-select {
+    height: 32px; padding: 0 10px;
+    border: 1px solid var(--line); border-radius: 4px; background: #fff;
+    color: var(--text); min-width: 180px;
+}
+.spacer { flex: 1; }
+.btn {
+    height: 32px; padding: 0 14px;
+    border-radius: 4px; border: 1px solid var(--line);
+    background: #fff; color: var(--text);
+    font: inherit; cursor: pointer; line-height: 30px;
+}
+.btn:hover { background: var(--band); }
+.btn-primary { background: var(--blue); color: #fff; border-color: var(--blue); font-weight: 600; }
+.btn-primary:hover { background: var(--blue-d); border-color: var(--blue-d); }
+.btn-ghost { background: transparent; color: var(--muted); }
+
+/* ---- script editor ---- */
+.script-input {
+    width: 100%; min-height: 240px;
+    padding: 12px 14px;
+    background: #fff;
+    border: 1px solid var(--line); border-radius: 8px;
+    font-family: "Cascadia Mono", "Fira Code", Consolas, monospace;
+    font-size: 13px; line-height: 1.5;
+    color: var(--text);
+    resize: vertical;
+}
+.script-input:focus { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+
+/* ---- output ---- */
+.output { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.output-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 14px;
+    background: var(--band);
+    border-bottom: 1px solid var(--line);
+    font-size: 13px; color: var(--muted);
+}
+.output-meta { font-family: "Cascadia Mono", monospace; font-size: 12px; }
+.output-meta.ok { color: var(--green); }
+.output-meta.err { color: var(--red); }
+.output-body {
+    margin: 0; padding: 14px;
+    background: var(--code-bg);
+    color: var(--code-fg);
+    font-family: "Cascadia Mono", "Fira Code", Consolas, monospace;
+    font-size: 13px; line-height: 1.55;
+    white-space: pre-wrap; word-wrap: break-word;
+    min-height: 80px;
+}
+
+/* ---- peer table ---- */
+.peer-table { width: 100%; border-collapse: collapse; margin-top: 12px; background: #fff; }
+.peer-table th, .peer-table td {
+    padding: 10px 14px; border-bottom: 1px solid var(--line); text-align: left;
+}
+.peer-table th { background: var(--band); font-weight: 600; color: var(--muted); }
+.peer-table td.role-self { color: var(--blue); font-weight: 600; }

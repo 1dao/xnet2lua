@@ -64,7 +64,10 @@ local function resume_rpc(req, ...)
 end
 
 local function fail_request(req, err)
-    if req then
+    if not req then return end
+    -- Only RPC / yielding-publish requests carry a coroutine. Fire-and-forget
+    -- publishes have no req.co, so resuming would crash inside coroutine.resume.
+    if req.co then
         resume_rpc(req, false, err)
     end
 end
@@ -389,8 +392,18 @@ flush_waiting = function()
         local req = table.remove(waitq, 1)
         local ok, state = send_request(req)
         if not ok then
-            fail_request(req, state)
-        elseif req.kind == 'publish' and state == 'sent' then
+            -- Only the path that originated from a yielding coroutine needs to be
+            -- resumed; pure fire-and-forget publishes (xthread.post -> xnats_publish
+            -- without an active rpc_context entry) have no req.co and must be
+            -- silently dropped on error.
+            if req.co then
+                fail_request(req, state)
+            else
+                io.stderr:write('[XNATS-WORKER] queued publish failed: ' .. tostring(state) .. '\n')
+            end
+        elseif req.kind == 'publish' and state == 'sent' and req.co then
+            -- Same guard: only resume when there is a coroutine waiting on the
+            -- yield in xnats_publish's queued path.
             resume_rpc(req, true)
         end
     end
