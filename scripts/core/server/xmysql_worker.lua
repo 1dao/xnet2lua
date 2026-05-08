@@ -2,6 +2,8 @@
 -- Uses xnet/xchannel raw mode and implements the MySQL protocol in Lua.
 
 local unpack_args = table.unpack or unpack
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XMYSQL-WORKER')
 
 local config = {
     host = '127.0.0.1',
@@ -19,37 +21,15 @@ local conns = {}
 local waitq = {}
 local rr = 1
 local stopping = false
-local rpc_context = {}
+function xthread.register(pt, h) return router.register(pt, h) end
 
-_stubs = {}
-_thread_replys = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function pack_values(...)
-    return { n = select('#', ...), ... }
-end
-
-local function resume_rpc(req, ...)
-    local results = pack_values(coroutine.resume(req.co, ...))
-    local resumed = results[1]
-    if not resumed then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, false, results[2])
-        return
-    end
-
-    if coroutine.status(req.co) == 'dead' then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, unpack_args(results, 2, results.n))
-    end
+local function resume_request(req, ...)
+    return router.resume_request(req, ...)
 end
 
 local function fail_request(req, err)
     if req then
-        resume_rpc(req, false, err)
+        resume_request(req, false, err)
     end
 end
 
@@ -723,7 +703,7 @@ local function complete_request(c, ok, result)
     if not req then
         return
     end
-    resume_rpc(req, ok, result)
+    resume_request(req, ok, result)
     flush_waiting()
 end
 
@@ -996,8 +976,7 @@ xthread.register('xmysql_stop', function(silent)
 end)
 
 xthread.register('xmysql_query', function(sql)
-    local co = coroutine.running()
-    local req = rpc_context[co]
+    local req = router.current_request()
     if not req then
         return false, 'xmysql rpc context missing'
     end
@@ -1006,49 +985,6 @@ xthread.register('xmysql_query', function(sql)
     enqueue(req)
     return coroutine.yield()
 end)
-
-local function dispatch_post(k1, k2, ...)
-    local h = _stubs[k1]
-    if h then
-        h(k2, ...)
-    elseif k1 then
-        io.stderr:write('[XMYSQL-WORKER] no post handler: ' .. tostring(k1) .. '\n')
-    end
-end
-
-local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
-    local reply = _thread_replys[reply_router]
-    if not reply then
-        io.stderr:write('[XMYSQL-WORKER] missing reply router: ' .. tostring(reply_router) .. '\n')
-        return
-    end
-
-    local h = _stubs[pt]
-    if not h then
-        reply(co_id, sk, pt, false, 'xmysql handler not found: ' .. tostring(pt))
-        return
-    end
-
-    local req = {
-        co_id = co_id,
-        sk = sk,
-        pt = pt,
-        reply = reply,
-        co = coroutine.create(function(...)
-            return h(...)
-        end),
-    }
-    rpc_context[req.co] = req
-    resume_rpc(req, ...)
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        dispatch_rpc(reply_router, k1, k2, k3, ...)
-    else
-        dispatch_post(k1, k2, k3, ...)
-    end
-end
 
 local function __init()
     print('[XMYSQL-WORKER] init')
@@ -1077,5 +1013,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

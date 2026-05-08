@@ -2,6 +2,8 @@
 -- Uses xnet/xchannel raw mode so RESP bulk strings remain binary-safe.
 
 local unpack_args = table.unpack or unpack
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XREDIS-WORKER')
 
 local config = {
     host = '127.0.0.1',
@@ -16,32 +18,10 @@ local conns = {}
 local waitq = {}
 local rr = 1
 local stopping = false
-local rpc_context = {}
+function xthread.register(pt, h) return router.register(pt, h) end
 
-_stubs = {}
-_thread_replys = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function pack_values(...)
-    return { n = select('#', ...), ... }
-end
-
-local function resume_rpc(req, ...)
-    local results = pack_values(coroutine.resume(req.co, ...))
-    local resumed = results[1]
-    if not resumed then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, false, results[2])
-        return
-    end
-
-    if coroutine.status(req.co) == 'dead' then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, unpack_args(results, 2, results.n))
-    end
+local function resume_request(req, ...)
+    return router.resume_request(req, ...)
 end
 
 local function fail_request(req, err)
@@ -49,7 +29,7 @@ local function fail_request(req, err)
         if req.internal then
             req.internal(false, err)
         else
-            resume_rpc(req, false, err)
+            resume_request(req, false, err)
         end
     end
 end
@@ -315,7 +295,7 @@ local function connect_one(c)
             elseif req.internal then
                 req.internal(true, reply_to_lua(reply))
             else
-                resume_rpc(req, true, reply_to_lua(reply))
+                resume_request(req, true, reply_to_lua(reply))
             end
 
             pos = next_pos
@@ -396,8 +376,7 @@ xthread.register('xredis_stop', function()
 end)
 
 xthread.register('xredis_call', function(cmd, ...)
-    local co = coroutine.running()
-    local req = rpc_context[co]
+    local req = router.current_request()
     if not req then
         return false, 'xredis rpc context missing'
     end
@@ -405,49 +384,6 @@ xthread.register('xredis_call', function(cmd, ...)
     enqueue(req)
     return coroutine.yield()
 end)
-
-local function dispatch_post(k1, k2, ...)
-    local h = _stubs[k1]
-    if h then
-        h(k2, ...)
-    elseif k1 then
-        io.stderr:write('[XREDIS-WORKER] no post handler: ' .. tostring(k1) .. '\n')
-    end
-end
-
-local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
-    local reply = _thread_replys[reply_router]
-    if not reply then
-        io.stderr:write('[XREDIS-WORKER] missing reply router: ' .. tostring(reply_router) .. '\n')
-        return
-    end
-
-    local h = _stubs[pt]
-    if not h then
-        reply(co_id, sk, pt, false, 'xredis handler not found: ' .. tostring(pt))
-        return
-    end
-
-    local req = {
-        co_id = co_id,
-        sk = sk,
-        pt = pt,
-        reply = reply,
-        co = coroutine.create(function(...)
-            return h(...)
-        end),
-    }
-    rpc_context[req.co] = req
-    resume_rpc(req, ...)
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        dispatch_rpc(reply_router, k1, k2, k3, ...)
-    else
-        dispatch_post(k1, k2, k3, ...)
-    end
-end
 
 local function __init()
     print('[XREDIS-WORKER] init')
@@ -475,5 +411,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

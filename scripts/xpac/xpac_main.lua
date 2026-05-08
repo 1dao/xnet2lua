@@ -1,7 +1,20 @@
 -- xpac_main.lua - browser test entry for editing ./proxy.pac.
 
 local xhttp = dofile('scripts/core/server/xhttp.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
 local xutils = require('xutils')
+router.set_log_prefix('XPAC-MAIN')
+router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
+    local _ = reply_router
+    _ = co_id
+    _ = sk
+    _ = ...
+    io.stderr:write('[XPAC-MAIN] unexpected RPC message: ' .. tostring(pt) .. '\n')
+end)
+router.set_unknown_post(function(pt, ...)
+    local _ = ...
+    io.stderr:write('[XPAC-MAIN] no handler for pt=' .. tostring(pt) .. '\n')
+end)
 
 local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
@@ -29,26 +42,7 @@ end
 
 HTTPS = to_bool(xutils.get_config('HTTPS_ENABLE', '1'), true)
 
-_stubs = {}
-_thread_replys = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        io.stderr:write('[XPAC-MAIN] unexpected RPC message: ' .. tostring(k3) .. '\n')
-        return
-    end
-
-    local h = _stubs[k1]
-    if h then
-        h(k2, k3, ...)
-    elseif k1 then
-        io.stderr:write('[XPAC-MAIN] no handler for pt=' .. tostring(k1) .. '\n')
-    end
-end
+function xthread.register(pt, h) return router.register(pt, h) end
 
 local function __init()
     local scheme = HTTPS and 'https' or 'http'
@@ -88,5 +82,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

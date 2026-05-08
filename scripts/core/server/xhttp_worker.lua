@@ -2,6 +2,15 @@
 -- HTTP parsing and response serialization live in shared Lua modules.
 
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XHTTP-WORKER')
+router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
+    local _ = reply_router
+    _ = co_id
+    _ = sk
+    _ = ...
+    io.stderr:write('[XHTTP-WORKER] unexpected RPC message: ' .. tostring(pt) .. '\n')
+end)
 
 local app = nil
 local app_script = nil
@@ -11,26 +20,7 @@ local use_https = false
 local tls_config = nil
 local connections = {}
 
-_stubs = {}
-_thread_replys = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        io.stderr:write('[XHTTP-WORKER] unexpected RPC message: ' .. tostring(k3) .. '\n')
-        return
-    end
-
-    local h = _stubs[k1]
-    if h then
-        h(k2, k3, ...)
-    elseif k1 then
-        io.stderr:write('[XHTTP-WORKER] no handler for pt=' .. tostring(k1) .. '\n')
-    end
-end
+function xthread.register(pt, h) return router.register(pt, h) end
 
 local function load_app(path)
     app_script = path
@@ -180,5 +170,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

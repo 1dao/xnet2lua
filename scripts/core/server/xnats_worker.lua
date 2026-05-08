@@ -4,6 +4,8 @@
 
 local cmsgpack = require('cmsgpack')
 local unpack_args = table.unpack or unpack
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XNATS-WORKER')
 
 local MAGIC = 'xnats1'
 
@@ -35,32 +37,14 @@ local next_sid = 1
 local next_req_id = 1
 local rr_worker = 1
 local stopping = false
-local rpc_context = {}
-
-_stubs = {}
-_thread_replys = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
+function xthread.register(pt, h) return router.register(pt, h) end
 
 local function pack_values(...)
     return { n = select('#', ...), ... }
 end
 
-local function resume_rpc(req, ...)
-    local results = pack_values(coroutine.resume(req.co, ...))
-    local resumed = results[1]
-    if not resumed then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, false, results[2])
-        return
-    end
-
-    if coroutine.status(req.co) == 'dead' then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, unpack_args(results, 2, results.n))
-    end
+local function resume_request(req, ...)
+    return router.resume_request(req, ...)
 end
 
 local function fail_request(req, err)
@@ -68,7 +52,7 @@ local function fail_request(req, err)
     -- Only RPC / yielding-publish requests carry a coroutine. Fire-and-forget
     -- publishes have no req.co, so resuming would crash inside coroutine.resume.
     if req.co then
-        resume_rpc(req, false, err)
+        resume_request(req, false, err)
     end
 end
 
@@ -291,7 +275,7 @@ local function handle_reply_msg(msg, values)
 
     pending[req.reply_subject] = nil
     pending[tostring(req.req_id)] = nil
-    resume_rpc(req, values[4], unpack_args(values, 5, values.n))
+    resume_request(req, values[4], unpack_args(values, 5, values.n))
 end
 
 local function handle_msg(msg)
@@ -394,7 +378,7 @@ flush_waiting = function()
         if not ok then
             -- Only the path that originated from a yielding coroutine needs to be
             -- resumed; pure fire-and-forget publishes (xthread.post -> xnats_publish
-            -- without an active rpc_context entry) have no req.co and must be
+            -- without an active router request context) have no req.co and must be
             -- silently dropped on error.
             if req.co then
                 fail_request(req, state)
@@ -404,7 +388,7 @@ flush_waiting = function()
         elseif req.kind == 'publish' and state == 'sent' and req.co then
             -- Same guard: only resume when there is a coroutine waiting on the
             -- yield in xnats_publish's queued path.
-            resume_rpc(req, true)
+            resume_request(req, true)
         end
     end
 end
@@ -593,8 +577,7 @@ xthread.register('xnats_stop', function(silent)
 end)
 
 xthread.register('xnats_publish', function(pt, ...)
-    local co = coroutine.running()
-    local req = rpc_context[co]
+    local req = router.current_request()
     if not req then
         req = {
             kind = 'publish',
@@ -623,8 +606,7 @@ xthread.register('xnats_publish', function(pt, ...)
 end)
 
 xthread.register('xnats_rpc', function(target, pt, ...)
-    local co = coroutine.running()
-    local req = rpc_context[co]
+    local req = router.current_request()
     if not req then
         return false, 'xnats rpc context missing'
     end
@@ -640,49 +622,6 @@ xthread.register('xnats_rpc', function(target, pt, ...)
     end
     return coroutine.yield()
 end)
-
-local function dispatch_post(k1, k2, ...)
-    local h = _stubs[k1]
-    if h then
-        h(k2, ...)
-    elseif k1 then
-        io.stderr:write('[XNATS-WORKER] no post handler: ' .. tostring(k1) .. '\n')
-    end
-end
-
-local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
-    local reply = _thread_replys[reply_router]
-    if not reply then
-        io.stderr:write('[XNATS-WORKER] missing reply router: ' .. tostring(reply_router) .. '\n')
-        return
-    end
-
-    local h = _stubs[pt]
-    if not h then
-        reply(co_id, sk, pt, false, 'xnats handler not found: ' .. tostring(pt))
-        return
-    end
-
-    local req = {
-        co_id = co_id,
-        sk = sk,
-        pt = pt,
-        reply = reply,
-        co = coroutine.create(function(...)
-            return h(...)
-        end),
-    }
-    rpc_context[req.co] = req
-    resume_rpc(req, ...)
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        dispatch_rpc(reply_router, k1, k2, k3, ...)
-    else
-        dispatch_post(k1, k2, k3, ...)
-    end
-end
 
 local function __init()
     print('[XNATS-WORKER] init')
@@ -717,5 +656,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }

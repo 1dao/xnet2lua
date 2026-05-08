@@ -16,6 +16,8 @@
 local xnats = dofile('scripts/core/server/xnats.lua')
 local xhttp = dofile('scripts/core/server/xhttp.lua')
 local xutils = require('xutils')
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XADMIN-MAIN')
 
 local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
@@ -48,78 +50,10 @@ local KEY_PASSWORD = xutils.get_config('HTTPS_KEY_PASSWORD', '')
 local NATS_ID = xthread.NATS
 local MAIN_ID = xthread.MAIN
 
--- ---------------------------------------------------------------------------
--- Cross-thread plumbing (POST + RPC) -- copies xnats_business.lua's pattern so
--- this thread can serve NATS RPCs (xadmin_remote_exec) AND post-style
--- requests from xadmin_worker (xadmin_query_peers / xadmin_run_script).
--- ---------------------------------------------------------------------------
-
-_stubs = {}
-_thread_replys = {}
-
-local unpack_args = table.unpack or unpack
-local rpc_context = {}
-
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
+function xthread.register(pt, h) return router.register(pt, h) end
 
 local function pack_values(...)
     return { n = select('#', ...), ... }
-end
-
-local function resume_rpc(req, ...)
-    local results = pack_values(coroutine.resume(req.co, ...))
-    local resumed = results[1]
-    if not resumed then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, false, results[2])
-        return
-    end
-    if coroutine.status(req.co) == 'dead' then
-        rpc_context[req.co] = nil
-        req.reply(req.co_id, req.sk, req.pt, unpack_args(results, 2, results.n))
-    end
-end
-
-local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
-    local reply = _thread_replys[reply_router]
-    if not reply then
-        io.stderr:write('[XADMIN-MAIN] missing reply router: ' .. tostring(reply_router) .. '\n')
-        return
-    end
-    local h = _stubs[pt]
-    if not h then
-        reply(co_id, sk, pt, false, 'xadmin handler not found: ' .. tostring(pt))
-        return
-    end
-    local req = {
-        co_id = co_id, sk = sk, pt = pt, reply = reply,
-        co = coroutine.create(function(...) return h(...) end),
-    }
-    rpc_context[req.co] = req
-    resume_rpc(req, ...)
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        dispatch_rpc(reply_router, k1, k2, k3, ...)
-        return
-    end
-    local h = _stubs[k1]
-    if not h then
-        if k1 then
-            io.stderr:write('[XADMIN-MAIN] no post handler for pt=' .. tostring(k1) .. '\n')
-        end
-        return
-    end
-    -- POST handlers may xnats.rpc, so wrap them in a coroutine too.
-    local args = { n = select('#', ...) + 2, k2, k3, ... }
-    local co = coroutine.create(function() return h(unpack_args(args, 1, args.n)) end)
-    local ok, err = coroutine.resume(co)
-    if not ok then
-        io.stderr:write('[XADMIN-MAIN] post handler error: ' .. tostring(err) .. '\n')
-    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -319,7 +253,7 @@ end
 
 return {
     __init = __init,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
     __uninit = __uninit,
     __tick_ms = 10,
 }

@@ -146,6 +146,31 @@ local function resume_rpc(req, ...)
     end
 end
 
+-- Resume a previously yielded RPC request coroutine.
+-- Returns true on successful resume, or false + err when resume itself fails.
+-- Reply emission stays in the coroutine body assembled by dispatch_rpc.
+function M.resume_request(req, ...)
+    if type(req) ~= 'table' or type(req.co) ~= 'thread' then
+        return false, 'resume_request: invalid request'
+    end
+    local ok, err = coroutine.resume(req.co, ...)
+    if not ok then
+        M.rpc_context[req.co] = nil
+        if req.reply and req.co_id and req.pt then
+            req.reply(req.co_id, req.sk, req.pt, false, tostring(err))
+        end
+        return false, tostring(err)
+    end
+    if coroutine.status(req.co) == 'dead' then
+        M.rpc_context[req.co] = nil
+    end
+    return true
+end
+
+function M.fail_request(req, err)
+    return M.resume_request(req, false, err)
+end
+
 local function dispatch_post(k1, k2, k3, ...)
     local h = M.stubs[k1]
     if not h then

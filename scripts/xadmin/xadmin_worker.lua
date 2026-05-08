@@ -8,6 +8,15 @@
 -- worker looks up the pending entry and writes the HTTP response then.
 
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('XADMIN-WORKER')
+router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
+    local _ = reply_router
+    _ = co_id
+    _ = sk
+    _ = ...
+    io.stderr:write('[XADMIN-WORKER] unexpected RPC message: ' .. tostring(pt) .. '\n')
+end)
 
 local app = nil
 local app_script = nil
@@ -22,30 +31,12 @@ local next_id = 0
 local MAIN_ID = xthread.MAIN
 local unpack_args = table.unpack or unpack
 
-_stubs = {}
-_thread_replys = {}
-
 local function alloc_id()
     next_id = next_id + 1
     return next_id
 end
 
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
-
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        io.stderr:write('[XADMIN-WORKER] unexpected RPC message: ' .. tostring(k3) .. '\n')
-        return
-    end
-    local h = _stubs[k1]
-    if h then
-        h(k2, k3, ...)
-    elseif k1 then
-        io.stderr:write('[XADMIN-WORKER] no handler for pt=' .. tostring(k1) .. '\n')
-    end
-end
+function xthread.register(pt, h) return router.register(pt, h) end
 
 local function load_app(path)
     app_script = path
@@ -226,5 +217,5 @@ return {
     __init = __init,
     __update = __update,
     __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __thread_handle = router.handle,
 }
