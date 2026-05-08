@@ -1,10 +1,10 @@
 -- Business-side Redis API.
--- Redis I/O lives in demo/xredis_worker.lua and uses xnet/xchannel raw mode.
+-- Redis I/O lives in scripts/core/server/xredis_worker.lua and uses xnet/xchannel raw mode.
 
 local M = {}
 
 local REDIS_ID = xthread.REDIS
-local DEFAULT_SCRIPT = 'demo/xredis_worker.lua'
+local DEFAULT_SCRIPT = 'scripts/core/server/xredis_worker.lua'
 
 local running = false
 

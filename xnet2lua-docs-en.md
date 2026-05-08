@@ -213,7 +213,7 @@ module-name or signature changes.
 > 💡 **Note for application code**: Lua 5.4's bitwise operators `& | ~ << >>`
 > are a **syntax error** under LuaJIT (5.1). To stay portable across both
 > backends, use the `bit` library (LuaJIT bundles `bit.band` / `bit.bxor` /
-> `bit.lshift` / …). `demo/xmysql_worker.lua`'s SHA-1 / SHA-256 helpers are a
+> `bit.lshift` / …). `scripts/core/server/xmysql_worker.lua`'s SHA-1 / SHA-256 helpers are a
 > good template — they prefer `bit` / `bit32` if available and fall back to a
 > pure-Lua implementation otherwise.
 
@@ -888,8 +888,8 @@ local ok, err = xhttp.start({
 | key_password | string | "" | Private key password (optional) |
 | worker_count | number | 2 | Number of worker threads |
 | worker_base | number | xthread.WORKER_GRP3 | Starting worker thread ID |
-| worker_script | string | "demo/xhttp_worker.lua" | Worker script path |
-| app_script | string | "demo/xhttp_app.lua" | Application routing script path |
+| worker_script | string | "scripts/core/server/xhttp_worker.lua" | Worker script path |
+| app_script | string | "scripts/core/server/xhttp_app.lua" | Application routing script path |
 | max_request_size | number | 16MB | Maximum request body size (bytes) |
 
 ### 8.2 Writing the Application Router (app_script)

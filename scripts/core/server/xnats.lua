@@ -1,10 +1,10 @@
 -- Business-side NATS API.
--- NATS I/O lives in demo/xnats_worker.lua and uses xnet/xchannel raw mode.
+-- NATS I/O lives in scripts/core/server/xnats_worker.lua and uses xnet/xchannel raw mode.
 
 local M = {}
 
 local NATS_ID = xthread.NATS
-local DEFAULT_SCRIPT = 'demo/xnats_worker.lua'
+local DEFAULT_SCRIPT = 'scripts/core/server/xnats_worker.lua'
 
 local running = false
 
