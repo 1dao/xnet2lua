@@ -1,0 +1,85 @@
+-- xhttp_app.lua - demo HTTP application used by xhttp_main.lua.
+
+local codec = dofile('scripts/core/share/xhttp_codec.lua')
+local router = dofile('scripts/core/share/xhttp_router.lua')
+
+local M = {}
+
+local function text(status, body, headers)
+    headers = headers or {}
+    headers['Content-Type'] = headers['Content-Type'] or 'text/plain; charset=utf-8'
+    return { status = status, body = body, headers = headers }
+end
+
+router.reset({
+    not_found = function()
+        return text(404, 'not found\n')
+    end,
+})
+
+M.route = router.reg
+M.router = router
+
+router.reg('get', '/hello', function(req)
+    local name = req.query.name or 'xnet'
+    return text(200, 'hello ' .. tostring(name) .. '\n')
+end)
+
+router.reg('post', '/echo', function(req)
+    return text(200, req.body)
+end)
+
+router.reg('post', '/chunked', function(req)
+    return text(200, 'chunked:' .. req.body)
+end)
+
+router.reg('post', '/form', function(req)
+    local form = codec.form(req)
+    return text(200, string.format('form:%s:%s\n',
+        tostring(form.name or ''), tostring(form.kind or '')))
+end)
+
+router.reg('post', '/json', function(req)
+    local data, err = codec.json(req)
+    if not data then
+        return text(400, tostring(err) .. '\n')
+    end
+    return text(200, string.format('json:%s:%s:%s\n',
+        tostring((data and data.pt) or ''), tostring((data and data.arg1) or ''), tostring((data and data.ok) or '')))
+end)
+
+router.reg('post', '/multipart', function(req)
+    local mp, err = codec.multipart(req)
+    if not mp then
+        return text(400, tostring(err) .. '\n')
+    end
+    local upload = mp.files.upload
+    return text(200, string.format('multipart:%s:%s:%s\n',
+        tostring(mp.fields.name or ''),
+        tostring(upload and upload.filename or ''),
+        tostring(upload and upload.data or '')))
+end)
+
+router.reg('get', '/headers', function(req)
+    return text(200, tostring(req.headers['x-demo'] or '') .. '\n')
+end)
+
+router.reg('head', '/head', function()
+    return text(200, 'head-body-not-sent')
+end)
+
+-- Path-param demo: GET /api/user/:id  -> echoes the captured id.
+router.reg('get', '/api/user/:id', function(req)
+    return text(200, 'user_id=' .. tostring(req.params.id) .. '\n')
+end)
+
+-- Wildcard demo: GET /static/*path  -> echoes the captured tail.
+router.reg('get', '/static/*path', function(req)
+    return text(200, 'static=' .. tostring(req.params.path) .. '\n')
+end)
+
+function M.handle(req)
+    return router.handle(req)
+end
+
+return M
