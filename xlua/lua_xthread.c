@@ -804,6 +804,64 @@ static int l_current_id(lua_State* L) {
     return 1;
 }
 
+static int push_thread_stats(lua_State* L, int id) {
+    xThread* thr = xthread_get(id);
+    if (!thr) return 0;
+
+    lua_createtable(L, 0, 4);
+
+    lua_pushinteger(L, id);
+    lua_setfield(L, -2, "id");
+
+    {
+        const char* name = xthread_get_name(thr);
+        lua_pushstring(L, name ? name : "");
+        lua_setfield(L, -2, "name");
+    }
+
+    {
+        int qdepth = xthread_get_queue_depth(id);
+        lua_pushinteger(L, qdepth < 0 ? 0 : qdepth);
+        lua_setfield(L, -2, "queue_depth");
+    }
+
+    {
+        int qmax = xthread_get_queue_max(id);
+        lua_pushinteger(L, qmax < 0 ? 0 : qmax);
+        lua_setfield(L, -2, "queue_max");
+    }
+
+    return 1;
+}
+
+/* xthread.stats(id) -> table | nil, err */
+static int l_xthread_stats(lua_State* L) {
+    int id = (int)luaL_checkinteger(L, 1);
+    if (id <= 0 || id >= XTHR_MAX) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "xthread.stats: invalid thread id %d", id);
+        return 2;
+    }
+
+    if (!push_thread_stats(L, id)) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "xthread.stats: thread %d not found", id);
+        return 2;
+    }
+    return 1;
+}
+
+/* xthread.all_stats() -> { {id,name,queue_depth,queue_max}, ... } */
+static int l_xthread_all_stats(lua_State* L) {
+    int idx = 1;
+    lua_createtable(L, 0, 0);
+    for (int id = 1; id < XTHR_MAX; ++id) {
+        if (!push_thread_stats(L, id)) continue;
+        lua_rawseti(L, -2, idx++);
+    }
+    return 1;
+}
+
 /* ============================================================================
 ** New API - Dynamic thread creation from Lua
 ** ============================================================================ */
@@ -1164,6 +1222,8 @@ static const luaL_Reg xthread_funcs[] = {
     { "init",             l_xthread_init },
     { "post",             l_xthread_post },
     { "set_queue_max",    l_xthread_set_queue_max },
+    { "stats",            l_xthread_stats },
+    { "all_stats",        l_xthread_all_stats },
     { "rpc",              l_xthread_rpc },
     { "_rpc_timeout",     l_xthread_rpc_timeout },
     { "current_id",       l_current_id   },
