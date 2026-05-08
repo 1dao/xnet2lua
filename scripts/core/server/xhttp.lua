@@ -5,7 +5,6 @@
 local M = {}
 
 local DEFAULT_WORKER_SCRIPT = 'scripts/core/server/xhttp_worker.lua'
-local DEFAULT_APP_SCRIPT = 'scripts/core/server/xhttp_app.lua'
 
 local running = false
 local listener = nil
@@ -51,7 +50,7 @@ local function normalize_config(cfg)
         https = to_bool(cfg.https, false),
         server_name = cfg.server_name or cfg.name or 'xnet-http',
         worker_script = cfg.worker_script or DEFAULT_WORKER_SCRIPT,
-        app_script = cfg.app_script or DEFAULT_APP_SCRIPT,
+        app_script = cfg.app_script,
         cert_file = cfg.cert_file or cfg.cert or '',
         key_file = cfg.key_file or cfg.key or '',
         key_password = cfg.key_password or cfg.password or '',
@@ -86,6 +85,9 @@ function M.start(cfg)
     end
 
     local conf = normalize_config(cfg)
+    if type(conf.app_script) ~= 'string' or conf.app_script:match('^%s*$') then
+        return false, 'xhttp.start requires non-empty app_script'
+    end
     if conf.https and XNET_WITH_HTTPS == false then
         return false, 'HTTPS support is not compiled in; rebuild with WITH_HTTPS=1'
     end

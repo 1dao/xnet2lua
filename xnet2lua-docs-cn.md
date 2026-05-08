@@ -926,7 +926,7 @@ local ok, err = xhttp.start({
 | `worker_count` | number | 2 | worker 线程数量 |
 | `worker_base` | number | xthread.WORKER_GRP3 | worker 线程起始 ID |
 | `worker_script` | string | "scripts/core/server/xhttp_worker.lua" | worker 脚本路径 |
-| `app_script` | string | "scripts/core/server/xhttp_app.lua" | 应用路由脚本路径 |
+| `app_script` | string | （必填） | 应用路由脚本路径（例如 "demo/xhttp_app.lua"） |
 | `max_request_size` | number | 16MB | 最大请求体大小（字节）|
 
 ### 8.2 编写应用路由（app_script）

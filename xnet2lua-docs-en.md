@@ -889,7 +889,7 @@ local ok, err = xhttp.start({
 | worker_count | number | 2 | Number of worker threads |
 | worker_base | number | xthread.WORKER_GRP3 | Starting worker thread ID |
 | worker_script | string | "scripts/core/server/xhttp_worker.lua" | Worker script path |
-| app_script | string | "scripts/core/server/xhttp_app.lua" | Application routing script path |
+| app_script | string | (required) | Application routing script path (for example "demo/xhttp_app.lua") |
 | max_request_size | number | 16MB | Maximum request body size (bytes) |
 
 ### 8.2 Writing the Application Router (app_script)
