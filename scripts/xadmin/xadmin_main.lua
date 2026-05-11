@@ -104,6 +104,11 @@ local function __init()
     })
     if not ok then error(err) end
 
+    -- Push caller-side routing info to HTTP workers so xnats.rpc(SELF, ...)
+    -- on those threads short-circuits straight into the local business
+    -- worker without bouncing through the NATS thread.
+    xnats.bind_workers(xhttp.worker_ids())
+
     local function heartbeat()
         xnats.publish('xadmin_announce', SERVER_NAME)
     end

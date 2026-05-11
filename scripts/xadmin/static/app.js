@@ -109,8 +109,42 @@
             for (var i = 0; i < sel.options.length; i++) {
                 if (sel.options[i].value === keep) {
                     sel.selectedIndex = i;
+                    renderReloadSelect();
                     return;
                 }
+            }
+        }
+        sel.selectedIndex = 0;
+        renderReloadSelect();
+    }
+
+    function renderReloadSelect() {
+        var sel = $('#reload-target');
+        if (!sel) return;
+        var keep = sel.value || 'all';
+        sel.innerHTML = '';
+
+        var optAll = document.createElement('option');
+        optAll.value = 'all';
+        optAll.textContent = 'all processes';
+        sel.appendChild(optAll);
+
+        var optSelf = document.createElement('option');
+        optSelf.value = 'self';
+        optSelf.textContent = STATE.self ? ('self (' + STATE.self + ')') : 'self';
+        sel.appendChild(optSelf);
+
+        STATE.peers.forEach(function (p) {
+            var o = document.createElement('option');
+            o.value = p.name;
+            o.textContent = p.name;
+            sel.appendChild(o);
+        });
+
+        for (var i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === keep) {
+                sel.selectedIndex = i;
+                return;
             }
         }
         sel.selectedIndex = 0;
@@ -250,6 +284,52 @@
             });
     }
 
+    function reloadProcess() {
+        var targetEl = $('#reload-target');
+        var target = targetEl ? (targetEl.value || 'all') : 'all';
+        setMeta('reload running...', '');
+
+        var t0 = performance.now();
+        function send() {
+            return fetch('/api/reload', {
+                method: 'POST',
+                headers: authHeaders(),
+                body: JSON.stringify({ target: target }),
+            });
+        }
+
+        send()
+            .then(function (r) {
+                if (r.status === 401) {
+                    if (promptToken() != null) {
+                        return send().then(function (rr) {
+                            return rr.json().then(function (d) { return [rr, d]; });
+                        });
+                    }
+                    return [r, { ok: false, error: 'cancelled' }];
+                }
+                return r.json().then(function (d) { return [r, d]; });
+            })
+            .then(function (pair) {
+                var data = pair[1] || {};
+                var dt = (performance.now() - t0).toFixed(0);
+                var rows = [];
+                (data.results || []).forEach(function (r) {
+                    rows.push((r.ok ? 'ok' : 'failed') + '  ' + (r.target || '') + '  ' + (r.result || ''));
+                });
+                if (data.error) rows.push('error  ' + data.error);
+                setOutput(rows.join('\n') || '(no output)');
+                setMeta(
+                    (data.ok ? 'reload ok' : 'reload failed') + '  · target=' + (data.target || target) + '  · ' + dt + 'ms',
+                    data.ok ? 'ok' : 'err'
+                );
+            })
+            .catch(function (err) {
+                setOutput(String((err && err.message) || err));
+                setMeta('reload request failed', 'err');
+            });
+    }
+
     document.addEventListener('keydown', function (e) {
         if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
             var shellPage = $('.page[data-page="shell"]');
@@ -261,6 +341,8 @@
     });
 
     $('#run-script').addEventListener('click', runScript);
+    var reloadBtn = $('#reload-process');
+    if (reloadBtn) reloadBtn.addEventListener('click', reloadProcess);
     $('#refresh-peers').addEventListener('click', fetchPeers);
     var rp2 = $('#refresh-peers-2');
     if (rp2) rp2.addEventListener('click', fetchPeers);

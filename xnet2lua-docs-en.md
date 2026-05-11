@@ -1725,71 +1725,314 @@ end
 
 ---
 
-## 17. xadmin Startup and Smoke Test
+## 17. xadmin Console
 
-### 17.1 Current behavior
+`scripts/xadmin/` is a small but complete admin console: HTTP routes + cross-process node discovery + remote script execution + remote hot reload. It also serves as the end-to-end reference for §18 (xnats cross-process RPC) and §19 (hot reload protocol).
 
-- xadmin HTTP APIs (`/api/peers`, `/api/stats`, `/api/exec`) are handled **locally in xadmin_worker**.
-- `/api/exec` performs direct `xnats.rpc(target, 'xadmin_remote_exec', script)` from worker (no main-thread relay).
-- Main thread keeps `xadmin_remote_exec` as the RPC callee; NATS workers include `MAIN + HTTP worker` so workers receive broadcast and RPC directly.
+### 17.1 Architecture
+
+```
+┌──────────── xadmin1 ────────────┐         ┌──────────── xadmin2 ────────────┐
+│  MAIN ──── listener (18091)     │   NATS   │  MAIN ──── listener (18092)     │
+│   │                              │  ←───→   │   │                              │
+│   ├── xnats-worker (NATS I/O)   │ wire 4222│   ├── xnats-worker              │
+│   └── xhttp-worker (HTTP I/O)   │          │   └── xhttp-worker              │
+└─────────────────────────────────┘          └─────────────────────────────────┘
+```
+
+Key design points:
+
+- **HTTP routes run inside a per-request coroutine.** A route handler may call yielding APIs (`xnats.rpc`, `xthread.rpc`) directly and just `return` the response. The worker keeps a per-connection queue so HTTP/1.1 pipelining order is preserved.
+- **Local RPC short-circuits at the caller side.** `xnats.rpc(self, ...)` never touches the NATS wire — it hits the local business worker directly via `xthread.rpc`. See §18.4.
+- **State survives reload.** Connections, peer cache, in-flight RPC context all live in `_G`, so top-level `dofile` doesn't disturb them. See §19.2.
 
 ### 17.2 Start NATS
 
-```powershell
+```bash
 nats-server -p 4222
 ```
 
-### 17.3 Build xnet (MSYS2/MinGW)
+### 17.3 Build
 
-```powershell
-$env:PATH = "C:\software\msys64\mingw64\bin;$env:PATH"
-make clean xnet
+```bash
+make                       # MSYS2 / MinGW / Linux / macOS
+# or
+build.bat                  # Windows / MSVC
 ```
 
-### 17.4 Start xadmin
+### 17.4 Run nodes
 
-```powershell
-bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18090 XADMIN_HTTPS=0
+Each node needs a **unique** `SERVER_NAME` and port:
+
+```bash
+bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18091
+bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin2 XADMIN_PORT=18092
 ```
 
-### 17.5 API smoke test
+Nodes discover each other through the NATS broadcast subject (5s heartbeat, 15s TTL) and surface as peers in `/api/peers`.
 
-```powershell
-# 1) peers
-Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/peers" -Method Get
+### 17.5 HTTP API
 
-# 2) stats
-Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/stats" -Method Get
+| Path | Method | Auth | Purpose |
+|---|---|---|---|
+| `/api/peers` | GET | no | This node + peers discovered via heartbeat |
+| `/api/stats` | GET | no | Per-thread runtime stats (queue depth, etc.) |
+| `/api/exec` | POST | optional | Run a Lua chunk on the given node (see 17.6) |
+| `/api/reload` | POST | optional | Hot-reload self / a specific node / all nodes (see 17.7) |
 
-# 3) exec(self)
-$body = @{ target = "self"; script = "print('hello'); return 1+2" } | ConvertTo-Json -Compress
-Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+When `XADMIN_TOKEN=...` is set, `/api/exec` and `/api/reload` require `X-Xadmin-Token: <token>`. `/api/peers` and `/api/stats` are always public.
+
+### 17.6 Remote exec — `/api/exec`
+
+Body: `{"target": "self"|"name"|"name:N", "script": "..."}`.
+
+```bash
+# Local (caller-side short-circuit, no NATS wire)
+curl -X POST http://127.0.0.1:18091/api/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"self","script":"return 1+2, xthread.current_id()"}'
+# → {"ok":true,"target":"xadmin1","stdout":"","result":"3\t1"}
+
+# Cross-process (over NATS)
+curl -X POST http://127.0.0.1:18091/api/exec \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"xadmin2","script":"return os.time()"}'
+# → {"ok":true,"target":"xadmin2","stdout":"","result":"<timestamp>"}
 ```
 
-Expected exec response:
+Underneath this is the xrouter builtin `@run_script`. `result` is the script's top-level `return` values joined by tabs; `stdout` is whatever the script printed.
+
+### 17.7 Remote hot-reload — `/api/reload`
+
+Body: `{"target": "self"|"all"|"name"}`.
+
+```bash
+# Reload this node only
+curl -X POST http://127.0.0.1:18091/api/reload \
+  -H 'Content-Type: application/json' -d '{"target":"self"}'
+
+# Reload a specific node (cross-process)
+curl -X POST http://127.0.0.1:18091/api/reload \
+  -H 'Content-Type: application/json' -d '{"target":"xadmin2"}'
+
+# Reload every discovered node (self + all peers) in one shot
+curl -X POST http://127.0.0.1:18091/api/reload \
+  -H 'Content-Type: application/json' -d '{"target":"all"}'
+```
+
+Sample response:
 
 ```json
 {
   "ok": true,
-  "target": "xadmin1",
-  "stdout": "hello",
-  "result": "3"
+  "target": "all",
+  "results": [
+    {"target":"xadmin1","ok":true,"result":"current=1 notified=1 deferred=2"},
+    {"target":"xadmin2","ok":true,"result":"current=1 notified=1 deferred=2"}
+  ]
 }
 ```
 
-### 17.6 Two-node remote execution test
+The `current` / `notified` / `deferred` counts are explained in §19.4. Reload never restarts the process; new code takes effect immediately. See §19.2 for how state survives.
 
-Start a second node:
+### 17.8 End-to-end smoke test (recommended)
 
-```powershell
-bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin2 XADMIN_PORT=18091 XADMIN_HTTPS=0
+```bash
+# 1. Start NATS + xadmin1 + xadmin2.
+# 2. Edit scripts/xadmin/xadmin_app.lua — add a marker field to the /api/peers response.
+# 3. From xadmin1:   curl POST /api/reload {target:"all"}
+# 4. curl http://127.0.0.1:18091/api/peers  → marker present
+# 5. curl http://127.0.0.1:18092/api/peers  → marker present too (cross-process reload OK)
+# 6. Revert the edit + reload all again      → marker gone.
 ```
 
-Run remote script from `xadmin1`:
+No xnet process is restarted at any point.
 
-```powershell
-$body = @{ target = "xadmin2"; script = "print('from xadmin2'); return 4+5" } | ConvertTo-Json -Compress
-Invoke-RestMethod -Uri "http://127.0.0.1:18090/api/exec" -Method Post -ContentType "application/json" -Body $body
+---
+
+## 18. xnats Cross-Process RPC
+
+`scripts/core/server/xnats.lua` + `scripts/core/server/xnats_worker.lua` implement a NATS-based cross-process transport with two operations: `publish` (broadcast) and `rpc` (synchronous-looking call). All NATS I/O lives on the dedicated `xthread.NATS` thread; business threads talk to it via `xthread.post`/`xthread.rpc`.
+
+### 18.1 Startup
+
+```lua
+local xnats = dofile('scripts/core/server/xnats.lua')
+
+xnats.start({
+    host    = '127.0.0.1',
+    port    = 4222,
+    name    = 'game1',                                 -- unique process id
+    prefix  = 'xnet.test',                             -- NATS subject prefix
+    workers = { xthread.MAIN, xthread.WORKER_GRP3 },   -- local business worker IDs
+    reconnect_ms   = 1000,
+    rpc_timeout_ms = 10000,
+})
 ```
 
-Expected: `target == xadmin2` and correct `stdout/result`.
+The `workers` list serves two roles:
+
+- **Inbound routing**: a remote `xnats.rpc("game1:N", pt, ...)` is dispatched to `workers[N]` (1-based). Without `:N`, the local NATS thread round-robins.
+- **Caller-side short-circuit routing**: see §18.4.
+
+### 18.2 Propagating routing info to worker threads
+
+`xnats.start` already calls `xnats.bind_local` on the calling thread (usually MAIN). Other business threads have isolated Lua states and need an explicit push:
+
+```lua
+-- Main thread, after xhttp.start(...)
+xnats.bind_workers(xhttp.worker_ids())
+```
+
+`bind_workers` posts `xnats_bind_local` to each target. The target thread's `xnats.lua` top level installs a handler that writes `self_name` and `worker_threads` into **that** thread's `_G.__xnet_xnats_state`, enabling its short-circuit path.
+
+### 18.3 Unified return shape
+
+```lua
+local channel_ok, app_ok, ret1, ret2, ... = xnats.rpc(target, pt, ...)
+```
+
+- `channel_ok == false` → channel-level failure (not connected, timeout, target not present, missing local handler). Second value is the error string.
+- `channel_ok == true`  → channel succeeded. `app_ok` is the callee handler's first return (boolean by convention); the rest are its remaining returns.
+
+**The shape is identical for the local short-circuit and remote NATS paths** — the caller doesn't have to branch. For a handler returning `(true, "done")`, both paths yield `(true, true, "done")`.
+
+```lua
+xthread.register('do_lookup', function(key)
+    -- ... lookup ...
+    return true, value
+end)
+
+-- Caller:
+local channel_ok, app_ok, value = xnats.rpc('peer:1', 'do_lookup', 'foo')
+if not channel_ok then
+    io.stderr:write('channel: ' .. tostring(app_ok) .. '\n')
+elseif not app_ok then
+    io.stderr:write('app: ' .. tostring(value) .. '\n')
+else
+    print('got', value)
+end
+```
+
+### 18.4 Caller-side local short-circuit
+
+`xnats.rpc(target, pt, ...)` parses the target:
+
+1. process name == `state.self_name` → skip NATS, call `xthread.rpc(local_worker_tid, pt, 0, ...)` directly.
+2. otherwise → route through the NATS thread and serialise to the wire.
+
+Short-circuit requires the thread to have been bound (it called `xnats.start` itself, or received an `xnats_bind_local` post from `bind_workers`). **An unbound thread silently falls back to the NATS wire path** — still correct, just one extra hop.
+
+When the resolved local target id equals the current thread id, xnats.rpc avoids the self-RPC deadlock by looking up the stub directly and `pcall(h, ...)`'ing it, packaging the result in the unified shape.
+
+### 18.5 Target string format
+
+- `"name"` → round-robin over `workers`.
+- `"name:N"` → 1-based index into `workers[N]`.
+- An out-of-range `N` returns `channel_ok=false, "xnats: local worker idx out of range: N"` (or the remote equivalent).
+
+### 18.6 publish (broadcast)
+
+```lua
+xnats.publish(pt, arg1, arg2, ...)
+```
+
+Sent to `prefix .. '.broadcast'`. Every process subscribed to that prefix has its NATS thread fan the message out to all of its own `workers` via POST.
+
+---
+
+## 19. Hot Reload Protocol
+
+xnet2lua ships a **no-restart** script hot-reload mechanism: each thread's top-level Lua is re-`dofile`d, new closures take effect in place, in-flight coroutines survive.
+
+### 19.1 What reload does — and doesn't do
+
+**Reload does**:
+
+- For each target thread, call `xnet.__reload()` (a C-side builtin), which runs `luaL_dofile(thread_script)` to re-execute the script's top level.
+- Main thread additionally refreshes the refs for `__tick_ms`, `__update`, `__uninit`, `__thread_handle`.
+- xrouter is a singleton; `router.register(pt, h)` **overwrites in place** on the existing stub table — new handlers fire on the next message.
+- Module state tables stored under `_G[STATE_KEY]` survive untouched; new code reads the old data.
+
+**Reload does not**:
+
+- **Re-run `__init`** — avoids re-bootstrapping listeners, re-`xnet.init()`, etc.
+- **Drop in-flight coroutines** — xrouter's `rpc_context` and the C-side pending table keep them alive until their reply lands; top-level dofile does not touch those tables.
+- **Change thread IDs or topology** — thread count, worker assignment stay the same.
+
+### 19.2 Persisting state across reload
+
+Reload makes module-local variables (`local connections = {}`) brand-new tables. Old coroutines that captured the previous reference are now looking at a **different** table than the new code reads — silent inconsistency.
+
+The fix is to put any cross-reload state into `_G`:
+
+```lua
+local STATE_KEY = '__myapp_state'
+local state = rawget(_G, STATE_KEY)
+if type(state) ~= 'table' then
+    state = {}
+    rawset(_G, STATE_KEY, state)
+end
+if type(state.connections) ~= 'table' then state.connections = {} end
+if state.counter == nil then state.counter = 0 end
+
+-- Then alias locally:
+local connections = state.connections   -- old code, new code, all coroutines: same table
+```
+
+`xhttp.lua`, `xnats.lua`, `xnats_worker.lua`, `xadmin_worker.lua`, `xrouter.lua`, `xhttp_router.lua` all follow this pattern — use them as references.
+
+### 19.3 Three ways to trigger reload
+
+#### Path 1 — xadmin HTTP (recommended for ops)
+
+See §17.7.
+
+#### Path 2 — POST `@reload_thread` to a single thread
+
+```lua
+xthread.post(target_tid, '@reload_thread')
+```
+
+`@reload_thread` is **intercepted by C** inside the thread message handler and goes straight to `xnet.__reload()`. It never enters the Lua handler path.
+
+#### Path 3 — RPC `@reload` to coordinate a whole-process reload
+
+```lua
+local channel_ok, app_ok, msg = xnats.rpc('peer_or_self', '@reload')
+-- msg looks like "current=1 notified=2 deferred=2"
+```
+
+`@reload` is an xrouter builtin (see `scripts/core/share/xrouter.lua`). It runs on one business worker of the target process, broadcasts `@reload_thread` to every thread of that process, and adds a few **deferred** threads to a defer set.
+
+### 19.4 Defer semantics
+
+The `@reload` coordinator builds the defer set:
+
+| Included when | Why |
+|---|---|
+| **The reply_router thread** | The RPC reply hasn't been written yet; the thread must finish sending it before reloading itself. |
+| **The current handler's own thread** | Reloading mid-handler would invalidate the running handler context. |
+| **`explicit_defer_id`** (optional) | Caller-provided extra thread that must also be deferred. |
+
+Deferred threads do NOT get an immediate `@reload_thread` post. Their reload is hooked on `req.after_reply` — once the RPC reply is on the wire, the coordinator posts `@reload_thread` to them.
+
+Returned message format:
+
+```
+current=<current_thread_id> notified=<count> deferred=<count>
+```
+
+- `current` — the business-worker thread that handled this `@reload` call.
+- `notified` — threads that received `@reload_thread` immediately.
+- `deferred` — threads whose reload was deferred via the after_reply hook.
+
+### 19.5 Checklist for making your own module reload-safe
+
+1. **Top level only does dofile-safe work** — register handlers, populate `_G` state, define routes. No `xnet.init()`, no opening sockets.
+2. **One-shot side effects belong in `__init`** — listener sockets, `xnet.init()`, `xtimer.init(...)`, thread creation.
+3. **Cross-reload state lives in `_G[STATE_KEY]`** — connection tables, counters, caches, in-flight bookkeeping.
+4. **Register handlers via `xthread.register(pt, h)` or `router.register(pt, h)`** — both go through the xrouter singleton and support in-place overwrite.
+5. **Use the `local foo = state.foo` aliasing pattern** so old and new code (and old/new coroutines) reference the same sub-table.
+6. **Coroutine-shaped request dispatch** — let yielding APIs (`xnats.rpc`, `xthread.rpc`, `xtimer` callbacks) be called synchronously inside the handler; the response flows back through the coroutine naturally. `scripts/xadmin/xadmin_worker.lua`'s `start_request` + per-connection `queue` is the reference implementation.
+7. **Smoke-test**: change one line → `POST /api/reload {target:"self"}` → confirm new behavior live → revert + reload again → confirm gone. No process restart in either step.

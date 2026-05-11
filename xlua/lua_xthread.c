@@ -94,6 +94,10 @@ LUALIB_API int luaopen_xtimer(lua_State* L);
 #ifndef LUA_OK
 #define LUA_OK 0
 #endif
+#ifndef lua_absindex
+#define lua_absindex(L, i) \
+    (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
+#endif
 
 /* ============================================================================
 ** ThreadData - Stores per-thread Lua state and callback references
@@ -113,6 +117,7 @@ typedef struct {
 /* Forward declaration */
 static void thread_message_handler(xThread* thr, void* arg, int arg_len);
 static int thread_data_gc(lua_State* L);
+static int l_xnet_thread_reload(lua_State* L);
 
 static void lua_thread_runtime_post_init(lua_State* L) {
 #if defined(XLUA_USE_LUAJIT)
@@ -120,6 +125,20 @@ static void lua_thread_runtime_post_init(lua_State* L) {
 #else
     (void)L;
 #endif
+}
+
+static int lua_traceback_handler(lua_State* L) {
+    const char* msg = lua_tostring(L, 1);
+    if (msg) {
+        luaL_traceback(L, L, msg, 1);
+    } else if (!lua_isnoneornil(L, 1)) {
+        if (!luaL_callmeta(L, 1, "__tostring")) {
+            lua_pushliteral(L, "(error object is not a string)");
+        }
+    } else {
+        lua_pushliteral(L, "(no error message)");
+    }
+    return 1;
 }
 
 /* ThreadData metatable name */
@@ -343,6 +362,122 @@ static void thread_data_unref_callbacks(ThreadData* td, lua_State* L) {
     }
 }
 
+static int ref_field_if_function(lua_State* L, int table_idx, const char* field) {
+    table_idx = lua_absindex(L, table_idx);
+    lua_getfield(L, table_idx, field);
+    if (lua_isfunction(L, -1)) {
+        return luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    lua_pop(L, 1);
+    return LUA_NOREF;
+}
+
+static void thread_data_apply_callbacks(ThreadData* td, lua_State* L,
+                                        int sync_ref, int init_ref,
+                                        int update_ref, int uninit_ref) {
+    thread_data_unref_callbacks(td, L);
+    td->sync_handler_ref = sync_ref;
+    td->init_ref = init_ref;
+    td->update_ref = update_ref;
+    td->uninit_ref = uninit_ref;
+}
+
+static int lua_thread_reload_current(lua_State* L) {
+    xThread* thr = xthread_current();
+    if (!thr) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xnet.__reload: current thread is not registered");
+        return 2;
+    }
+
+    ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
+    if (!td || !td->L || !td->script_path || !td->script_path[0]) {
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xnet.__reload: thread %d has no reloadable script",
+                        xthread_get_id(thr));
+        return 2;
+    }
+
+    int base = lua_gettop(L);
+    XLOGI("xnet.__reload: loading thread script '%s' for thread %d",
+          td->script_path, xthread_get_id(thr));
+
+    if (luaL_dofile(L, td->script_path) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "xnet.__reload: load %s failed: %s",
+                 td->script_path, err ? err : "unknown error");
+        lua_settop(L, base);
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, msg);
+        return 2;
+    }
+
+    if (!lua_istable(L, -1)) {
+        lua_settop(L, base);
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xnet.__reload: %s did not return a table",
+                        td->script_path);
+        return 2;
+    }
+
+    int table_idx = lua_gettop(L);
+    int sync_ref = ref_field_if_function(L, table_idx, "__thread_handle");
+    int init_ref = ref_field_if_function(L, table_idx, "__init");
+    int update_ref = ref_field_if_function(L, table_idx, "__update");
+    int uninit_ref = ref_field_if_function(L, table_idx, "__uninit");
+    thread_data_apply_callbacks(td, L, sync_ref, init_ref, update_ref, uninit_ref);
+
+    lua_settop(L, base);
+    lua_pushboolean(L, 1);
+    lua_pushfstring(L, "thread %d reloaded %s", xthread_get_id(thr), td->script_path);
+    return 2;
+}
+
+static int l_xnet_thread_reload(lua_State* L) {
+    return lua_thread_reload_current(L);
+}
+
+static void install_xnet_thread_reload(lua_State* L) {
+    lua_getglobal(L, "xnet");
+    if (lua_istable(L, -1)) {
+        lua_pushcfunction(L, l_xnet_thread_reload);
+        lua_setfield(L, -2, "__reload");
+    }
+    lua_pop(L, 1);
+}
+
+static void call_xnet_reload_noresult(lua_State* L, int thread_id) {
+    int base = lua_gettop(L);
+    lua_getglobal(L, "xnet");
+    if (!lua_istable(L, -1)) {
+        XLOGE("xthread: xnet table missing while reloading thread %d", thread_id);
+        lua_settop(L, base);
+        return;
+    }
+    lua_getfield(L, -1, "__reload");
+    if (!lua_isfunction(L, -1)) {
+        XLOGE("xthread: xnet.__reload missing on thread %d", thread_id);
+        lua_settop(L, base);
+        return;
+    }
+
+    if (lua_pcall(L, 0, 2, 0) != LUA_OK) {
+        XLOGE("xthread: xnet.__reload failed on thread %d: %s",
+              thread_id, lua_tostring(L, -1));
+        lua_settop(L, base);
+        return;
+    }
+
+    if (!lua_toboolean(L, -2)) {
+        XLOGE("xthread: xnet.__reload reported failure on thread %d: %s",
+              thread_id, lua_tostring(L, -1));
+    } else {
+        XLOGI("xthread: %s", lua_tostring(L, -1));
+    }
+    lua_settop(L, base);
+}
+
 static int thread_data_gc(lua_State* L) {
     ThreadData* td = (ThreadData*)luaL_checkudata(L, 1, THREAD_DATA_META);
     if (!td) return 0;
@@ -403,6 +538,12 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
     /* REPLY always has base+1 = nil (reply_router is nil), base+2 = "@async_resume" */
     if (nvals >= 2 && lua_isnil(L, base + 1)) {
         const char* k1 = lua_tostring(L, base + 2);
+        if (k1 && strcmp(k1, "@reload_thread") == 0) {
+            call_xnet_reload_noresult(L, id);
+            lua_settop(L, base);
+            return;
+        }
+
         if (k1 && strcmp(k1, "@async_resume") == 0) {
             XLOGI("C INTERCEPT: @async_resume on thread %d will resume coroutine", xthread_current_id());
             /* Got it - intercept this in C, do NOT pass to Lua handler */
@@ -453,6 +594,9 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
     /* Not @async_resume - go to normal Lua handler dispatch */
     /* ── Normal dispatch: call Lua handler ── */
     if (td->sync_handler_ref != LUA_NOREF) {
+        lua_pushcfunction(L, lua_traceback_handler);
+        lua_insert(L, base + 1);
+        int errfunc = base + 1;
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
         if (!lua_isfunction(L, -1)) {
             XLOGE("xthread: no handler on thread %d (did you call xthread.init?)", id);
@@ -460,12 +604,14 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
             return;
         }
         /* Move handler below all unpacked values */
-        lua_insert(L, base + 1);
+        lua_insert(L, base + 2);
         /* Call: handler(reply_router, k1, k2, k3, ...) */
-        if (lua_pcall(L, nvals, 0, 0) != LUA_OK) {
+        if (lua_pcall(L, nvals, 0, errfunc) != LUA_OK) {
             XLOGE("xthread: handler error on thread %d: %s", id, lua_tostring(L, -1));
             lua_settop(L, base);
+            return;
         }
+        lua_settop(L, base);
     } else {
         XLOGE("xthread: no handler on thread %d (did you call xthread.init(handler)?)", id);
         lua_settop(L, base);
@@ -899,6 +1045,7 @@ static void lua_thread_on_init(xThread* thr) {
     /* Open xnet module so dynamic Lua threads can use network polling too. */
     luaL_requiref(L, "xnet", luaopen_xnet, 1);
     lua_pop(L, 1);
+    install_xnet_thread_reload(L);
 
     /* Open shared utility module for small helpers such as JSON. */
     luaL_requiref(L, "xutils", luaopen_xutils, 1);
@@ -1017,11 +1164,15 @@ static void lua_thread_on_update(xThread* thr) {
 
     if (td->update_ref != LUA_NOREF) {
         int base = lua_gettop(L);
+        lua_pushcfunction(L, lua_traceback_handler);
+        int errfunc = base + 1;
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->update_ref);
-        if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        if (lua_pcall(L, 0, 0, errfunc) != LUA_OK) {
             XLOGE("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
             lua_settop(L, base);
+            return;
         }
+        lua_settop(L, base);
     }
 
     /* Auto-drive timers and xpoll for scripts that don't define their own

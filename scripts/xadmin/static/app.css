@@ -60,7 +60,7 @@ code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size
 
 /* ---- toolbar ---- */
 .toolbar {
-    display: flex; align-items: center; gap: 10px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     background: #fff;
     padding: 10px 14px;
     border: 1px solid var(--line);

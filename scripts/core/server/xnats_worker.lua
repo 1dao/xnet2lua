@@ -9,35 +9,65 @@ router.set_log_prefix('XNATS-WORKER')
 
 local MAGIC = 'xnats1'
 
-local config = {
-    host = '127.0.0.1',
-    port = 4222,
-    name = 'game1',
-    prefix = 'xnet',
-    broadcast_subject = '',
-    worker_threads = {},
-    reconnect_ms = 1000,
-    rpc_timeout_ms = 5000,
-    max_packet = 64 * 1024 * 1024,
-}
+local STATE_KEY = '__xnet_xnats_worker_state'
+local state = rawget(_G, STATE_KEY)
+if type(state) ~= 'table' then
+    state = {}
+    rawset(_G, STATE_KEY, state)
+end
+local was_loaded = state.loaded and true or false
 
-local conn_state = {
-    conn = nil,
-    connected = false,
-    ready = false,
-    connecting = false,
-    closed = false,
-    retry_at = 0,
-}
+local function ensure_table(t, key)
+    if type(t[key]) ~= 'table' then
+        t[key] = {}
+    end
+    return t[key]
+end
 
-local waitq = {}
-local pending = {}
-local subs = {}
-local next_sid = 1
-local next_req_id = 1
-local rr_worker = 1
-local stopping = false
+local function default_nil(t, key, value)
+    if t[key] == nil then
+        t[key] = value
+    end
+end
+
+local config = ensure_table(state, 'config')
+default_nil(config, 'host', '127.0.0.1')
+default_nil(config, 'port', 4222)
+default_nil(config, 'name', 'game1')
+default_nil(config, 'prefix', 'xnet')
+default_nil(config, 'broadcast_subject', '')
+if type(config.worker_threads) ~= 'table' then config.worker_threads = {} end
+default_nil(config, 'reconnect_ms', 1000)
+default_nil(config, 'rpc_timeout_ms', 5000)
+default_nil(config, 'max_packet', 64 * 1024 * 1024)
+
+local conn_state = ensure_table(state, 'conn_state')
+default_nil(conn_state, 'connected', false)
+default_nil(conn_state, 'ready', false)
+default_nil(conn_state, 'connecting', false)
+default_nil(conn_state, 'closed', false)
+default_nil(conn_state, 'retry_at', 0)
+
+if type(state.waitq) ~= 'table' then state.waitq = {} end
+if type(state.pending) ~= 'table' then state.pending = {} end
+if type(state.subs) ~= 'table' then state.subs = {} end
+default_nil(state, 'next_sid', 1)
+default_nil(state, 'next_req_id', 1)
+default_nil(state, 'rr_worker', 1)
+default_nil(state, 'stopping', false)
+default_nil(state, 'loaded', false)
+state.loaded = true
+
+local waitq = state.waitq
+local pending = state.pending
+local subs = state.subs
 function xthread.register(pt, h) return router.register(pt, h) end
+
+local function clear_table(t)
+    for k in pairs(t) do
+        t[k] = nil
+    end
+end
 
 local function pack_values(...)
     return { n = select('#', ...), ... }
@@ -57,10 +87,13 @@ local function fail_request(req, err)
 end
 
 local function fail_pending(err)
-    local old = pending
-    pending = {}
+    local old = {}
+    for k, req in pairs(pending) do
+        old[#old + 1] = req
+        pending[k] = nil
+    end
     local seen = {}
-    for _, req in pairs(old) do
+    for _, req in ipairs(old) do
         if not seen[req] then
             seen[req] = true
             fail_request(req, err)
@@ -69,8 +102,11 @@ local function fail_pending(err)
 end
 
 local function fail_waiting(err)
-    local old = waitq
-    waitq = {}
+    local old = {}
+    for i, req in ipairs(waitq) do
+        old[i] = req
+        waitq[i] = nil
+    end
     for _, req in ipairs(old) do
         fail_request(req, err)
     end
@@ -139,8 +175,8 @@ local function rpc_subject_for(target)
 end
 
 local function next_subscription(kind, value)
-    local sid = tostring(next_sid)
-    next_sid = next_sid + 1
+    local sid = tostring(state.next_sid)
+    state.next_sid = state.next_sid + 1
     subs[sid] = { kind = kind, value = value }
     return sid
 end
@@ -208,8 +244,8 @@ local function choose_worker(target)
         return tid
     end
 
-    local tid = workers[rr_worker]
-    rr_worker = (rr_worker % #workers) + 1
+    local tid = workers[state.rr_worker]
+    state.rr_worker = (state.rr_worker % #workers) + 1
     return tid
 end
 
@@ -236,9 +272,17 @@ local function start_incoming_rpc(msg, values)
             return
         end
 
-        publish_response(msg.reply, req_id, true, unpack_args(called, 2, called.n))
+        local rpc_ok = true
+        local first_result = 2
+        if type(called[2]) == 'boolean' then
+            rpc_ok = called[2] and true or false
+            first_result = 3
+        end
+
+        publish_response(msg.reply, req_id, rpc_ok,
+            unpack_args(called, first_result, called.n))
         print(string.format('[XNATS-WORKER] rpc from=%s target=%s tid=%s pt=%s ok=%s',
-            tostring(from), tostring(target), tostring(tid), tostring(pt), tostring(true)))
+            tostring(from), tostring(target), tostring(tid), tostring(pt), tostring(rpc_ok)))
     end)
 
     local ok, co_err = coroutine.resume(co)
@@ -344,8 +388,8 @@ local function send_request(req)
         return true, 'sent'
     end
 
-    local req_id = next_req_id
-    next_req_id = next_req_id + 1
+    local req_id = state.next_req_id
+    state.next_req_id = state.next_req_id + 1
     local reply_subject = string.format('_INBOX.%s.%s.%d', base_subject(), config.name, req_id)
     local sid = next_subscription('reply', reply_subject)
     local ok, err = send_sub(reply_subject, sid)
@@ -396,6 +440,24 @@ end
 local function close_conn(reason)
     if conn_state.conn and not conn_state.conn:is_closed() then
         conn_state.conn:close(reason or 'close')
+    end
+end
+
+if was_loaded then
+    fail_waiting('xnats reloaded')
+    fail_pending('xnats reloaded')
+    clear_table(subs)
+    conn_state.ready = false
+    if conn_state.conn and not conn_state.conn:is_closed() then
+        close_conn('xnats reload')
+    else
+        conn_state.conn = nil
+        conn_state.connected = false
+        conn_state.connecting = false
+        conn_state.closed = true
+        if not state.stopping then
+            conn_state.retry_at = os.time()
+        end
     end
 end
 
@@ -489,7 +551,7 @@ local function process_packet(data)
 end
 
 local function connect_one()
-    if stopping or conn_state.connecting or conn_state.connected then return end
+    if state.stopping or conn_state.connecting or conn_state.connected then return end
     conn_state.connecting = true
     conn_state.closed = false
 
@@ -516,9 +578,9 @@ local function connect_one()
         conn_state.connecting = false
         conn_state.closed = true
         conn_state.conn = nil
-        subs = {}
+        clear_table(subs)
         fail_pending(reason or 'nats connection closed')
-        if not stopping then
+        if not state.stopping then
             conn_state.retry_at = os.time() + math.max(1, math.floor(config.reconnect_ms / 1000))
         end
         print(string.format('[XNATS-WORKER] close: %s', tostring(reason)))
@@ -549,15 +611,15 @@ local function start_nats(host, port, name, prefix, bsubject, workers, reconnect
     config.reconnect_ms = tonumber(reconnect_ms) or config.reconnect_ms
     config.rpc_timeout_ms = tonumber(rpc_timeout_ms) or config.rpc_timeout_ms
     config.max_packet = tonumber(max_packet) or config.max_packet
-    stopping = false
+    state.stopping = false
     connect_one()
 end
 
 local function stop_nats(silent)
-    stopping = true
+    state.stopping = true
     if silent then
-        waitq = {}
-        pending = {}
+        clear_table(waitq)
+        clear_table(pending)
     else
         fail_waiting('xnats stopped')
         fail_pending('xnats stopped')
@@ -630,7 +692,7 @@ end
 
 local function __update()
     local now = os.time()
-    if not stopping and not conn_state.connected and not conn_state.connecting and conn_state.retry_at > 0 and now >= conn_state.retry_at then
+    if not state.stopping and not conn_state.connected and not conn_state.connecting and conn_state.retry_at > 0 and now >= conn_state.retry_at then
         conn_state.retry_at = 0
         connect_one()
     end

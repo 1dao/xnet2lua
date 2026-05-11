@@ -92,6 +92,8 @@ static int g_script_argc = 0;
 static char** g_script_argv = NULL;
 static const char* g_process_name = NULL;
 
+static int l_xnet_main_reload(lua_State* L);
+
 static void lua_runtime_post_init(lua_State* L) {
 #if defined(XLUA_USE_LUAJIT)
     /* Explicitly keep the JIT engine enabled when running with LuaJIT. */
@@ -167,6 +169,14 @@ static void unref_if_needed(lua_State* L, int* ref) {
     *ref = LUA_NOREF;
 }
 
+static void unref_lifecycle(MainLuaData* data) {
+    if (!data || !data->L) return;
+    unref_if_needed(data->L, &data->sync_handler_ref);
+    unref_if_needed(data->L, &data->init_ref);
+    unref_if_needed(data->L, &data->update_ref);
+    unref_if_needed(data->L, &data->uninit_ref);
+}
+
 static void preload_modules(lua_State* L) {
     luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1);
     lua_pop(L, 1);
@@ -188,6 +198,17 @@ static void install_stop(lua_State* L) {
     lua_getglobal(L, "xthread");
     lua_pushcfunction(L, l_xthread_stop);
     lua_setfield(L, -2, "stop");
+    lua_pop(L, 1);
+}
+
+static void install_main_reload(MainLuaData* data) {
+    lua_State* L = data->L;
+    lua_getglobal(L, "xnet");
+    if (lua_istable(L, -1)) {
+        lua_pushlightuserdata(L, data);
+        lua_pushcclosure(L, l_xnet_main_reload, 1);
+        lua_setfield(L, -2, "__reload");
+    }
     lua_pop(L, 1);
 }
 
@@ -264,6 +285,48 @@ static void ref_lifecycle(MainLuaData* data) {
     lua_pop(L, 1);
 }
 
+static int reload_main_script(MainLuaData* data, lua_State* L) {
+    if (!data || !L || !g_main_file) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, "xnet.__reload: main runner is not initialized");
+        return 2;
+    }
+
+    int base = lua_gettop(L);
+    XLOGI("[xnet] reload main script '%s'", g_main_file);
+    if (luaL_dofile(L, g_main_file) != LUA_OK) {
+        const char* err = lua_tostring(L, -1);
+        char msg[1024];
+        snprintf(msg, sizeof(msg), "xnet.__reload: load %s failed: %s",
+                 g_main_file, err ? err : "unknown error");
+        lua_settop(L, base);
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, msg);
+        return 2;
+    }
+
+    if (!lua_istable(L, -1)) {
+        lua_settop(L, base);
+        lua_pushboolean(L, 0);
+        lua_pushfstring(L, "xnet.__reload: %s did not return a table", g_main_file);
+        return 2;
+    }
+
+    unref_lifecycle(data);
+    data->tick_ms = 10;
+    ref_lifecycle(data);
+    lua_settop(L, base);
+
+    lua_pushboolean(L, 1);
+    lua_pushfstring(L, "main reloaded %s", g_main_file);
+    return 2;
+}
+
+static int l_xnet_main_reload(lua_State* L) {
+    MainLuaData* data = (MainLuaData*)lua_touserdata(L, lua_upvalueindex(1));
+    return reload_main_script(data, L);
+}
+
 static MainLuaData* main_init(void) {
     MainLuaData* data = (MainLuaData*)calloc(1, sizeof(*data));
     if (!data) return NULL;
@@ -285,6 +348,7 @@ static MainLuaData* main_init(void) {
     lua_runtime_post_init(L);
     preload_modules(L);
     install_stop(L);
+    install_main_reload(data);
     set_runner_globals(L);
 
     XLOGI("[xnet] loading main script '%s'", g_main_file);
