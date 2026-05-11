@@ -36,35 +36,56 @@
 --     }
 --
 -- Reload model: re-running the worker script overwrites handlers in place on
--- the existing singleton, while `router.handle` (referenced by the C-side
--- __thread_handle ref) and any in-flight rpc_context survive intact.
+-- the existing singleton, while the router table and any in-flight rpc_context
+-- survive intact. The script returns the current `router.handle`, so the C-side
+-- __thread_handle ref is refreshed during runtime reload.
 
 local ROUTER_KEY = '__xnet_xrouter'
 local M = rawget(_G, ROUTER_KEY)
-if M then return M end
 
 local unpack_args = table.unpack or unpack
+local coroutine_create = coroutine.create
+local coroutine_resume = coroutine.resume
+local coroutine_running = coroutine.running
+local coroutine_status = coroutine.status
+local debug_traceback = debug and debug.traceback
 
 local function pack_values(...)
     return { n = select('#', ...), ... }
+end
+
+local function coroutine_error(req, err)
+    if debug_traceback and type(req) == 'table' and type(req.co) == 'thread' then
+        local ok, tb = pcall(debug_traceback, req.co, tostring(err))
+        if ok and tb then return tb end
+    end
+    return tostring(err)
 end
 
 local function format_error(prefix, fmt, ...)
     return string.format('[%s] ' .. fmt, prefix, ...)
 end
 
-M = {
-    log_prefix       = 'XROUTER',
-    stubs            = {},   -- pt -> handler  (single unified table)
-    rpc_context      = {},   -- co -> req      (in-flight RPC requests)
-    unknown_post     = nil,  -- function(pt, ...) when no handler matches a POST
-    unknown_rpc      = nil,  -- function(reply_router, co_id, sk, pt, ...) for RPC misses
-    on_handler_error = nil,  -- function(pt, err) for POST-side coroutine top-level error
-    builtins = {
-        ['@run_script'] = {},
-    },
-}
-rawset(_G, ROUTER_KEY, M)
+if type(M) ~= 'table' then
+    M = {
+        log_prefix       = 'XROUTER',
+        stubs            = {},   -- pt -> handler  (single unified table)
+        rpc_context      = {},   -- co -> req      (in-flight RPC requests)
+        unknown_post     = nil,  -- function(pt, ...) when no handler matches a POST
+        unknown_rpc      = nil,  -- function(reply_router, co_id, sk, pt, ...) for RPC misses
+        on_handler_error = nil,  -- function(pt, err) for POST-side coroutine top-level error
+        builtins = {},
+    }
+    rawset(_G, ROUTER_KEY, M)
+else
+    M.log_prefix = M.log_prefix or 'XROUTER'
+    if type(M.stubs) ~= 'table' then M.stubs = {} end
+    if type(M.rpc_context) ~= 'table' then M.rpc_context = {} end
+    if type(M.builtins) ~= 'table' then M.builtins = {} end
+end
+M.builtins['@run_script'] = M.builtins['@run_script'] or {}
+M.builtins['@reload'] = M.builtins['@reload'] or {}
+M.builtins['@reload_thread'] = M.builtins['@reload_thread'] or {}
 
 local function log_err(fmt, ...)
     io.stderr:write(format_error(M.log_prefix, fmt, ...) .. '\n')
@@ -187,8 +208,119 @@ local function install_builtin_run_script(opts)
     end
 end
 
+local function call_reload()
+    if not xnet or type(xnet.__reload) ~= 'function' then
+        return false, 'xnet.__reload builtin is not available'
+    end
+    local rets = pack_values(pcall(xnet.__reload))
+    if not rets[1] then
+        return false, tostring(rets[2])
+    end
+    if rets[2] == false then
+        return false, tostring(rets[3] or 'reload failed')
+    end
+    return true, tostring(rets[3] or rets[2] or 'reloaded')
+end
+
+local function reply_router_thread_id(req)
+    if type(req) ~= 'table' then return nil end
+    local router = tostring(req.reply_router or '')
+    local id = router:match('^xthread:(%d+)$')
+    return id and tonumber(id) or nil
+end
+
+local function add_unique_id(list, seen, value)
+    local id = tonumber(value)
+    if not id or id <= 0 or seen[id] then return end
+    seen[id] = true
+    list[#list + 1] = id
+end
+
+local function schedule_deferred_reload(ids)
+    if #ids == 0 then return end
+    local delay_ms = 20
+    local function post_all()
+        for _, id in ipairs(ids) do
+            local ok, err = xthread.post(id, '@reload_thread')
+            if not ok then
+                log_err('deferred reload post failed thread=%s err=%s',
+                        tostring(id), tostring(err))
+            end
+        end
+    end
+
+    if xtimer and xtimer.inited and xtimer.init and xtimer.add then
+        if not xtimer.inited() then xtimer.init(16) end
+        local ok = pcall(xtimer.add, delay_ms, post_all, 1)
+        if ok then return end
+    end
+    post_all()
+end
+
+local function reload_process_impl(opts, explicit_defer_id)
+    local _ = opts
+    local current_id = xthread and xthread.current_id and xthread.current_id() or 0
+    local stats = xthread and xthread.all_stats and xthread.all_stats() or {}
+    local req = M.current_request()
+    local defer_seen = {}
+    local defer_ids = {}
+    add_unique_id(defer_ids, defer_seen, reply_router_thread_id(req))
+    add_unique_id(defer_ids, defer_seen, explicit_defer_id)
+    if req then
+        add_unique_id(defer_ids, defer_seen, current_id)
+    end
+    local notified = {}
+    local deferred = {}
+    local errors = {}
+
+    for _, st in ipairs(stats) do
+        local id = tonumber(st.id)
+        if id and id > 0 then
+            if defer_seen[id] then
+                deferred[#deferred + 1] = id
+            else
+                local ok, err = xthread.post(id, '@reload_thread')
+                if ok then
+                    notified[#notified + 1] = id
+                else
+                    errors[#errors + 1] = string.format('%s:%s', tostring(id), tostring(err))
+                end
+            end
+        end
+    end
+
+    if req and #deferred > 0 then
+        local previous = req.after_reply
+        req.after_reply = function()
+            if previous then previous() end
+            schedule_deferred_reload(deferred)
+        end
+    elseif #deferred > 0 then
+        schedule_deferred_reload(deferred)
+    end
+
+    local ok = #errors == 0
+    local msg = string.format('current=%s notified=%d deferred=%d%s%s',
+        tostring(current_id), #notified, #deferred,
+        #errors > 0 and ' errors=' or '',
+        #errors > 0 and table.concat(errors, ',') or '')
+    return ok, msg
+end
+
+local function install_builtin_reload(opts)
+    M.builtins['@reload'] = opts or M.builtins['@reload'] or {}
+    M.stubs['@reload'] = function(explicit_defer_id)
+        return reload_process_impl(M.builtins['@reload'], explicit_defer_id)
+    end
+    M.builtins['@reload_thread'] = M.builtins['@reload_thread'] or {}
+    M.stubs['@reload_thread'] = function()
+        return call_reload()
+    end
+end
+
 local function install_builtins()
     install_builtin_run_script(M.builtins['@run_script'])
+    install_builtin_reload(M.builtins['@reload'])
 end
 
 -- Enable or reconfigure a builtin protocol handler.
@@ -196,6 +328,10 @@ function M.enable_builtin(name, opts)
     name = tostring(name or '')
     if name == '@run_script' then
         install_builtin_run_script(opts)
+        return true
+    end
+    if name == '@reload' or name == '@reload_thread' then
+        install_builtin_reload(opts)
         return true
     end
     return false, 'unknown builtin: ' .. name
@@ -260,7 +396,7 @@ end
 -- Returns the req for RPC handlers, or nil for POST handlers (since POST
 -- has no reply path). Useful when a handler needs to know if it must reply.
 function M.current_request()
-    local co = coroutine.running()
+    local co = coroutine_running()
     return co and M.rpc_context[co] or nil
 end
 
@@ -273,16 +409,24 @@ end
 -- `@async_resume` resumptions -- which bypass this function entirely --
 -- still cause a reply to be sent when the handler finally returns.
 local function resume_rpc(req, ...)
-    local ok, err = coroutine.resume(req.co, ...)
+    local called = pack_values(pcall(coroutine_resume, req.co, ...))
+    if not called[1] then
+        local err = coroutine_error(req, called[2])
+        M.rpc_context[req.co] = nil
+        req.reply(req.co_id, req.sk, req.pt, false, err)
+        return
+    end
+
+    local ok, err = called[2], called[3]
     if not ok then
         M.rpc_context[req.co] = nil
         -- Coroutine raised before the in-body pcall could catch it (very
         -- rare; mostly happens if create itself failed). Send an error
         -- reply so the caller doesn't hang.
-        req.reply(req.co_id, req.sk, req.pt, false, tostring(err))
+        req.reply(req.co_id, req.sk, req.pt, false, coroutine_error(req, err))
         return
     end
-    if coroutine.status(req.co) == 'dead' then
+    if coroutine_status(req.co) == 'dead' then
         M.rpc_context[req.co] = nil
     end
 end
@@ -294,15 +438,25 @@ function M.resume_request(req, ...)
     if type(req) ~= 'table' or type(req.co) ~= 'thread' then
         return false, 'resume_request: invalid request'
     end
-    local ok, err = coroutine.resume(req.co, ...)
+    local called = pack_values(pcall(coroutine_resume, req.co, ...))
+    if not called[1] then
+        M.rpc_context[req.co] = nil
+        local err = coroutine_error(req, called[2])
+        if req.reply and req.co_id and req.pt then
+            req.reply(req.co_id, req.sk, req.pt, false, err)
+        end
+        return false, err
+    end
+
+    local ok, err = called[2], called[3]
     if not ok then
         M.rpc_context[req.co] = nil
         if req.reply and req.co_id and req.pt then
-            req.reply(req.co_id, req.sk, req.pt, false, tostring(err))
+            req.reply(req.co_id, req.sk, req.pt, false, coroutine_error(req, err))
         end
-        return false, tostring(err)
+        return false, coroutine_error(req, err)
     end
-    if coroutine.status(req.co) == 'dead' then
+    if coroutine_status(req.co) == 'dead' then
         M.rpc_context[req.co] = nil
     end
     return true
@@ -330,16 +484,26 @@ local function dispatch_post(k1, k2, k3, ...)
     local nrest = select('#', ...)
     local args = { n = nrest + 2, k2, k3, ... }
     local pt = k1
-    local co = coroutine.create(function()
+    local co = coroutine_create(function()
         h(unpack_args(args, 1, args.n))
     end)
-    local ok, err = coroutine.resume(co)
+    local ok, err = coroutine_resume(co)
     if not ok then
         if M.on_handler_error then
             M.on_handler_error(pt, err)
         else
             log_err('handler error pt=%s: %s', tostring(pt), tostring(err))
         end
+    end
+end
+
+local function run_after_reply(req)
+    local fn = req and req.after_reply
+    if type(fn) ~= 'function' then return end
+    req.after_reply = nil
+    local ok, err = pcall(fn)
+    if not ok then
+        log_err('after_reply failed pt=%s: %s', tostring(req.pt), tostring(err))
     end
 end
 
@@ -368,6 +532,7 @@ local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
         co_id = co_id,
         sk = sk,
         pt = pt,
+        reply_router = reply_router,
         reply = reply,
     }
 
@@ -381,7 +546,7 @@ local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
     -- is the handler at registration time. If you re-register `pt`
     -- mid-call, in-flight invocations finish with the OLD handler and only
     -- subsequent dispatches see the NEW one -- this is the safe semantics.
-    req.co = coroutine.create(function(...)
+    req.co = coroutine_create(function(...)
         local function call_handler(...) return h(...) end
         local rets = pack_values(pcall(call_handler, ...))
         M.rpc_context[req.co] = nil
@@ -393,11 +558,13 @@ local function dispatch_rpc(reply_router, co_id, sk, pt, ...)
             if not ok then
                 log_err('rpc reply route failed: pt=%s', tostring(req.pt))
             end
+            run_after_reply(req)
         else
             local ok = req.reply(req.co_id, req.sk, req.pt, false, tostring(rets[2]))
             if not ok then
                 log_err('rpc error reply route failed: pt=%s', tostring(req.pt))
             end
+            run_after_reply(req)
         end
     end)
 

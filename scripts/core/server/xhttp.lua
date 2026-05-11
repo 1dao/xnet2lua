@@ -2,14 +2,20 @@
 -- Main thread owns listen_fd and passes accepted sockets to worker threads.
 -- HTTP parsing/response serialization live in scripts/core/share/xhttp_codec.lua.
 
-local M = {}
+local M = rawget(_G, 'xhttp')
+if type(M) ~= 'table' then M = {} end
 
 local DEFAULT_WORKER_SCRIPT = 'scripts/core/server/xhttp_worker.lua'
 
-local running = false
-local listener = nil
-local workers = {}
-local rr_index = 0
+local STATE_KEY = '__xnet_xhttp_state'
+local state = rawget(_G, STATE_KEY)
+if type(state) ~= 'table' then
+    state = {}
+    rawset(_G, STATE_KEY, state)
+end
+if state.running == nil then state.running = false end
+if type(state.workers) ~= 'table' then state.workers = {} end
+if state.rr_index == nil then state.rr_index = 0 end
 
 local function to_bool(v, default)
     if v == nil then return default end
@@ -60,12 +66,14 @@ local function normalize_config(cfg)
 end
 
 local function pick_worker()
+    local workers = state.workers
     if #workers == 0 then return nil end
-    rr_index = (rr_index % #workers) + 1
-    return workers[rr_index]
+    state.rr_index = (state.rr_index % #workers) + 1
+    return workers[state.rr_index]
 end
 
 local function shutdown_workers()
+    local workers = state.workers
     for i = #workers, 1, -1 do
         local id = workers[i]
         local ok, err = xthread.shutdown_thread(id)
@@ -77,7 +85,7 @@ local function shutdown_workers()
 end
 
 function M.start(cfg)
-    if running then
+    if state.running then
         return true
     end
     if XNET_WITH_HTTP == false then
@@ -97,8 +105,8 @@ function M.start(cfg)
         end
     end
 
-    workers = {}
-    rr_index = 0
+    state.workers = {}
+    state.rr_index = 0
 
     for i, id in ipairs(conf.workers) do
         local ok, err = xthread.create_thread(id, 'xhttp-worker-' .. tostring(i), conf.worker_script)
@@ -106,7 +114,7 @@ function M.start(cfg)
             shutdown_workers()
             return false, err
         end
-        workers[#workers + 1] = id
+        state.workers[#state.workers + 1] = id
 
         ok, err = xthread.post(id, 'xhttp_worker_start',
             conf.app_script, conf.max_request_size, conf.server_name,
@@ -141,30 +149,30 @@ function M.start(cfg)
         return false, err
     end
 
-    listener = l
-    running = true
+    state.listener = l
+    state.running = true
     print(string.format('[XHTTP] listening on %s://%s:%d workers=%d',
-        conf.https and 'https' or 'http', conf.host, conf.port, #workers))
+        conf.https and 'https' or 'http', conf.host, conf.port, #state.workers))
     return true
 end
 
 function M.stop()
-    if listener then
-        listener:close('xhttp_stop')
-        listener = nil
+    if state.listener then
+        state.listener:close('xhttp_stop')
+        state.listener = nil
     end
     shutdown_workers()
-    running = false
+    state.running = false
     return true
 end
 
 function M.running()
-    return running
+    return state.running
 end
 
 function M.worker_ids()
     local out = {}
-    for i, id in ipairs(workers) do out[i] = id end
+    for i, id in ipairs(state.workers) do out[i] = id end
     return out
 end
 

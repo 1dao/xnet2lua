@@ -3,14 +3,19 @@
 local xutils = require 'xutils'
 local ROUTER_KEY = '__xnet_xhttp_router'
 local M = rawget(_G, ROUTER_KEY)
-if M then return M end
 
-M = {
-    routes = {},
-    dyn_routes = {},
-    log_prefix = 'XHTTP',
-}
-rawset(_G, ROUTER_KEY, M)
+if type(M) ~= 'table' then
+    M = {
+        routes = {},
+        dyn_routes = {},
+        log_prefix = 'XHTTP',
+    }
+    rawset(_G, ROUTER_KEY, M)
+else
+    if type(M.routes) ~= 'table' then M.routes = {} end
+    if type(M.dyn_routes) ~= 'table' then M.dyn_routes = {} end
+    M.log_prefix = M.log_prefix or 'XHTTP'
+end
 
 local CONTENT_TYPES = {
     css = 'text/css; charset=utf-8',
