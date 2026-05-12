@@ -16,6 +16,8 @@
 #include <sys/types.h>
 #endif
 
+#include "../xmacro.h"   /* malloc/free → rpmalloc */
+
 #if defined(LUA_EMBEDDED)
 #include "../3rd/minilua.h"
 #else

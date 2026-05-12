@@ -35,7 +35,8 @@
 #endif
 
 #include "xpoll.h"
-#include "xhash.h"
+#include "xhash.h"      /* transitively pulls xmacro.h */
+#include "xmacro.h"     /* explicit, in case xhash.h is replaced */
 
 #if defined(XPOLL_WITH_IO_URING)
 #   include <liburing.h>

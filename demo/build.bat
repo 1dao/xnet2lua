@@ -13,6 +13,7 @@ set "RESET=[0m"
 set "BUILD_MODE=release"
 set "WITH_HTTP=1"
 set "WITH_HTTPS=1"
+set "WITH_RPMALLOC=1"
 set "CLEAN_ONLY=0"
 set "LUA_BACKEND=minilua"
 
@@ -21,12 +22,13 @@ for %%A in (%*) do (
     if /I "%%~A"=="release" set "BUILD_MODE=release"
     if /I "%%~A"=="clean" set "CLEAN_ONLY=1"
     if /I "%%~A"=="nohttps" set "WITH_HTTPS=0"
+    if /I "%%~A"=="norpmalloc" set "WITH_RPMALLOC=0"
     if /I "%%~A"=="luajit" set "LUA_BACKEND=luajit"
     if /I "%%~A"=="minilua" set "LUA_BACKEND=minilua"
 )
 
 echo %GREEN%[INFO]%RESET% Building demo with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% Mode=%BUILD_MODE% HTTPS=%WITH_HTTPS% Lua=%LUA_BACKEND%
+echo %GREEN%[INFO]%RESET% Mode=%BUILD_MODE% HTTPS=%WITH_HTTPS% rpmalloc=%WITH_RPMALLOC% Lua=%LUA_BACKEND%
 
 set "VS_VCVARS="
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
@@ -81,12 +83,24 @@ set "XNET_EXE=xnet.exe"
 set "THREAD_EXE=xthread_test.exe"
 
 set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c"
+if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% ..\3rd\rpmalloc\rpmalloc.c"
 set "XNET_SOURCES=..\xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
 set "THREAD_SOURCES=xthread_test.c"
 set "LUAJIT_DIR=..\3rd\luajit\src"
 set "LUAJIT_INC=..\3rd\luajit\src"
 
+REM rpmalloc toggle:
+REM  WITH_RPMALLOC=1 → xmacro.h routes malloc/free to rp*, rpmalloc.c is linked.
+REM    ENABLE_OVERRIDE=0 keeps rpmalloc.c from including malloc.c (which would
+REM    hijack libc CRT symbols — not what we want; also breaks MinGW emutls).
+REM  WITH_RPMALLOC=0 → xmacro.h passes through to libc, rpmalloc.c not linked,
+REM    rpmalloc_* lifecycle calls stub to no-ops.
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS%"
+if "%WITH_RPMALLOC%"=="1" (
+    set "DEFS=%DEFS% /DENABLE_OVERRIDE=0 /DXMACRO_USE_RPMALLOC=1"
+) else (
+    set "DEFS=%DEFS% /DXMACRO_USE_RPMALLOC=0"
+)
 set "INCS=/I.."
 if "%WITH_HTTPS%"=="1" (
     set "INCS=%INCS% /I..\3rd\mbedtls3\include"
@@ -227,8 +241,11 @@ if defined XNET_LUA_LIB (
     set "XNET_LIBS=%XNET_LIBS% %XNET_LUA_LIB%"
 )
 
+set "THREAD_RPMALLOC_OBJ="
+if "%WITH_RPMALLOC%"=="1" set "THREAD_RPMALLOC_OBJ=%OBJDIR%\rpmalloc.obj"
+
 echo %GREEN%[INFO]%RESET% Linking %THREAD_EXE%...
-link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj %THREAD_LIBS%
+link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj %THREAD_RPMALLOC_OBJ% %THREAD_LIBS%
 if errorlevel 1 (
     echo %RED%[ERROR]%RESET% Link failed for %THREAD_EXE%
     exit /b 1

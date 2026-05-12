@@ -24,6 +24,7 @@
 #include "../xthread.h"
 #include "../xlog.h"
 #include "../xtimer.h"
+#include "../xmacro.h"   /* declares rpmalloc lifecycle API; stubbed if -DXMACRO_USE_RPMALLOC=0 */
 
 /* Test counters */
 static volatile int task_counter = 0;
@@ -669,6 +670,13 @@ int main(int argc, char** argv) {
     (void)argc;
     (void)argv;
 
+    /* xthread.c allocates via rpmalloc — must init before xthread_init().
+    ** Auto-registers the calling (main) thread. */
+    if (rpmalloc_initialize(NULL) != 0) {
+        printf("Failed to initialize rpmalloc\n");
+        return -1;
+    }
+
     printf("========================================\n");
     printf("xthread library test demo\n");
     printf("========================================\n");
@@ -677,6 +685,7 @@ int main(int argc, char** argv) {
        This automatically registers main thread and initializes wakeup */
     if (!xthread_init()) {
         printf("Failed to initialize xthread library\n");
+        rpmalloc_finalize();
         return -1;
     }
 
@@ -731,6 +740,7 @@ int main(int argc, char** argv) {
 cleanup:
     /* Final cleanup */
     xthread_uninit();
+    rpmalloc_finalize();
 
     return ret;
 }

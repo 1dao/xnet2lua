@@ -3,6 +3,8 @@
 #include <string.h>
 #include <ctype.h>
 
+#include "xmacro.h"   /* malloc/free/strdup → rpmalloc; after system headers */
+
 typedef struct {
     char short_opt;
     char* long_opt;

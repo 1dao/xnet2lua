@@ -37,6 +37,8 @@
 #include "xthread.h"
 #include "xtimer.h"
 
+#include "xmacro.h"   /* malloc/free → rpmalloc; runtime lifecycle in main() */
+
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
 static void luaL_requiref(lua_State* L, const char* modname,
                           lua_CFunction openf, int glb) {
@@ -479,10 +481,19 @@ static void main_uninit(MainLuaData* data) {
 }
 
 int main(int argc, char** argv) {
+    /* Initialise rpmalloc before ANY other allocation in this process.
+    ** rpmalloc_initialize() also registers the calling (main) thread, so
+    ** main does not need a separate rpmalloc_thread_initialize(). */
+    if (rpmalloc_initialize(NULL) != 0) {
+        fprintf(stderr, "[xnet] rpmalloc_initialize failed\n");
+        return 1;
+    }
+
     console_set_consolas_font();
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <main.lua> [SERVER_NAME=name]\n", argv[0]);
+        rpmalloc_finalize();
         return 2;
     }
 
@@ -496,6 +507,7 @@ int main(int argc, char** argv) {
     if (!xthread_init()) {
         XLOGE("[xnet] xthread_init failed");
         xargs_cleanup();
+        rpmalloc_finalize();
         return 1;
     }
 
@@ -504,6 +516,7 @@ int main(int argc, char** argv) {
     if (!data) {
         xthread_uninit();
         xargs_cleanup();
+        rpmalloc_finalize();
         return g_exit_code ? g_exit_code : 1;
     }
 
@@ -514,5 +527,6 @@ int main(int argc, char** argv) {
     main_uninit(data);
     xthread_uninit();
     xargs_cleanup();
+    rpmalloc_finalize();
     return g_exit_code;
 }

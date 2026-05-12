@@ -35,8 +35,47 @@
 #include "lauxlib.h"
 #endif
 
+/* yyjson.h has inline funcs that call alc.free(ctx, ptr) — that field name
+** would collide with a function-like `free` macro, so yyjson.h MUST be
+** preprocessed before xmacro.h takes effect. xmacro.h goes last. */
 #include "../3rd/yyjson.h"
 #include "xargs.h"
+
+#include "../xmacro.h"   /* malloc/free → rpmalloc; must be last include */
+
+/* yyjson allocator routed through xmacro.h.
+**
+** Why this is needed:
+**   yyjson's default allocator (passed as NULL) is libc malloc/free. Output
+**   strings from yyjson_*_write_opts() are libc-allocated and the caller is
+**   expected to libc-free them. But once xmacro.h is in scope, the bare
+**   free(out) call in this file gets rewritten to rpfree(out) — feeding a
+**   libc pointer to rpmalloc's free path, which corrupts the rp heap
+**   (observed: STATUS_HEAP_CORRUPTION 0xC0000374 mid-test). Passing this
+**   allocator into every yyjson entry point keeps both ends consistent.
+**
+** With WITH_RPMALLOC=0 the malloc/realloc/free inside these trampolines
+** resolve back to libc (xmacro.h is pass-through in that mode), so behaviour
+** matches the yyjson default — no #ifdef needed at the call sites. */
+static void *xj_alc_malloc(void *ctx, size_t size) {
+    (void)ctx;
+    return malloc(size);
+}
+static void *xj_alc_realloc(void *ctx, void *ptr, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return realloc(ptr, size);
+}
+static void xj_alc_free(void *ctx, void *ptr) {
+    (void)ctx;
+    free(ptr);
+}
+static const yyjson_alc g_xj_alc = {
+    xj_alc_malloc,
+    xj_alc_realloc,
+    xj_alc_free,
+    NULL    /* no ctx needed — the allocator is process-global */
+};
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
 static int lua_isinteger(lua_State *L, int idx) {
@@ -344,7 +383,7 @@ static int lua_json_push_value(lua_State *L, const yyjson_val *val, int depth) {
 }
 
 static int l_util_json_pack(lua_State *L) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(&g_xj_alc);
     if (!doc) {
         return json_error(L, "json pack: out of memory");
     }
@@ -358,7 +397,9 @@ static int l_util_json_pack(lua_State *L) {
     yyjson_write_err err;
     memset(&err, 0, sizeof(err));
     size_t len = 0;
-    char *out = yyjson_mut_val_write_opts(root, 0, NULL, &len, &err);
+    /* g_xj_alc here makes the returned `out` come from our allocator, so the
+    ** free(out) below (routed by xmacro.h) lands on the matching free path. */
+    char *out = yyjson_mut_val_write_opts(root, 0, &g_xj_alc, &len, &err);
     yyjson_mut_doc_free(doc);
     if (!out) {
         return json_error(L, err.msg ? err.msg : "json pack failed");
@@ -375,7 +416,7 @@ static int l_util_json_unpack(lua_State *L) {
     yyjson_read_err err;
     memset(&err, 0, sizeof(err));
 
-    yyjson_doc *doc = yyjson_read_opts((char *)(void *)text, len, 0, NULL, &err);
+    yyjson_doc *doc = yyjson_read_opts((char *)(void *)text, len, 0, &g_xj_alc, &err);
     if (!doc) {
         int pos = (err.pos > (size_t)INT_MAX) ? INT_MAX : (int)err.pos;
         lua_pushnil(L);

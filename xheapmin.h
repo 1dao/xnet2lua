@@ -11,6 +11,9 @@ extern "C" {
 #include <string.h>
 #include <stdint.h>
 
+/* Route the malloc/realloc/free calls below through rpmalloc. */
+#include "xmacro.h"
+
 typedef struct xHeapMinNode {
     int heap_index;
     uint64_t key;

@@ -81,6 +81,7 @@ make clean
 | `WITH_HTTP` | `1` | `1` / `0` | 是否编译 HTTP 代码路径 |
 | `WITH_HTTPS` | `1` | `1` / `0` | 是否编译 mbedTLS / HTTPS 路径 |
 | `WITH_IO_URING` | `0` | `1` / `0` | Linux 下启用 `XPOLL_USE_IO_URING` 与 `XCHANNEL_USE_IO_URING`，需链接 `liburing` |
+| `WITH_RPMALLOC` | `1` | `1` / `0` | 把项目自己的 `malloc/free` 通过 `xmacro.h` 路由到 rpmalloc；`=0` 时退回 libc，`rpmalloc.c` 不参与链接（详见 §2.7） |
 | `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | 内置 Lua 还是 LuaJIT；选 `luajit` 时需要先把 `3rd/luajit` 子模块拉下来并构建 `libluajit.a` |
 
 ```bash
@@ -107,6 +108,9 @@ build.bat debug
 :: 关闭 HTTP / HTTPS
 build.bat nohttp
 build.bat nohttps
+
+:: 关闭 rpmalloc，自有代码的内存分配退回 libc（详见 2.7）
+build.bat norpmalloc
 
 :: 切换到 LuaJIT 后端
 ::（首次会自动调用 3rd\luajit\src\msvcbuild.bat static 把 lua51.lib 编出来）
@@ -214,6 +218,11 @@ luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 #endif
 
 #include "xthread.h"
+#include "xmacro.h"   // 必须最后包含；带 -DXMACRO_USE_RPMALLOC=0 构建时四个 rpmalloc_* 调用自动 stub 成 no-op
+
+// rpmalloc 必须先于一切分配（包括 xthread_init 内部的 calloc）初始化；
+// 同时把主线程注册到 rpmalloc。WITH_RPMALLOC=0 构建时这行被 stub 掉。
+rpmalloc_initialize(NULL);
 
 lua_State* L = luaL_newstate();
 luaL_openlibs(L);
@@ -227,9 +236,52 @@ luaL_requiref(L, "xnet",     luaopen_xnet,     1); lua_pop(L, 1);
 luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1); lua_pop(L, 1);
 luaL_requiref(L, "xutils",   luaopen_xutils,   1); lua_pop(L, 1);
 
-// 初始化线程系统
+// 初始化线程系统（worker 线程的 rpmalloc_thread_initialize/_finalize 由框架自动配对）
 xthread_init();
+
+// ... 业务循环 ...
+
+// 退出前
+xthread_uninit();
+lua_close(L);
+rpmalloc_finalize();
 ```
+
+### 2.7 内存分配器（rpmalloc + xmacro.h）
+
+xnet2lua 默认把**项目自己写的 C 代码**的 `malloc / calloc / realloc / free / strdup` 路由到 mjansson/rpmalloc（`3rd/rpmalloc/rpmalloc.c`）。rpmalloc 的每线程 cache + 跨线程 deferred-free 队列正好匹配本项目的 actor 模型——大量 POST/RPC buffer 由 sender 线程分配、receiver 线程释放，这种工况下 rpmalloc 不依赖全局锁。
+
+路由由 `xmacro.h` 中的函数式宏完成：
+
+```c
+#define malloc(n)     rpmalloc(n)
+#define calloc(n,s)   rpcalloc((n),(s))
+#define realloc(p,n)  rprealloc((p),(n))
+#define free(p)       rpfree(p)
+#define strdup(s)     xmacro_rpstrdup(s)
+```
+
+**关键边界**：xnet2lua **不**劫持 CRT 的 `malloc/free` 符号（rpmalloc 自带的 `ENABLE_OVERRIDE` 已强制关闭）。所以 libc 调用、miniz / mbedTLS、以及 Lua VM 自己的 GC 仍然全部走 libc。两套分配器各管各的，绝不交叉——rpmalloc 出来的指针必须用 rpfree 释放，libc 出来的指针必须用 libc free 释放。你写业务 C 代码时不要把 libc 分配的指针交给 xnet2lua 释放，反之亦然。
+
+**yyjson 是个例外**——它在 HTTP/JSON API 场景里调用极频繁，所以特别处理过：`xlua/lua_xutils.c` 定义了一个 `g_xj_alc`（`yyjson_alc` 结构体）将 yyjson 内部的 `malloc/realloc/free` 全部走 `xmacro.h` 路由的同一套分配器。所以**yyjson 的 doc / 输出字符串都和项目其它内存来自同一个 rpmalloc 池**，统一统计、统一释放、无堆错配。如果你在自己代码里直接调 `yyjson_*_opts` / `yyjson_*_doc_new`，记得把 `&g_xj_alc` 传进去而不是 NULL；否则 doc 内存来自 libc，最终被路由后的 `rpfree` 释放 → 堆损坏（症状：进程退出时 Windows 0xC0000374）。
+
+**开关**（默认开，详见 §2.1 / §2.2）：
+
+| 入口 | 关闭方式 | 效果 |
+|---|---|---|
+| Makefile | `make WITH_RPMALLOC=0` | 宏退化为 libc 名字；`rpmalloc.c` 不参与链接 |
+| build.bat | `build.bat norpmalloc` | 同上 |
+
+`WITH_RPMALLOC=0` 时，`xmacro.h` 把 `rpmalloc_initialize / _finalize / _thread_initialize / _thread_finalize` 四个 lifecycle API 同时 stub 成 no-op，调用点无需 `#ifdef` 保护。适合用 AddressSanitizer / Valgrind 调内存问题、或做 rpmalloc vs libc 的对比压测。
+
+**嵌入式使用约定**（§2.6 已含代码）：
+- 主线程必须在 `xthread_init()` 之前调一次 `rpmalloc_initialize(NULL)`，进程退出前调一次 `rpmalloc_finalize()`。
+- Worker 线程不需要管——框架的 `worker_func` 已经在线程入口/出口配对调用 `rpmalloc_thread_initialize / _finalize`。
+- 跨线程 POST/RPC 的 buffer：sender 用 `xmacro.h` 路由后的 `malloc`，receiver 用同一套宏路由后的 `free`，rpmalloc 内部走 deferred-free 队列归还给 owner thread，**无需同步**。
+
+> ⚠️ **MinGW + rpmalloc 已知陷阱**：rpmalloc 上游 `rpmalloc.c` 末尾默认 `#include "malloc.c"`，把 libc 的 `malloc/calloc/free` 符号全局替换。**MinGW 的 emulated TLS 内部用 `calloc` 分配 `_Thread_local` 存储**——首次访问任何 `_Thread_local` 变量就会触发 `calloc → rpcalloc → get_thread_heap → __emutls_get_address → calloc → ...` 无限递归，进程在 `main()` 跑起来**之前**就 `0xC00000FD` (stack overflow) 退出，**没有任何 stdout / stderr 输出**。本仓库的 `Makefile` 和 `build.bat` 已经强制带上 `-DENABLE_OVERRIDE=0` 规避。**如果你把构建系统迁到别处或自己写编译规则，务必保留这个宏**。MSVC 不受影响（它的 `__declspec(thread)` 不经过 calloc），但 `-DENABLE_OVERRIDE=0` 仍然该保留——否则 rpmalloc 会跟你自己代码里的其它分配器抢 CRT 符号。
+
+> 💡 **小坑：3rd-party 头里的 `.free` / `.malloc` 字段**。函数式宏 `#define free(p) rpfree(p)` 遇到 `xxx.free(ctx, ptr)` 这样的字段调用会被错误展开（变成 `xxx.rpfree((ctx, ptr))`）。本仓库已知的中招点是 `3rd/yyjson.h` 里 `yyjson_alc` 的 `.free`/`.malloc` 字段。规则：**`xmacro.h` 必须在 `yyjson.h` 之后**才 include。如果你引入新的 3rd-party 头有同样字段命名，照此处理。
 
 ---
 

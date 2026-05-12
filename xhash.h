@@ -7,6 +7,11 @@
 #include <stdlib.h>
 #include <assert.h>
 
+/* Route malloc/free/strdup used by XHASH_MALLOC/FREE/STRDUP through rpmalloc.
+** xmacro.h is self-contained: it pulls <stdlib.h>/<string.h> first, then
+** shadows the libc names — safe to include after the prototypes above. */
+#include "xmacro.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
