@@ -1,9 +1,11 @@
 // xtimer.c
-#include "xtimer.h"
+#include "xtimer.h"     /* transitively pulls xmacro.h via xheapmin.h */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <limits.h>
+
+#include "xmacro.h"     /* explicit; safe after system headers */
 
 #define XTIMER_MIN_CAP        16
 #define XTIMER_DEFAULT_CAP    100

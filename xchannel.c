@@ -8,6 +8,8 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "xmacro.h"   /* malloc/free → rpmalloc; must come after system headers */
+
 #if defined(XCHANNEL_USE_IO_URING) && defined(XPOLL_WITH_IO_URING)
 #define XCHANNEL_WITH_IO_URING 1
 #endif

@@ -50,7 +50,9 @@
 
 #include "xthread.h"
 #include "xlog.h"
-#include "xtimer.h"
+#include "xtimer.h"      /* transitively pulls xmacro.h via xheapmin.h */
+
+#include "../xmacro.h"   /* explicit, in case header chain changes */
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
 static void luaL_requiref(lua_State* L, const char* modname,

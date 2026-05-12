@@ -6,6 +6,12 @@ ARFLAGS ?= rcs
 WITH_IO_URING ?= 0
 WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
+# WITH_RPMALLOC=1 (default): route allocs through rpmalloc via xmacro.h,
+#   link 3rd/rpmalloc/rpmalloc.c.
+# WITH_RPMALLOC=0: pass through to libc; useful for ASan/Valgrind/A-B perf.
+#   xmacro.h stubs out the rpmalloc_* lifecycle API as no-ops so callers
+#   compile unchanged.
+WITH_RPMALLOC ?= 1
 LUA_BACKEND ?= minilua
 LUAJIT_DIR ?= 3rd/luajit
 LUAJIT_INC ?= $(LUAJIT_DIR)/src
@@ -13,6 +19,17 @@ LUAJIT_LIB ?= $(LUAJIT_DIR)/src/libluajit.a
 BUILD_MODE ?= release
 
 BASE_CFLAGS := -Wall -Wextra -I. -MMD -MP
+
+ifeq ($(WITH_RPMALLOC),1)
+    # ENABLE_OVERRIDE=0 stops rpmalloc.c from pulling in malloc.c which would
+    # hijack libc's malloc/calloc/free symbol-wise. We route via xmacro.h
+    # instead. Also required to avoid an infinite recursion under MinGW emutls
+    # (calls calloc internally to materialise _Thread_local; would otherwise
+    # re-enter rpcalloc).
+    BASE_CFLAGS  += -DENABLE_OVERRIDE=0 -DXMACRO_USE_RPMALLOC=1
+else
+    BASE_CFLAGS  += -DXMACRO_USE_RPMALLOC=0
+endif
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS := $(BASE_CFLAGS) -O0 -g -DDEBUG
 else ifeq ($(BUILD_MODE),release)
@@ -54,7 +71,17 @@ XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(EXE_EXT)
 
-XTHREAD_TEST_SRCS := demo/xthread_test.c xthread.c xpoll.c xsock.c
+# rpmalloc is consumed by everything that uses libxsock.a or compiles xthread.c
+# directly. libxsock.a itself does NOT contain rpmalloc symbols, so both the
+# xnet target and the xthread_test target add it to their own source lists.
+# Empty when WITH_RPMALLOC=0 — xmacro.h then stubs the lifecycle API.
+ifeq ($(WITH_RPMALLOC),1)
+    RPMALLOC_SRC := 3rd/rpmalloc/rpmalloc.c
+else
+    RPMALLOC_SRC :=
+endif
+
+XTHREAD_TEST_SRCS := demo/xthread_test.c xthread.c xpoll.c xsock.c $(RPMALLOC_SRC)
 XTHREAD_TEST_BUILD := $(BIN_DIR)/xthread_test_build$(EXE_EXT)
 XTHREAD_TEST_TARGET := $(BIN_DIR)/xthread_test$(EXE_EXT)
 
@@ -116,9 +143,9 @@ $(TARGET_LIB): $(CORE_OBJS)
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(XNET_TARGET): xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
+$(XNET_TARGET): xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(XTHREAD_TEST_TARGET): $(XTHREAD_TEST_SRCS) | $(BIN_DIR)

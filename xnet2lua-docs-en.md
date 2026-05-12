@@ -84,6 +84,7 @@ Tunable variables (override on the command line as `KEY=VALUE`):
 | `WITH_HTTP` | `1` | `1` / `0` | Compile HTTP code paths |
 | `WITH_HTTPS` | `1` | `1` / `0` | Compile mbedTLS / HTTPS code paths |
 | `WITH_IO_URING` | `0` | `1` / `0` | On Linux, define `XPOLL_USE_IO_URING` and `XCHANNEL_USE_IO_URING`; links `liburing` |
+| `WITH_RPMALLOC` | `1` | `1` / `0` | Route the project's own `malloc`/`free` through rpmalloc via `xmacro.h`. With `=0` the macros pass through to libc and `rpmalloc.c` is not linked (see §2.7) |
 | `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | Use the embedded mini Lua or LuaJIT. For `luajit`, fetch the `3rd/luajit` submodule and build `libluajit.a` first |
 
 ```bash
@@ -115,6 +116,9 @@ build.bat debug
 :: Disable HTTP / HTTPS
 build.bat nohttp
 build.bat nohttps
+
+:: Disable rpmalloc; fall back to libc for the project's own allocations (see 2.7)
+build.bat norpmalloc
 
 :: Switch to the LuaJIT backend
 :: (the first run automatically calls 3rd\luajit\src\msvcbuild.bat static
@@ -243,6 +247,12 @@ To embed xnet2lua into your own C project:
 #endif
 
 #include "xthread.h"
+#include "xmacro.h"   // include LAST; the four rpmalloc_* calls below stub to no-ops when -DXMACRO_USE_RPMALLOC=0
+
+// rpmalloc must be initialized before ANY allocation, including the calloc
+// inside xthread_init(). This also registers the main thread with rpmalloc.
+// Stubs out to a no-op when built with WITH_RPMALLOC=0.
+rpmalloc_initialize(NULL);
 
 lua_State* L = luaL_newstate();
 luaL_openlibs(L);
@@ -256,9 +266,53 @@ luaL_requiref(L, "xnet",     luaopen_xnet,     1); lua_pop(L, 1);
 luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1); lua_pop(L, 1);
 luaL_requiref(L, "xutils",   luaopen_xutils,   1); lua_pop(L, 1);
 
-// Initialize the thread system
+// Initialize the thread system (worker threads handle their own
+// rpmalloc_thread_initialize / _finalize automatically inside worker_func).
 xthread_init();
+
+// ... event loop ...
+
+// Shutdown
+xthread_uninit();
+lua_close(L);
+rpmalloc_finalize();
 ```
+
+### 2.7 Memory allocator (rpmalloc + xmacro.h)
+
+By default, xnet2lua routes the project's own `malloc / calloc / realloc / free / strdup` calls to mjansson/rpmalloc (`3rd/rpmalloc/rpmalloc.c`). rpmalloc's per-thread caches plus a deferred cross-thread free queue map cleanly onto the project's actor model — most POST/RPC buffers are allocated by the sender thread and freed by the receiver thread, and rpmalloc handles that workload without a global lock.
+
+The routing is done by a set of function-like macros in `xmacro.h`:
+
+```c
+#define malloc(n)     rpmalloc(n)
+#define calloc(n,s)   rpcalloc((n),(s))
+#define realloc(p,n)  rprealloc((p),(n))
+#define free(p)       rpfree(p)
+#define strdup(s)     xmacro_rpstrdup(s)
+```
+
+**Important boundary**: xnet2lua does **not** hijack the CRT's `malloc/free` symbols (rpmalloc's own `ENABLE_OVERRIDE` is forced off). libc calls, miniz, mbedTLS, and the Lua VM's own GC all stay on libc. The two allocators are strictly partitioned — a pointer that came from rpmalloc must be freed with rpfree, and a pointer that came from libc must be freed with libc `free`. Don't hand a libc-allocated pointer to xnet2lua to free, and don't free an rpmalloc-allocated pointer with the libc `free` directly.
+
+**yyjson is the one exception.** Because JSON pack/unpack is hot in any HTTP/API workload, we redirect its allocator too — but through its first-class `yyjson_alc` hook rather than the macro-based shadow. `xlua/lua_xutils.c` defines a `g_xj_alc` whose `malloc/realloc/free` trampolines call the libc names (which `xmacro.h` routes to rpmalloc when `WITH_RPMALLOC=1`). Every `yyjson_read_opts` / `yyjson_mut_doc_new` / `yyjson_*_write_opts` call passes `&g_xj_alc`, so yyjson docs and output buffers all live in the same rpmalloc pool as the rest of the project — unified accounting, unified release, no heap mismatch. If you add a new yyjson call site, pass `&g_xj_alc` too. Passing `NULL` would silently make the doc libc-allocated and the eventual `free()` (routed by `xmacro.h` to `rpfree`) corrupts the heap (visible as `0xC0000374` on Windows process exit).
+
+**Toggle** (default on, see §2.1 / §2.2):
+
+| Build system | How to disable | Effect |
+|---|---|---|
+| Makefile | `make WITH_RPMALLOC=0` | macros expand to libc names; `rpmalloc.c` is not linked |
+| build.bat | `build.bat norpmalloc` | same |
+
+With `WITH_RPMALLOC=0`, `xmacro.h` also stubs out the four lifecycle entry points `rpmalloc_initialize / _finalize / _thread_initialize / _thread_finalize` as no-ops, so call sites compile unchanged. Useful for AddressSanitizer / Valgrind sessions, or for an A/B perf comparison against libc.
+
+**Embedding rules** (the §2.6 snippet already shows them):
+- The main thread must call `rpmalloc_initialize(NULL)` **before** `xthread_init()` and `rpmalloc_finalize()` before process exit.
+- Worker threads need no manual care — the framework's `worker_func` calls `rpmalloc_thread_initialize / _finalize` at the thread's entry and exit.
+- Cross-thread POST/RPC buffers: the sender allocates via the `xmacro.h`-routed `malloc`, the receiver frees via the same routed `free`. rpmalloc internally hands the deferred free back to the owner thread — **no extra synchronization needed**.
+
+> ⚠️ **Known trap on MinGW.** Upstream rpmalloc's `rpmalloc.c` ends with `#include "malloc.c"`, which replaces the libc `malloc/calloc/free` symbols globally. **MinGW's emulated TLS allocates `_Thread_local` storage by calling `calloc()` internally** — so the first access to any `_Thread_local` variable triggers `calloc → rpcalloc → get_thread_heap → __emutls_get_address → calloc → ...` infinite recursion. The process exits with `0xC00000FD` (stack overflow) **before `main()` runs**, with **no stdout / stderr output at all**. This repo's `Makefile` and `build.bat` already pass `-DENABLE_OVERRIDE=0` to defeat that. **If you migrate the build to another system or write your own compile rules, you must keep that define.** MSVC is unaffected (its `__declspec(thread)` does not go through calloc), but `-DENABLE_OVERRIDE=0` should stay on regardless — otherwise rpmalloc fights every other allocator in the process for the CRT symbols.
+
+> 💡 **Minor trap: 3rd-party headers with `.free` / `.malloc` fields**. The function-like macro `#define free(p) rpfree(p)` will wrongly expand `something.free(ctx, ptr)` field calls into `something.rpfree((ctx, ptr))`. The one place this hits in this repo is `3rd/yyjson.h`'s `yyjson_alc` struct (it has `.malloc`/`.free` fields and the inline json doc free path calls `alc.free(alc.ctx, doc)`). The rule: **`xmacro.h` must be included AFTER `yyjson.h`** in any `.c` that uses both. Same precaution if you pull in any other library with similar field naming.
 
 ---
 

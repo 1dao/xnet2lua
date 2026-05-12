@@ -42,6 +42,8 @@
 #  include <time.h>
 #endif
 
+#include "xmacro.h"   /* malloc/free → rpmalloc; after all system headers */
+
 /* ============================================================================
 ** Internal types
 ** ========================================================================== */
@@ -913,6 +915,11 @@ static void* worker_func(void* arg) {
 #endif
     xThread* ctx = (xThread*)arg;
     tls_set(ctx->id);
+
+    /* Register this worker with rpmalloc BEFORE any allocation happens.
+    ** xthread_internal_init may call into user on_init which allocates. */
+    rpmalloc_thread_initialize();
+
     XLOGI("Thread[%d:%s] started", ctx->id, ctx->name);
 
     xthread_internal_init(ctx);
@@ -933,6 +940,10 @@ static void* worker_func(void* arg) {
     process_tasks(ctx); /* flush tasks posted after stop was requested */
     xthread_internal_uninit(ctx);
     XLOGI("Thread[%d:%s] stopped", ctx->id, ctx->name);
+
+    /* Flush this thread's cache back to the global pool. Any cross-thread
+    ** frees still in flight will be reclaimed by their owner thread. */
+    rpmalloc_thread_finalize();
 
 #ifdef _WIN32
     return 0;
