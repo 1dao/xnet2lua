@@ -156,6 +156,17 @@ static LuaTlsConn* check_tls_conn(lua_State* L, int idx) {
     return (LuaTlsConn*)luaL_checkudata(L, idx, LUA_XNET_TLS_META);
 }
 
+static lua_State* main_lua_state(lua_State* L) {
+#ifdef LUA_RIDX_MAINTHREAD
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    lua_State* mainL = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return mainL ? mainL : L;
+#else
+    return L;
+#endif
+}
+
 static void push_tls_self(lua_State* L, LuaTlsConn* c) {
     if (!c || c->self_ref == LUA_NOREF || c->self_ref == LUA_REFNIL)
         lua_pushnil(L);
@@ -710,7 +721,7 @@ int l_xnet_attach_tls(lua_State* L) {
 
     LuaTlsConn* c = (LuaTlsConn*)lua_newuserdata(L, sizeof(*c));
     memset(c, 0, sizeof(*c));
-    c->L = L;
+    c->L = main_lua_state(L);
     c->fd = fd;
     c->self_ref = LUA_NOREF;
     c->handler_ref = LUA_NOREF;

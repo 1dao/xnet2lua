@@ -82,6 +82,17 @@ static LuaNetListener* check_listener(lua_State* L, int idx) {
     return (LuaNetListener*)luaL_checkudata(L, idx, LUA_XNET_LISTENER_META);
 }
 
+static lua_State* main_lua_state(lua_State* L) {
+#ifdef LUA_RIDX_MAINTHREAD
+    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
+    lua_State* mainL = lua_tothread(L, -1);
+    lua_pop(L, 1);
+    return mainL ? mainL : L;
+#else
+    return L;
+#endif
+}
+
 static void ref_unref(lua_State* L, int* ref) {
     if (*ref != LUA_NOREF && *ref != LUA_REFNIL) {
         luaL_unref(L, LUA_REGISTRYINDEX, *ref);
@@ -302,7 +313,7 @@ static LuaNetConn* push_conn(lua_State* L, xChannel* ch,
                               const char* ip, int port) {
     LuaNetConn* c = (LuaNetConn*)lua_newuserdata(L, sizeof(*c));
     memset(c, 0, sizeof(*c));
-    c->L = L;
+    c->L = main_lua_state(L);
     c->ch = ch;
     c->self_ref = LUA_NOREF;
     c->handler_ref = LUA_NOREF;
@@ -807,7 +818,7 @@ static int l_xnet_listen(lua_State* L) {
 
     LuaNetListener* s = (LuaNetListener*)lua_newuserdata(L, sizeof(*s));
     memset(s, 0, sizeof(*s));
-    s->L = L;
+    s->L = main_lua_state(L);
     s->fd = fd;
     s->self_ref = LUA_NOREF;
     s->handler_ref = LUA_NOREF;
@@ -861,7 +872,7 @@ static int l_xnet_listen_fd(lua_State* L) {
 
     LuaNetListener* s = (LuaNetListener*)lua_newuserdata(L, sizeof(*s));
     memset(s, 0, sizeof(*s));
-    s->L = L;
+    s->L = main_lua_state(L);
     s->fd = fd;
     s->self_ref = LUA_NOREF;
     s->handler_ref = LUA_NOREF;
