@@ -1197,7 +1197,7 @@ xnet2lua supports runtime configuration via `.cfg` files; format is `KEY=VALUE`,
 
 ```ini
 # xnet.cfg example
-SERVER_NAME=myserver
+# SERVER_NAME=myserver # Move it to startup parameters to support configuration sharing.
 
 HTTP_HOST=0.0.0.0
 HTTP_PORT=8080

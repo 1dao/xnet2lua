@@ -1227,7 +1227,7 @@ xnet2lua 支持通过 `.cfg` 文件管理运行时配置，格式为 `KEY=VALUE`
 
 ```ini
 # xnet.cfg 示例
-SERVER_NAME=myserver
+# SERVER_NAME=myserver #移动到启动参数中，为了支持配置共享
 
 HTTP_HOST=0.0.0.0
 HTTP_PORT=8080
