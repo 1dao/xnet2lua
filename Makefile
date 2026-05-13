@@ -6,6 +6,7 @@ ARFLAGS ?= rcs
 WITH_IO_URING ?= 0
 WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
+WITH_XDEBUG ?= 0
 # WITH_RPMALLOC=1 (default): route allocs through rpmalloc via xmacro.h,
 #   link 3rd/rpmalloc/rpmalloc.c.
 # WITH_RPMALLOC=0: pass through to libc; useful for ASan/Valgrind/A-B perf.
@@ -66,6 +67,7 @@ XNET_CFLAGS :=
 XNET_HTTPS_SRC :=
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c
 XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c
+XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
@@ -114,6 +116,13 @@ else
 	$(error Unsupported LUA_BACKEND '$(LUA_BACKEND)'; expected 'minilua' or 'luajit')
 endif
 
+ifeq ($(WITH_XDEBUG),1)
+	XNET_DEFS += -DXNET_WITH_XDEBUG=1
+	XNET_DEBUG_SRC := xlua/lua_xdebug.c
+else
+	XNET_DEFS += -DXNET_WITH_XDEBUG=0
+endif
+
 ifeq ($(WITH_IO_URING),1)
 ifneq ($(OS),Windows_NT)
 	CFLAGS += -DXPOLL_USE_IO_URING -DXCHANNEL_USE_IO_URING
@@ -143,9 +152,9 @@ $(TARGET_LIB): $(CORE_OBJS)
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(XNET_TARGET): xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
+$(XNET_TARGET): xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xnet_main.c $(XNET_LUA_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(XTHREAD_TEST_TARGET): $(XTHREAD_TEST_SRCS) | $(BIN_DIR)

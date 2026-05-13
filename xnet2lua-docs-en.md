@@ -22,8 +22,12 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 12. Thread ID Constants  
 13. Complete Example: TCP Server  
 14. Complete Example: HTTP API Service  
-15. Complete Example: Cross-thread RPC  
+15. Complete Example: Cross-thread RPC
 16. Best Practices and Considerations
+17. xadmin Console
+18. xnats Cross-Process RPC
+19. Hot Reload Protocol
+20. Lua Debugging and VSCode Debugging
 
 ---
 
@@ -84,6 +88,7 @@ Tunable variables (override on the command line as `KEY=VALUE`):
 | `WITH_HTTP` | `1` | `1` / `0` | Compile HTTP code paths |
 | `WITH_HTTPS` | `1` | `1` / `0` | Compile mbedTLS / HTTPS code paths |
 | `WITH_IO_URING` | `0` | `1` / `0` | On Linux, define `XPOLL_USE_IO_URING` and `XCHANNEL_USE_IO_URING`; links `liburing` |
+| `WITH_XDEBUG` | `0` | `1` / `0` | Compile the native Lua debugger into `bin/xnet`; this only adds the capability and does not start the debug service |
 | `WITH_RPMALLOC` | `1` | `1` / `0` | Route the project's own `malloc`/`free` through rpmalloc via `xmacro.h`. With `=0` the macros pass through to libc and `rpmalloc.c` is not linked (see §2.7) |
 | `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | Use the embedded mini Lua or LuaJIT. For `luajit`, fetch the `3rd/luajit` submodule and build `libluajit.a` first |
 
@@ -91,6 +96,7 @@ Tunable variables (override on the command line as `KEY=VALUE`):
 # Examples
 make BUILD_MODE=debug
 make WITH_HTTPS=0
+make WITH_XDEBUG=1                         # compile debugger support; runtime still needs XDEBUG_BOOT or xthread.xdebug_start
 make WITH_IO_URING=1                       # Linux only
 make LUA_BACKEND=luajit                    # see 2.5
 ```
@@ -119,6 +125,9 @@ build.bat nohttps
 
 :: Disable rpmalloc; fall back to libc for the project's own allocations (see 2.7)
 build.bat norpmalloc
+
+:: Compile native Lua debugger support; this does not start the debug service
+build.bat xdebug
 
 :: Switch to the LuaJIT backend
 :: (the first run automatically calls 3rd\luajit\src\msvcbuild.bat static
@@ -611,6 +620,36 @@ local id = xthread.current_id()
 -- Get main thread ID constant
 local main_id = xthread.MAIN   -- value 1
 ```
+
+### 4.7 Native Lua Debugger Control
+
+These APIs are available when xnet is built with `WITH_XDEBUG=1`. In the default
+production build they report that debugging is unavailable or disabled.
+
+```lua
+-- Start the native Lua debug service at runtime.
+-- port: TCP debug port; 19090 is the recommended default.
+-- wait: true stops Lua threads on their next line; for remote on-demand
+--       startup, false is usually easier to use.
+-- Returns: true + message, or false + error.
+local ok, msg = xthread.xdebug_start(19090, false)
+
+-- Query debug service status.
+-- Returns: running(bool), port(number)
+local running, port = xthread.xdebug_status()
+```
+
+The usual operational path is to run this from the xadmin script executor:
+
+```lua
+local ok, msg = xthread.xdebug_start(19090, false)
+return ok, msg
+```
+
+The Lua thread that executes the script is enabled immediately. Other
+registered Lua threads enable their debug hooks on their next update tick, which
+keeps all hook installation inside the owning OS thread and avoids touching
+another thread's `lua_State` directly.
 
 ---
 
@@ -2090,3 +2129,374 @@ current=<current_thread_id> notified=<count> deferred=<count>
 5. **Use the `local foo = state.foo` aliasing pattern** so old and new code (and old/new coroutines) reference the same sub-table.
 6. **Coroutine-shaped request dispatch** — let yielding APIs (`xnats.rpc`, `xthread.rpc`, `xtimer` callbacks) be called synchronously inside the handler; the response flows back through the coroutine naturally. `scripts/xadmin/xadmin_worker.lua`'s `start_request` + per-connection `queue` is the reference implementation.
 7. **Smoke-test**: change one line → `POST /api/reload {target:"self"}` → confirm new behavior live → revert + reload again → confirm gone. No process restart in either step.
+
+---
+
+## 20. Lua Debugging and VSCode Debugging
+
+xnet2lua includes a native Lua debugger for its multi-OS-thread,
+multi-`lua_State`, coroutine-heavy runtime. It is not based on `Local Lua
+Debugger`. Instead, xnet starts a small in-process TCP debug service, and
+`tools/xdebug_dap.js` bridges that protocol to VSCode's Debug Adapter Protocol.
+
+### 20.1 Files and Responsibilities
+
+| File | Purpose |
+|---|---|
+| `xlua/lua_xdebug.c` / `xlua/lua_xdebug.h` | Native C debug core: TCP service, breakpoints, stepping, stacks, locals, thread state |
+| `tools/xdebug_dap.js` | VSCode DAP bridge, run by Node.js on the development host |
+| `.vscode/launch.json` | VSCode attach configuration |
+| `.vscode/tasks.json` | Background task that starts the DAP bridge |
+| `xdebug.md` | Short debugger guide and raw TCP protocol reference |
+
+### 20.2 Build
+
+The default build does not include the debugger:
+
+```bash
+make xnet
+```
+
+Compile debugger support into `bin/xnet`:
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 xnet
+```
+
+LuaJIT is supported too:
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit xnet
+```
+
+MSVC:
+
+```bat
+build.bat debug nohttps xdebug xnet
+```
+
+Keep the switches separate:
+
+| Switch | Phase | Meaning |
+|---|---|---|
+| `WITH_XDEBUG=1` | Build time | Compile debugger support into the executable; does not start debugging |
+| `XDEBUG_BOOT=1` | Process startup | Start the debug service during process boot |
+| `xthread.xdebug_start(...)` | Runtime | Start the debug service on demand after the process is already running |
+
+The old `XDEBUG=1` startup flag is no longer used.
+
+### 20.3 Start Debugging at Process Boot
+
+Useful for local development when you want to debug from the first line:
+
+```bat
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18091 XDEBUG_BOOT=1 XDEBUG_PORT=19090 XDEBUG_WAIT=1
+```
+
+Arguments:
+
+| Argument | Meaning |
+|---|---|
+| `XDEBUG_BOOT=1` | Start the debug service during process boot |
+| `XDEBUG_PORT=19090` | Native debug TCP port; `19090` is the recommended default |
+| `XDEBUG_WAIT=1` | Stop each Lua state on its first executable Lua line so VSCode can attach before it continues |
+
+If you do not want the process to stop during startup:
+
+```bat
+XDEBUG_BOOT=1 XDEBUG_PORT=19090 XDEBUG_WAIT=0
+```
+
+### 20.4 Start Debugging On Demand
+
+This is the recommended path for test environments or remote incidents. Start
+the process without any debug startup flags:
+
+```bat
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18091
+```
+
+When debugging is needed, run this from xadmin's script executor:
+
+```lua
+local ok, msg = xthread.xdebug_start(19090, false)
+return ok, msg
+```
+
+Check status:
+
+```lua
+local running, port = xthread.xdebug_status()
+return running, port
+```
+
+For on-demand remote startup, pass `false` as the second argument: start the
+service, attach VSCode, set breakpoints, then trigger the request again. Passing
+`true` makes Lua threads stop on their next executable line, which is useful
+only when the debugger is ready to attach immediately.
+
+### 20.5 VSCode Workflow
+
+The debugger itself does not require VSCode, but the recommended client is
+VSCode with its built-in DAP debugger. This section gives **copy-paste ready**
+`.vscode/` files. These files are **not committed** to the repo; each developer
+creates them locally under the workspace root.
+
+#### 20.5.1 Prerequisites
+
+- `bin/xnet.exe` built with `WITH_XDEBUG=1` (see §20.2).
+- Node.js installed (≥ 18 recommended). `tools/xdebug_dap.js` is the Node
+  bridge that translates xnet's native debug protocol into DAP for VSCode.
+- An xnet process is running with the debug service enabled via either
+  `XDEBUG_BOOT=1` (§20.3) or `xthread.xdebug_start(...)` (§20.4).
+
+#### 20.5.2 Create `.vscode/tasks.json`
+
+Wire the DAP bridge as a pre-launch task. VSCode will run
+`node tools/xdebug_dap.js ...` on F5 and the bridge listens for DAP on
+`127.0.0.1:4711`.
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "xnet-xdebug-dap",
+            "type": "shell",
+            "command": "node",
+            "args": [
+                "${workspaceFolder}/tools/xdebug_dap.js",
+                "--listen", "4711",
+                "--xdebug-host", "127.0.0.1",
+                "--xdebug-port", "19090",
+                "--cwd", "${workspaceFolder}"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "xnet-xdebug-dap",
+                "pattern": { "regexp": ".*" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "xnet-xdebug-dap starting",
+                    "endsPattern": "xnet-xdebug-dap listening"
+                }
+            }
+        }
+    ]
+}
+```
+
+`beginsPattern` / `endsPattern` exactly match the strings
+`tools/xdebug_dap.js` prints (`xnet-xdebug-dap starting` and
+`xnet-xdebug-dap listening on 127.0.0.1:4711`) so VSCode can tell when the
+background task is ready.
+
+Bridge flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--listen` | `4711` | Local port the bridge exposes to VSCode (DAP side). |
+| `--xdebug-host` | `127.0.0.1` | Host where the native debug service listens. For remote debugging, keep `127.0.0.1` and use port-forwarding (see §20.7). |
+| `--xdebug-port` | `19090` | Native debug port — must match `XDEBUG_PORT`. |
+| `--cwd` | process CWD | Used to normalize absolute breakpoint paths down to repo-relative paths; always pass `${workspaceFolder}` explicitly. |
+
+#### 20.5.3 Create `.vscode/launch.json`
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "XNet Lua Attach :19090",
+            "type": "node",
+            "request": "attach",
+            "debugServer": 4711,
+            "preLaunchTask": "xnet-xdebug-dap",
+            "cwd": "${workspaceFolder}",
+            "xdebugHost": "127.0.0.1",
+            "xdebugPort": 19090
+        }
+    ]
+}
+```
+
+Key fields:
+
+| Field | Required | Meaning |
+|---|---|---|
+| `type` | yes | Hard-coded `node`. VSCode talks DAP directly via `debugServer`; it does not actually launch a Node debugger. |
+| `debugServer` | yes | Must match `--listen` in `tasks.json` (default `4711`). |
+| `preLaunchTask` | yes | Auto-starts the `xnet-xdebug-dap` background task; without it, you must start the bridge manually. |
+| `cwd` | yes | Repo root. Lua source resolution and breakpoint path normalization are anchored here. |
+| `xdebugHost` / `xdebugPort` | no | Passed through to the bridge so you can switch targets purely from `launch.json`; keep them aligned with `tasks.json` to avoid confusion. |
+
+Add more `configurations` entries (with different `debugServer` and
+`xdebugPort` values) to attach to multiple targets concurrently — for example
+one local and one remote process.
+
+#### 20.5.4 One-shot Debug Flow
+
+1. Start xnet with debug enabled (§20.3 or §20.4).
+2. Open the workspace in VSCode; confirm both JSON files exist under `.vscode/`.
+3. Open Run and Debug, pick `XNet Lua Attach :19090`, press F5.
+4. VSCode auto-runs the `xnet-xdebug-dap` background task (terminal shows
+   `xnet-xdebug-dap listening on 127.0.0.1:4711`), then attaches.
+5. Set breakpoints in Lua files and trigger the matching request.
+
+Connection chain: `VSCode ──DAP──▶ 127.0.0.1:4711 (Node bridge) ──native──▶ 127.0.0.1:19090 (xnet built-in)`.
+
+When a breakpoint hits, the current xnet thread is visible in three places:
+
+| Location | Example |
+|---|---|
+| Call Stack thread name | `T60 stopped scripts/xadmin/xadmin_app.lua:165 (xadmin_worker.lua)` |
+| Debug Console | `[xnet] breakpoint: T60 stopped at scripts/xadmin/xadmin_app.lua:165 ...` |
+| Variables panel | `XNet Thread` scope with `xnet_thread_id`, `script`, and `stopped_at` |
+
+#### 20.5.5 `.vscode/` Layout and Setup
+
+Place both JSON snippets under a `.vscode/` directory at the repo root. The
+file names are fixed:
+
+```
+xnet2lua/
+├── .vscode/
+│   ├── tasks.json    ← see §20.5.2
+│   └── launch.json   ← see §20.5.3
+├── tools/xdebug_dap.js
+├── bin/xnet.exe
+└── ...
+```
+
+Steps:
+
+1. Create the `.vscode` folder at the repo root (skip if it exists).
+   On Windows:
+
+   ```bat
+   mkdir .vscode
+   ```
+
+   Or right-click the empty area in the VSCode file tree ▶ *New Folder* ▶
+   name it `.vscode`.
+
+2. Create `.vscode/tasks.json` and paste the content from §20.5.2.
+3. Create `.vscode/launch.json` and paste the content from §20.5.3.
+4. Reload the VSCode window (`Ctrl+Shift+P` ▶ *Developer: Reload Window*) or
+   refresh the Run and Debug panel; `XNet Lua Attach :19090` will appear in
+   the dropdown.
+
+Common tweaks:
+
+- **Port conflicts**: change `--listen` in `tasks.json` and `debugServer` in
+  `launch.json` together — they must match. When you change `XDEBUG_PORT` on
+  the xnet side, also sync `--xdebug-port` in `tasks.json` and `xdebugPort`
+  in `launch.json`.
+- **Attach multiple targets in parallel**: duplicate the task (change `label`
+  and `--listen`) and duplicate the configuration (change `name`,
+  `debugServer`, `preLaunchTask`). Pick the right entry when hitting F5.
+- **Node not on PATH**: replace `"command": "node"` in `tasks.json` with an
+  absolute path, e.g. `"C:/Program Files/nodejs/node.exe"`.
+- **JSON parse errors**: standard `.json` forbids comments. Rename the file
+  to `.jsonc` or add a `files.associations` entry mapping `tasks.json` /
+  `launch.json` to `jsonc` if you want inline comments.
+- **Config not picked up**: make sure the workspace was opened as a folder
+  (not as a single file) and `.vscode/` sits directly under the workspace
+  root, not nested deeper.
+
+Whether to commit `.vscode/` to git is up to each project. Because ports and
+Node paths differ per developer, a common pattern is to add `.vscode/` to a
+local `.gitignore` and let everyone maintain their own copy based on the
+templates above.
+
+### 20.6 Threads and Coroutines
+
+Each xnet OS thread owns an independent `lua_State`. The debugger installs a
+line hook for each registered Lua state and wraps `coroutine.create` /
+`coroutine.wrap`, so new coroutines inherit debug hooks.
+
+These paths are debuggable:
+
+- Main-thread scripts such as `scripts/xadmin/xadmin_main.lua`
+- Dynamic worker scripts such as `scripts/xadmin/xadmin_worker.lua`
+- xadmin HTTP request coroutines such as `scripts/xadmin/xadmin_app.lua`
+- xrouter RPC handler coroutines
+- The `/api/exec` path used by the xadmin script executor
+
+Debug hooks must be installed by the OS thread that owns the target
+`lua_State`. During on-demand startup, other threads enable themselves on their
+next update tick, which avoids touching another thread's Lua state directly.
+
+### 20.7 Remote Debugging
+
+The native debug service listens on the target machine's own `127.0.0.1`.
+Do not expose the debug port directly to the public network. Use port
+forwarding instead.
+
+SSH remote host:
+
+```bash
+ssh -L 19090:127.0.0.1:19090 user@remote-host
+```
+
+Then keep VSCode attached to local `127.0.0.1:19090`.
+
+Android device or emulator:
+
+```bash
+adb forward tcp:19090 tcp:19090
+```
+
+iOS device:
+
+```bash
+iproxy 19090 19090
+```
+
+iOS Simulator or local macOS usually works with the local port directly. The
+preferred rule is simple: keep VSCode configured for a local port and forward
+that local port to the target device or machine.
+
+### 20.8 Performance and Security
+
+Performance impact has three levels:
+
+| State | Impact |
+|---|---|
+| `WITH_XDEBUG=0` | Debugger is not compiled; no runtime impact |
+| `WITH_XDEBUG=1`, service not started | Only lightweight state registration; no line hook; very small impact |
+| Debug service running | Every Lua line enters the debug hook; hot loops and high-frequency code slow down noticeably |
+
+Security recommendations:
+
+- Build production binaries with `WITH_XDEBUG=0`.
+- Test binaries may use `WITH_XDEBUG=1`, but should not boot with `XDEBUG_BOOT=1` by default.
+- Protect xadmin's remote script executor with authentication.
+- Do not expose `XDEBUG_PORT` publicly; use SSH/ADB/iproxy forwarding.
+
+### 20.9 Troubleshooting
+
+**1. Why can I debug after building with `WITH_XDEBUG=1`?**
+
+Either the process was started with `XDEBUG_BOOT=1`, or someone already called
+`xthread.xdebug_start(...)`. `WITH_XDEBUG=1` alone only compiles the capability.
+
+**2. Does the old `XDEBUG=1` flag still work?**
+
+No. Startup now only recognizes `XDEBUG_BOOT=1`.
+
+**3. Breakpoints do not hit.**
+
+Check that VSCode is attached to the same port as `XDEBUG_PORT`; make sure local
+files match the running code; and place breakpoints on executable Lua lines, not
+on comments, blank lines, or some function declaration lines.
+
+**4. The process is suspended after startup.**
+
+That is expected when `XDEBUG_WAIT=1` is used. Attach VSCode and continue, or
+use `XDEBUG_WAIT=0`.
+
+**5. Which thread am I stopped in?**
+
+Look at the Call Stack thread name or the `XNet Thread` scope in the Variables
+panel.

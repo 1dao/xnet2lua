@@ -51,6 +51,7 @@
 #include "xthread.h"
 #include "xlog.h"
 #include "xtimer.h"      /* transitively pulls xmacro.h via xheapmin.h */
+#include "lua_xdebug.h"
 
 #include "../xmacro.h"   /* explicit, in case header chain changes */
 
@@ -1057,12 +1058,15 @@ static void lua_thread_on_init(xThread* thr) {
     luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
     lua_pop(L, 1);
 
+    xdebug_attach_state(L, xthread_get_id(thr), td->script_path);
+
     /* Load the script in THIS THREAD'S own Lua state
     ** Script returns the definition table with callbacks */
     XLOGI("lua_thread_on_init: loading script '%s' for thread %d", td->script_path, xthread_get_id(thr));
     if (luaL_dofile(L, td->script_path) != LUA_OK) {
         XLOGE("lua_thread_on_init: failed to load script '%s': %s",
               td->script_path, lua_tostring(L, -1));
+        xdebug_detach_state(L);
         lua_close(L);
         td->L = NULL;
         return;
@@ -1071,6 +1075,7 @@ static void lua_thread_on_init(xThread* thr) {
     /* Script should return the definition table */
     if (!lua_istable(L, -1)) {
         XLOGE("lua_thread_on_init: script '%s' did not return a definition table", td->script_path);
+        xdebug_detach_state(L);
         lua_close(L);
         td->L = NULL;
         return;
@@ -1163,6 +1168,7 @@ static void lua_thread_on_update(xThread* thr) {
     if (!td || !td->L) return;
 
     lua_State* L = td->L;
+    xdebug_update_state(L);
 
     if (td->update_ref != LUA_NOREF) {
         int base = lua_gettop(L);
@@ -1219,6 +1225,7 @@ static void lua_thread_on_cleanup(xThread* thr) {
 
     if (td->L) {
         lua_State* L = td->L;
+        xdebug_detach_state(L);
         thread_data_unref_callbacks(td, L);
         td->L = NULL;
         lua_close(L);
@@ -1367,6 +1374,34 @@ static int l_xthread_shutdown_thread(lua_State* L) {
     return 1;
 }
 
+static int l_xthread_xdebug_start(lua_State* L) {
+    char port_s[32];
+    char wait_s[8];
+    char err[256];
+    int port = (int)luaL_optinteger(L, 1, 19090);
+    int wait = lua_toboolean(L, 2);
+
+    snprintf(port_s, sizeof(port_s), "%d", port);
+    snprintf(wait_s, sizeof(wait_s), "%d", wait ? 1 : 0);
+    if (!xdebug_start_current(L, port_s, wait_s, err, (int)sizeof(err))) {
+        lua_pushboolean(L, 0);
+        lua_pushstring(L, err[0] ? err : "xdebug is not available");
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    lua_pushfstring(L, "xdebug listening on 127.0.0.1:%d for thread %d",
+                    port, xthread_current_id());
+    return 2;
+}
+
+static int l_xthread_xdebug_status(lua_State* L) {
+    int port = 0;
+    int running = xdebug_status(&port);
+    lua_pushboolean(L, running);
+    lua_pushinteger(L, port);
+    return 2;
+}
+
 /* ============================================================================
 ** Module registration
 ** ========================================================================== */
@@ -1382,6 +1417,8 @@ static const luaL_Reg xthread_funcs[] = {
     { "current_id",       l_current_id   },
     { "create_thread",    l_xthread_create_thread },
     { "shutdown_thread",  l_xthread_shutdown_thread },
+    { "xdebug_start",     l_xthread_xdebug_start },
+    { "xdebug_status",    l_xthread_xdebug_status },
     { NULL, NULL }
 };
 
