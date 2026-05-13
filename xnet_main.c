@@ -36,6 +36,7 @@
 #include "xlog.h"
 #include "xthread.h"
 #include "xtimer.h"
+#include "xlua/lua_xdebug.h"
 
 #include "xmacro.h"   /* malloc/free → rpmalloc; runtime lifecycle in main() */
 
@@ -140,6 +141,9 @@ static xArgsCFG g_arg_configs[] = {
     { 0,   "XADMIN_TOKEN", NULL, 0 },
     { 0,   "XADMIN_HEARTBEAT_MS", NULL, 0 },
     { 0,   "XADMIN_PEER_TTL_MS", NULL, 0 },
+    { 0,   "XDEBUG_BOOT", NULL, 0 },
+    { 0,   "XDEBUG_PORT", NULL, 0 },
+    { 0,   "XDEBUG_WAIT", NULL, 0 },
     { 0,   "REDIS_HOST", NULL, 0 },
     { 0,   "REDIS_PORT", NULL, 0 },
     { 0,   "REDIS_DB", NULL, 0 },
@@ -352,10 +356,12 @@ static MainLuaData* main_init(void) {
     install_stop(L);
     install_main_reload(data);
     set_runner_globals(L);
+    xdebug_attach_state(L, XTHR_MAIN, g_main_file);
 
     XLOGI("[xnet] loading main script '%s'", g_main_file);
     if (luaL_dofile(L, g_main_file) != LUA_OK) {
         XLOGE("[xnet] load %s failed: %s", g_main_file, lua_tostring(L, -1));
+        xdebug_detach_state(L);
         lua_close(L);
         free(data);
         g_exit_code = 1;
@@ -364,6 +370,7 @@ static MainLuaData* main_init(void) {
 
     if (!lua_istable(L, -1)) {
         XLOGE("[xnet] %s did not return a table", g_main_file);
+        xdebug_detach_state(L);
         lua_close(L);
         free(data);
         g_exit_code = 1;
@@ -427,6 +434,7 @@ static int main_auto_drive(int max_wait_ms) {
 static void main_update(MainLuaData* data) {
     if (!data || !data->L) return;
     lua_State* L = data->L;
+    xdebug_update_state(L);
 
     if (data->update_ref != LUA_NOREF) {
         int base = lua_gettop(L);
@@ -466,6 +474,7 @@ static void main_uninit(MainLuaData* data) {
     }
 
     if (data->L) {
+        xdebug_detach_state(data->L);
         unref_if_needed(data->L, &data->sync_handler_ref);
         unref_if_needed(data->L, &data->init_ref);
         unref_if_needed(data->L, &data->update_ref);
@@ -503,10 +512,12 @@ int main(int argc, char** argv) {
     xargs_init(g_arg_configs, (int)(sizeof(g_arg_configs) / sizeof(g_arg_configs[0])),
                argc - 1, &argv[1]);
     g_process_name = xargs_get("SERVER_NAME");
+    xdebug_configure(xargs_get("XDEBUG_BOOT"), xargs_get("XDEBUG_PORT"), xargs_get("XDEBUG_WAIT"));
 
     if (!xthread_init()) {
         XLOGE("[xnet] xthread_init failed");
         xargs_cleanup();
+        xdebug_shutdown();
         rpmalloc_finalize();
         return 1;
     }
@@ -516,6 +527,7 @@ int main(int argc, char** argv) {
     if (!data) {
         xthread_uninit();
         xargs_cleanup();
+        xdebug_shutdown();
         rpmalloc_finalize();
         return g_exit_code ? g_exit_code : 1;
     }
@@ -527,6 +539,7 @@ int main(int argc, char** argv) {
     main_uninit(data);
     xthread_uninit();
     xargs_cleanup();
+    xdebug_shutdown();
     rpmalloc_finalize();
     return g_exit_code;
 }

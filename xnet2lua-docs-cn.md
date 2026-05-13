@@ -24,6 +24,10 @@
 14. [完整示例：HTTP API 服务](#14-完整示例http-api-服务)
 15. [完整示例：跨线程 RPC](#15-完整示例跨线程-rpc)
 16. [最佳实践与注意事项](#16-最佳实践与注意事项)
+17. [xadmin 控制台](#17-xadmin-控制台)
+18. [xnats 跨进程 RPC](#18-xnats-跨进程-rpc)
+19. [热重载协议](#19-热重载协议)
+20. [Lua 调试与 VSCode 调试](#20-lua-调试与-vscode-调试)
 
 ---
 
@@ -81,6 +85,7 @@ make clean
 | `WITH_HTTP` | `1` | `1` / `0` | 是否编译 HTTP 代码路径 |
 | `WITH_HTTPS` | `1` | `1` / `0` | 是否编译 mbedTLS / HTTPS 路径 |
 | `WITH_IO_URING` | `0` | `1` / `0` | Linux 下启用 `XPOLL_USE_IO_URING` 与 `XCHANNEL_USE_IO_URING`，需链接 `liburing` |
+| `WITH_XDEBUG` | `0` | `1` / `0` | 是否把原生 Lua 调试器编进 `bin/xnet`；只编译能力，不会自动启动调试服务 |
 | `WITH_RPMALLOC` | `1` | `1` / `0` | 把项目自己的 `malloc/free` 通过 `xmacro.h` 路由到 rpmalloc；`=0` 时退回 libc，`rpmalloc.c` 不参与链接（详见 §2.7） |
 | `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | 内置 Lua 还是 LuaJIT；选 `luajit` 时需要先把 `3rd/luajit` 子模块拉下来并构建 `libluajit.a` |
 
@@ -88,6 +93,7 @@ make clean
 # 示例
 make BUILD_MODE=debug
 make WITH_HTTPS=0
+make WITH_XDEBUG=1                         # 编进调试能力，运行时仍需 XDEBUG_BOOT 或 xthread.xdebug_start
 make WITH_IO_URING=1                       # Linux only
 make LUA_BACKEND=luajit                    # 详见 2.5
 ```
@@ -111,6 +117,9 @@ build.bat nohttps
 
 :: 关闭 rpmalloc，自有代码的内存分配退回 libc（详见 2.7）
 build.bat norpmalloc
+
+:: 编译原生 Lua 调试器能力（不等于启动调试服务）
+build.bat xdebug
 
 :: 切换到 LuaJIT 后端
 ::（首次会自动调用 3rd\luajit\src\msvcbuild.bat static 把 lua51.lib 编出来）
@@ -592,6 +601,31 @@ local id = xthread.current_id()
 -- 获取主线程 ID 常量
 local main_id = xthread.MAIN   -- 值为 1
 ```
+
+### 4.7 原生 Lua 调试器控制
+
+这些 API 只有在构建时启用 `WITH_XDEBUG=1` 时可用；默认生产构建中会返回失败或空状态。
+
+```lua
+-- 运行中启动原生 Lua 调试服务。
+-- port: 调试 TCP 端口，默认建议 19090。
+-- wait: true 表示启用后让 Lua 线程在下一行停住；远程按需开启时通常传 false。
+-- 返回：true + 描述信息，或 false + 错误信息。
+local ok, msg = xthread.xdebug_start(19090, false)
+
+-- 查询调试服务状态。
+-- 返回：running(bool), port(number)
+local running, port = xthread.xdebug_status()
+```
+
+典型用法是在 xadmin 的“执行脚本”页面中按需启动调试服务：
+
+```lua
+local ok, msg = xthread.xdebug_start(19090, false)
+return ok, msg
+```
+
+服务启动后，当前执行脚本的 Lua 线程会立即启用调试；其它已注册 Lua 线程会在自己的下一次 update tick 中安全启用调试 hook，避免跨线程直接操作别的 `lua_State`。
 
 ---
 
@@ -2126,3 +2160,323 @@ current=<current_thread_id> notified=<count> deferred=<count>
 5. **顶层 `local foo = state.foo` 模式**：让新旧代码、新旧协程引用同一张子表。
 6. **协程化的请求 dispatch**：让 yielding API（`xnats.rpc` / `xthread.rpc` / `xtimer` 回调）可以在 handler 内同步式调用，reply / 响应通过 coroutine 自然回到 IO 层（参考 `scripts/xadmin/xadmin_worker.lua` 的 `start_request` + 每连接 `queue` 实现）。
 7. **冒烟测试**：改一行业务代码 → 调 `/api/reload {target:"self"}` → 看新行为生效 → 撤回 + reload → 看新行为消失。不重启进程。
+
+---
+
+## 20. Lua 调试与 VSCode 调试
+
+xnet2lua 提供一套原生 Lua 调试器，用来调试多 OS 线程、多 `lua_State`、多 coroutine 的运行时。它不依赖 `Local Lua Debugger`，而是在进程内启动一个本地 TCP 调试服务，再由 `tools/xdebug_dap.js` 把它转换成 VSCode Debug Adapter Protocol。
+
+### 20.1 文件与职责
+
+| 文件 | 作用 |
+|---|---|
+| `xlua/lua_xdebug.c` / `xlua/lua_xdebug.h` | C 层原生调试核心，负责 TCP 服务、断点、单步、栈、局部变量、线程状态 |
+| `tools/xdebug_dap.js` | VSCode DAP 桥，运行在开发机 Node.js 中 |
+| `.vscode/launch.json` | VSCode attach 配置 |
+| `.vscode/tasks.json` | 启动 DAP 桥的后台任务 |
+| `xdebug.md` | 调试器简版说明与原始 TCP 协议 |
+
+### 20.2 构建
+
+默认构建不包含调试器：
+
+```bash
+make xnet
+```
+
+要把调试能力编进 `bin/xnet`：
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 xnet
+```
+
+LuaJIT 后端也支持：
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit xnet
+```
+
+MSVC：
+
+```bat
+build.bat debug nohttps xdebug xnet
+```
+
+含义要分清：
+
+| 开关 | 阶段 | 含义 |
+|---|---|---|
+| `WITH_XDEBUG=1` | 编译期 | 把调试器编进程序，不会自动启动服务 |
+| `XDEBUG_BOOT=1` | 启动期 | 进程启动时自动启动调试服务 |
+| `xthread.xdebug_start(...)` | 运行期 | 进程已运行后按需启动调试服务 |
+
+旧的 `XDEBUG=1` 不再作为启动开关使用。
+
+### 20.3 启动时自动开启调试
+
+适合本地开发时从第一行开始调试：
+
+```bat
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18091 XDEBUG_BOOT=1 XDEBUG_PORT=19090 XDEBUG_WAIT=1
+```
+
+参数说明：
+
+| 参数 | 说明 |
+|---|---|
+| `XDEBUG_BOOT=1` | 启动时启动调试服务 |
+| `XDEBUG_PORT=19090` | 原生调试 TCP 端口，默认建议 `19090` |
+| `XDEBUG_WAIT=1` | 每个 Lua state 在第一条可执行 Lua 行停住，方便 VSCode attach 后继续 |
+
+如果不想启动时挂住进程，可以用：
+
+```bat
+XDEBUG_BOOT=1 XDEBUG_PORT=19090 XDEBUG_WAIT=0
+```
+
+### 20.4 运行中按需开启调试
+
+适合测试环境或远程现场：程序启动时不带任何调试启动参数。
+
+```bat
+bin\xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_PORT=18091
+```
+
+需要调试时，在 xadmin 网页的执行脚本页面运行：
+
+```lua
+local ok, msg = xthread.xdebug_start(19090, false)
+return ok, msg
+```
+
+查询状态：
+
+```lua
+local running, port = xthread.xdebug_status()
+return running, port
+```
+
+推荐把第二个参数传 `false`：先启动调试服务，再让 VSCode attach、设置断点，然后重新触发要调试的请求。传 `true` 会让 Lua 线程在下一行停住，适合你已经准备好 attach 的情况。
+
+### 20.5 VSCode 使用
+
+调试器自身不依赖 VSCode，但官方推荐的客户端就是 VSCode + 内置 DAP 调试器。本节给出可以**直接复制粘贴**的 `.vscode/` 配置；这两个文件**不入库**，每位开发者在本机仓库根目录下自行建立即可。
+
+#### 20.5.1 前置条件
+
+- 已用 `WITH_XDEBUG=1` 构建 `bin/xnet.exe`（详见 §20.2）。
+- 已安装 Node.js（建议 ≥ 18）。`tools/xdebug_dap.js` 是 Node 脚本，VSCode 通过它把原生调试协议桥接到 DAP。
+- xnet 进程已在运行，并且已经通过 `XDEBUG_BOOT=1` 或 `xthread.xdebug_start(...)` 开启了调试服务（详见 §20.3 / §20.4）。
+
+#### 20.5.2 创建 `.vscode/tasks.json`
+
+把 DAP 桥挂成 attach 前置任务。VSCode 启动调试时会自动 `node tools/xdebug_dap.js ...`，在本地 `127.0.0.1:4711` 监听 DAP。
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "xnet-xdebug-dap",
+            "type": "shell",
+            "command": "node",
+            "args": [
+                "${workspaceFolder}/tools/xdebug_dap.js",
+                "--listen", "4711",
+                "--xdebug-host", "127.0.0.1",
+                "--xdebug-port", "19090",
+                "--cwd", "${workspaceFolder}"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "xnet-xdebug-dap",
+                "pattern": { "regexp": ".*" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "xnet-xdebug-dap starting",
+                    "endsPattern": "xnet-xdebug-dap listening"
+                }
+            }
+        }
+    ]
+}
+```
+
+`beginsPattern` / `endsPattern` 与 `tools/xdebug_dap.js` 实际输出的 `xnet-xdebug-dap starting` 和 `xnet-xdebug-dap listening on 127.0.0.1:4711` 严格对齐，VSCode 才知道后台任务何时算“就绪”。
+
+桥参数说明：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--listen` | `4711` | DAP 桥对外监听的本机端口（VSCode 连这里） |
+| `--xdebug-host` | `127.0.0.1` | 原生调试端口所在主机（远程调试时写 `127.0.0.1` 配合端口转发，见 §20.7） |
+| `--xdebug-port` | `19090` | 原生调试端口（必须与 `XDEBUG_PORT` 一致） |
+| `--cwd` | 进程 CWD | 把 VSCode 设的绝对路径断点映射成相对仓库路径，建议明确传 `${workspaceFolder}` |
+
+#### 20.5.3 创建 `.vscode/launch.json`
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "XNet Lua Attach :19090",
+            "type": "node",
+            "request": "attach",
+            "debugServer": 4711,
+            "preLaunchTask": "xnet-xdebug-dap",
+            "cwd": "${workspaceFolder}",
+            "xdebugHost": "127.0.0.1",
+            "xdebugPort": 19090
+        }
+    ]
+}
+```
+
+关键字段：
+
+| 字段 | 必填 | 含义 |
+|---|---|---|
+| `type` | 是 | 固定 `node`。VSCode 通过 `debugServer` 直接走 DAP，不会真的去拉起 Node 调试器。 |
+| `debugServer` | 是 | 与 `tasks.json` 里 `--listen` 保持一致（默认 `4711`）。 |
+| `preLaunchTask` | 是 | 自动把上面的 `xnet-xdebug-dap` 任务跑起来；不写则要手动起桥。 |
+| `cwd` | 是 | 仓库根。Lua 源文件路径解析与断点路径归一都基于此目录。 |
+| `xdebugHost` / `xdebugPort` | 否 | 透传给桥，便于在 launch.json 里直接切换目标，无需改 task；建议两边写一致以免混淆。 |
+
+需要并联多个目标（例如同时调本机和远端）就再加一份 configuration、改 `debugServer` 和 `xdebugPort` 即可。
+
+#### 20.5.4 一键调试流程
+
+1. 启动 xnet 并开启调试服务（参考 §20.3 或 §20.4）。
+2. VSCode 打开仓库根目录，确认上面两个 JSON 文件在 `.vscode/` 下。
+3. 打开“运行和调试”面板，选择 `XNet Lua Attach :19090`，按 F5。
+4. VSCode 自动跑 `xnet-xdebug-dap` 后台任务（终端会看到 `xnet-xdebug-dap listening on 127.0.0.1:4711`），随后 attach。
+5. 在 Lua 文件中下断点，触发对应请求即可命中。
+
+VSCode 实际连接路径：`VSCode ──DAP──▶ 127.0.0.1:4711（Node 桥） ──原生协议──▶ 127.0.0.1:19090（xnet 内置）`。
+
+断点命中后，当前 xnet 线程会显示在三个地方：
+
+| 位置 | 示例 |
+|---|---|
+| Call Stack 线程名 | `T60 stopped scripts/xadmin/xadmin_app.lua:165 (xadmin_worker.lua)` |
+| Debug Console | `[xnet] breakpoint: T60 stopped at scripts/xadmin/xadmin_app.lua:165 ...` |
+| Variables 面板 | `XNet Thread` scope，包含 `xnet_thread_id`、`script`、`stopped_at` |
+
+#### 20.5.5 `.vscode/` 配置方式
+
+把上面两份 JSON 放在仓库根的 `.vscode/` 目录下，文件名固定：
+
+```
+xnet2lua/
+├── .vscode/
+│   ├── tasks.json    ← 见 §20.5.2
+│   └── launch.json   ← 见 §20.5.3
+├── tools/xdebug_dap.js
+├── bin/xnet.exe
+└── ...
+```
+
+创建步骤：
+
+1. 在仓库根建 `.vscode` 目录（已有则跳过）。Windows 命令行：
+
+   ```bat
+   mkdir .vscode
+   ```
+
+   或在 VSCode 文件树空白处右键 ▶ “新建文件夹” ▶ 命名 `.vscode`。
+
+2. 在 `.vscode/` 下新建 `tasks.json`，把 §20.5.2 的内容粘贴进去。
+3. 在 `.vscode/` 下新建 `launch.json`，把 §20.5.3 的内容粘贴进去。
+4. 重新加载 VSCode 窗口（`Ctrl+Shift+P` ▶ `Developer: Reload Window`）或刷新“运行和调试”面板，`XNet Lua Attach :19090` 会出现在下拉列表里。
+
+调整建议：
+
+- **端口冲突**：同时改 `tasks.json` 的 `--listen` 和 `launch.json` 的 `debugServer`（两者必须相等）。改 xnet 侧 `XDEBUG_PORT` 时，同步改 `tasks.json` 的 `--xdebug-port` 与 `launch.json` 的 `xdebugPort`。
+- **多目标并联**：复制一份 task（改 `label` 和 `--listen`）+ 复制一份 configuration（改 `name`、`debugServer`、`preLaunchTask`），F5 时分别选择即可同时 attach 多个 xnet 进程。
+- **Node 不在 PATH 上**：把 `tasks.json` 里的 `"command": "node"` 改成 Node 可执行文件的绝对路径，例如 `"C:/Program Files/nodejs/node.exe"`。
+- **JSON 校验失败**：标准 `.json` 不允许注释；如果想加注释把文件后缀改成 `jsonc`，或在 VSCode `files.associations` 里把 `tasks.json` / `launch.json` 关联到 `jsonc`。
+- **配置不生效**：确认仓库是用“打开文件夹”方式打开（不是单独打开某个文件），且 `.vscode/` 在工作区根目录，不是嵌套子目录。
+
+是否把 `.vscode/` 提交到 git 由项目自行决定。端口和 Node 路径因人而异，常见做法是把 `.vscode/` 加进本地 `.gitignore`，让每位开发者基于本节的样板各自维护一份。
+
+### 20.6 多线程和 coroutine 行为
+
+每个 xnet OS 线程都有独立 `lua_State`。调试器会为每个已注册 Lua state 安装 line hook，并包装 `coroutine.create` / `coroutine.wrap`，让新建 coroutine 继承调试 hook。
+
+因此这些场景都能断住：
+
+- 主线程脚本，例如 `scripts/xadmin/xadmin_main.lua`
+- 动态创建的 worker 线程，例如 `scripts/xadmin/xadmin_worker.lua`
+- xadmin HTTP 请求 coroutine，例如 `scripts/xadmin/xadmin_app.lua`
+- xrouter RPC handler coroutine
+- 网页“执行脚本”触发的 `/api/exec` 路径
+
+调试 hook 必须在拥有该 `lua_State` 的 OS 线程里安装。运行中按需开启调试时，其它线程会在自己的下一次 update tick 中接入调试，避免跨线程直接操作别的 Lua state。
+
+### 20.7 远程调试
+
+调试服务默认只监听目标机器自己的 `127.0.0.1`，不要直接暴露到公网。远程调试推荐端口转发。
+
+SSH 远程主机：
+
+```bash
+ssh -L 19090:127.0.0.1:19090 user@remote-host
+```
+
+然后本地 VSCode 仍然 attach `127.0.0.1:19090`。
+
+Android 设备或模拟器：
+
+```bash
+adb forward tcp:19090 tcp:19090
+```
+
+iOS 真机：
+
+```bash
+iproxy 19090 19090
+```
+
+iOS Simulator 或本机 macOS 通常可以直接使用本机端口。无论哪种方式，VSCode 配置尽量保持不变，让它始终连接本机端口。
+
+### 20.8 性能与安全
+
+性能影响分三层：
+
+| 状态 | 影响 |
+|---|---|
+| `WITH_XDEBUG=0` | 调试器不参与编译，无运行时影响 |
+| `WITH_XDEBUG=1` 但未启动服务 | 只做轻量状态登记，不安装 line hook，影响很小 |
+| 调试服务已启动 | 每行 Lua 都会进入 debug hook，热循环和高频业务会明显变慢 |
+
+安全建议：
+
+- 生产包建议 `WITH_XDEBUG=0`。
+- 测试包可以 `WITH_XDEBUG=1`，但默认不要 `XDEBUG_BOOT=1`。
+- xadmin 远程执行脚本必须有鉴权，避免任何人都能启动调试服务。
+- 不建议把 `XDEBUG_PORT` 暴露到公网；使用 SSH/ADB/iproxy 端口转发。
+
+### 20.9 常见问题
+
+**1. `WITH_XDEBUG=1` 后为什么还能直接调试？**
+
+只有两种可能：进程启动时传了 `XDEBUG_BOOT=1`，或者运行中已经执行过 `xthread.xdebug_start(...)`。`WITH_XDEBUG=1` 本身只编译能力，不会启动服务。
+
+**2. 旧的 `XDEBUG=1` 还有效吗？**
+
+无效。启动期开关只认 `XDEBUG_BOOT=1`。
+
+**3. 断点不命中怎么办？**
+
+先确认 VSCode attach 的端口和 `XDEBUG_PORT` 一致；再确认本地代码与运行端代码版本一致；最后确认断点行是 Lua 可执行行，不是函数声明行、空行或注释行。
+
+**4. 进程启动后挂住怎么办？**
+
+如果传了 `XDEBUG_WAIT=1`，这是预期行为。VSCode attach 后点击 Continue，或改用 `XDEBUG_WAIT=0`。
+
+**5. 当前停住的是哪个线程？**
+
+看 VSCode Call Stack 的线程名，或 Variables 面板里的 `XNet Thread` scope。

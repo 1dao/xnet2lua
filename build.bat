@@ -14,6 +14,7 @@ set "BUILD_MODE=release"
 set "WITH_HTTP=1"
 set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
+set "WITH_XDEBUG=0"
 set "LUA_BACKEND=minilua"
 set "TARGET=all"
 set "RUN_SCRIPT="
@@ -25,6 +26,8 @@ for %%A in (%*) do (
     if /I "!ARG!"=="clean" set "TARGET=clean"
     if /I "!ARG!"=="nohttp" set "WITH_HTTP=0"
     if /I "!ARG!"=="nohttps" set "WITH_HTTPS=0"
+    if /I "!ARG!"=="xdebug" set "WITH_XDEBUG=1"
+    if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
     if /I "!ARG!"=="iouring" set "WITH_IO_URING=1"
     if /I "!ARG!"=="luajit" set "LUA_BACKEND=luajit"
     if /I "!ARG!"=="minilua" set "LUA_BACKEND=minilua"
@@ -56,7 +59,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG%
 
 set "VS_VCVARS="
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
@@ -113,6 +116,7 @@ set "THREAD_EXE=%BIN_DIR%\xthread_test.exe"
 
 set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c"
 set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c 3rd\yyjson.c"
+if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "LUAJIT_DIR=3rd\luajit\src"
 set "LUAJIT_INC=3rd\luajit\src"
@@ -120,7 +124,7 @@ set "LUAJIT_INC=3rd\luajit\src"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS%"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG%"
 set "INCS=/I."
 if "%WITH_HTTPS%"=="1" (
     set "INCS=%INCS% /I3rd\mbedtls3\include"
