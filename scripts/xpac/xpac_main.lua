@@ -68,9 +68,10 @@ local function __init()
     print(string.format('[XPAC-MAIN] open %s://%s:%d/', scheme, HOST, PORT))
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- xnet.init() marks this thread as network-active; the C layer drives
+-- xpoll_poll(), so enable __update only when periodic Lua work is added.
+-- local function __update()
+-- end
 
 local function __uninit()
     xhttp.stop()
@@ -80,7 +81,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = router.handle,
 }

@@ -112,8 +112,10 @@ local function __init()
     end
 end
 
-local function __update()
-end
+-- No periodic Lua work is needed here. Keep __update omitted so the C
+-- layer can skip the Lua callback; enable it only for per-frame processing.
+-- local function __update()
+-- end
 
 local function __uninit()
     shutdown_business()
@@ -123,7 +125,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = __thread_handle,
 }

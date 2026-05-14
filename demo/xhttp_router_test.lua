@@ -162,5 +162,5 @@ return {
         end
         xthread.stop(0)
     end,
-    __update = function() end,
+    -- __update = function() end, -- enable only when periodic Lua work is added
 }

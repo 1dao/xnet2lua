@@ -691,6 +691,8 @@ local function __init()
 end
 
 local function __update()
+    -- Network polling is driven by the C layer after xnet.init(); this
+    -- callback only handles Lua-side reconnect and RPC timeout timers.
     local now = os.time()
     if not state.stopping and not conn_state.connected and not conn_state.connecting and conn_state.retry_at > 0 and now >= conn_state.retry_at then
         conn_state.retry_at = 0
@@ -704,8 +706,6 @@ local function __update()
             fail_request(req, 'nats rpc timeout')
         end
     end
-
-    xnet.poll(10)
 end
 
 local function __uninit()

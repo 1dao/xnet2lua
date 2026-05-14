@@ -3,7 +3,7 @@
 -- When dynamically created from Lua, this module returns:
 --   {
 --     __init = function() end,        -- called after thread starts
---     __update = function() end,      -- called each xthread_update
+--     -- __update = function() end,   -- optional; only for per-frame work
 --     __uninit = function() end,      -- called before thread exit
 --     __thread_handle = function() end -- message handler
 --   }
@@ -67,10 +67,10 @@ local function __init()
     print('[COMPUTE] All handlers registered')
 end
 
-local function __update()
-    -- Process pending messages - xthread already handles this via xthread_update
-    -- We don't need to do anything here unless we have per-frame processing
-end
+-- No periodic Lua work is needed here. Keep __update omitted so the C
+-- layer can skip the Lua callback; enable it only for per-frame processing.
+-- local function __update()
+-- end
 
 local function __uninit()
     print('[COMPUTE] __uninit: thread shutting down')
@@ -82,7 +82,7 @@ end
 -- -----------------------------------------------------------------------------
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = router.handle,
 }

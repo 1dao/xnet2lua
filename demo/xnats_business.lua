@@ -166,8 +166,10 @@ local function __init()
     print(string.format('[XNATS-BIZ:%d] init', xthread.current_id()))
 end
 
-local function __update()
-end
+-- No periodic Lua work is needed here. Keep __update omitted so the C
+-- layer can skip the Lua callback; enable it only for per-frame processing.
+-- local function __update()
+-- end
 
 local function __uninit()
     print(string.format('[XNATS-BIZ:%d] uninit', xthread.current_id()))
@@ -175,7 +177,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = __thread_handle,
 }

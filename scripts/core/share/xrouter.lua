@@ -30,7 +30,7 @@
 --
 --     return {
 --         __init   = function() assert(xnet.init())     end,
---         __update = function() xnet.poll(10)            end,
+--         -- __update = function() ... end, -- only for periodic Lua work
 --         __uninit = function() xnet.uninit()            end,
 --         __thread_handle = router.handle,    -- only line that changes
 --     }

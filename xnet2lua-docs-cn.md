@@ -307,11 +307,10 @@ local function __init()
     print("线程初始化")
 end
 
-local function __update()
-    -- 每帧调用（主循环的每次迭代）
-    -- 对于网络线程，通常在此调用 xnet.poll(timeout_ms)
-    xnet.poll(10)
-end
+-- 可选：只有脚本有 Lua 侧周期任务时才定义，例如定时器、
+-- 重连检查或测试超时。
+-- local function __update()
+-- end
 
 local function __uninit()
     -- 线程退出时调用（资源清理）
@@ -324,7 +323,7 @@ end
 
 return {
     __init          = __init,
-    __update        = __update,
+    -- __update     = __update,
     __uninit        = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -423,12 +422,11 @@ dofile('demo/handlers/login.lua')                 -- 内部 router.register(...)
 dofile('demo/handlers/inventory.lua')             -- 内部 router.register(...)
 
 local function __init()   assert(xnet.init())     end
-local function __update() xnet.poll(10)            end
 local function __uninit() xnet.uninit()            end
 
 return {
     __init   = __init,
-    __update = __update,
+    -- __update = __update, -- 仅在有 Lua 侧周期任务时打开
     __uninit = __uninit,
     __thread_handle = router.handle,    -- ← 只有这一行换写法
 }
@@ -631,16 +629,15 @@ return ok, msg
 
 ## 5. xnet 模块——异步网络
 
-### 5.1 初始化与轮询
+### 5.1 初始化
 
 ```lua
 -- 初始化网络模块（在每个需要使用网络的线程中调用）
 -- 返回：true，或 nil + 错误信息
 assert(xnet.init())
 
--- 驱动事件循环（通常在 __update 中调用）
--- timeout_ms：等待事件的最长毫秒数（0 = 非阻塞，-1 = 永久等待）
-xnet.poll(10)
+-- 初始化后，C 层会把当前线程标记为有网络事件需求，
+-- 并自动驱动 xpoll_poll()。只有 Lua 侧有周期任务时才需要 __update。
 
 -- 关闭网络模块（在 __uninit 中调用）
 xnet.uninit()
@@ -1389,9 +1386,7 @@ local function __init()
     print(string.format("[MAIN] 监听 %s:%d", HOST, PORT))
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- 这里没有 Lua 侧定时任务，因此省略 __update。
 
 local function __uninit()
     if listener then listener:close("shutdown") end
@@ -1402,7 +1397,7 @@ end
 
 return {
     __init          = __init,
-    __update        = __update,
+    -- __update     = __update,
     __uninit        = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -1468,9 +1463,7 @@ local function __init()
     xthread.post(MAIN_ID, "report", "worker 就绪")
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- 这里没有 Lua 侧定时任务，因此省略 __update。
 
 local function __uninit()
     -- 关闭所有活跃连接
@@ -1483,7 +1476,7 @@ end
 
 return {
     __init          = __init,
-    __update        = __update,
+    -- __update     = __update,
     __uninit        = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -1532,9 +1525,7 @@ local function __init()
     print("[SERVER] HTTP 服务已启动，按 Ctrl+C 退出")
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- 这里没有 Lua 侧定时任务，因此省略 __update。
 
 local function __uninit()
     xhttp.stop()
@@ -1542,7 +1533,8 @@ local function __uninit()
 end
 
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1711,11 +1703,11 @@ local function __init()
     end
 end
 
-local function __update() end
 local function __uninit() end
 
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1769,11 +1761,11 @@ xthread.register("process_and_callback", function(s)
 end)
 
 local function __init() print("[COMPUTE] 初始化") end
-local function __update() end
 local function __uninit() print("[COMPUTE] 退出") end
 
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1785,8 +1777,8 @@ return {
 ### 线程设计
 
 - **主线程只管分发**：主线程负责 `listen_fd` 并通过 `xthread.post` 将 fd 传给 worker，不做任何业务逻辑
-- **每个线程调用 `xnet.init()`**：每个使用网络的线程都需要独立初始化 xnet，包括 worker 线程
-- **`xnet.poll()` 放在 `__update` 中**：确保事件循环持续驱动，超时时间建议 5–20ms
+- **每个线程调用 `xnet.init()`**：每个使用网络的线程都需要独立初始化 xnet；之后 C 层会为该线程驱动网络轮询
+- **省略空的 `__update` 回调**：只有 Lua 侧确实有周期任务时才定义，例如定时器、重连检查或测试超时
 - **不要跨线程传递连接对象**：`conn` 对象属于创建它的 Lua State，不能通过消息传递到另一线程
 
 ### 消息传递
@@ -1826,7 +1818,7 @@ end
 |------|------|
 | 高并发连接 | 增加 worker 线程数（通常 CPU 核数 * 1–2） |
 | 大数据包 | 增大 `max_packet`，考虑分片发送 |
-| 低延迟 | 减小 `xnet.poll()` 超时时间（如 1ms）|
+| 低延迟 | 减少 Lua 侧 `__update` 工作量；必要时调整 C 层轮询节奏 |
 | 高吞吐 | 使用 `conn:send_raw()` + 手动分包，减少内存拷贝 |
 | 静态文件 | 使用 `conn:send_file_response()`，框架内部使用 sendfile 优化 |
 
