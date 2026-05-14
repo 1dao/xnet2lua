@@ -337,11 +337,10 @@ local function __init()
     print("Thread initialized")
 end
 
-local function __update()
-    -- Per-frame / loop iteration
-    -- For network threads, typically call xnet.poll(timeout_ms)
-    xnet.poll(10)
-end
+-- Optional: define this only when the script has periodic Lua work
+-- such as timers, reconnect checks, or test timeouts.
+-- local function __update()
+-- end
 
 local function __uninit()
     -- Called on thread exit (resource cleanup)
@@ -354,7 +353,7 @@ end
 
 return {
     __init          = __init,
-    __update        = __update,
+    -- __update     = __update,
     __uninit        = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -458,12 +457,11 @@ dofile('demo/handlers/login.lua')        -- inside: router.register(...)
 dofile('demo/handlers/inventory.lua')    -- inside: router.register(...)
 
 local function __init()   assert(xnet.init())     end
-local function __update() xnet.poll(10)            end
 local function __uninit() xnet.uninit()            end
 
 return {
     __init   = __init,
-    __update = __update,
+    -- __update = __update, -- only for periodic Lua work
     __uninit = __uninit,
     __thread_handle = router.handle,    -- ← this is the only line that changes
 }
@@ -655,15 +653,15 @@ another thread's `lua_State` directly.
 
 ## 5. xnet Module — Asynchronous Networking
 
-### 5.1 Initialization and Polling
+### 5.1 Initialization
 
 ```lua
 -- Initialize the networking module (in every thread that uses networking)
 assert(xnet.init())
 
--- Drive the event loop (usually in __update)
--- timeout_ms: maximum time to wait for events (0 = non-blocking, -1 = wait forever)
-xnet.poll(10)
+-- After initialization, the C layer marks this thread as network-active
+-- and drives xpoll_poll() automatically. A Lua __update callback is only
+-- needed for periodic Lua-side work.
 
 -- Shutdown the networking module (in __uninit)
 xnet.uninit()
@@ -1361,9 +1359,7 @@ local function __init()
     if not ok then error(err) end
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- No Lua-side timer work is needed here, so __update is omitted.
 
 local function __uninit()
     if listener then
@@ -1377,7 +1373,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -1443,9 +1439,7 @@ local function __init()
     xthread.post(MAIN_ID, "report", "worker ready")
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- No Lua-side timer work is needed here, so __update is omitted.
 
 local function __uninit()
     -- Close all active connections
@@ -1458,7 +1452,7 @@ end
 
 return {
     __init          = __init,
-    __update        = __update,
+    -- __update     = __update,
     __uninit        = __uninit,
     __thread_handle = __thread_handle,
 }
@@ -1507,9 +1501,7 @@ local function __init()
     print("[SERVER] HTTP service started; press Ctrl+C to exit")
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- No Lua-side timer work is needed here, so __update is omitted.
 
 local function __uninit()
     xhttp.stop()
@@ -1517,7 +1509,8 @@ local function __uninit()
 end
 
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1680,12 +1673,12 @@ local function __init()
         xthread.stop(1)
     end
 end
- 
-local function __update() end
+
 local function __uninit() end
- 
+
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1739,11 +1732,11 @@ xthread.register("process_and_callback", function(s)
 end)
  
 local function __init() print("[COMPUTE] initialized") end
-local function __update() end
 local function __uninit() print("[COMPUTE] exit") end
- 
+
 return {
-    __init = __init, __update = __update,
+    __init = __init,
+    -- __update = __update,
     __uninit = __uninit, __thread_handle = __thread_handle,
 }
 ```
@@ -1755,8 +1748,8 @@ return {
 ### 16.1 Threading
 
 - **Main thread only distributes**: The main thread is responsible for listening and distributing connections to workers; business logic should live in workers.
-- **Every thread calls `xnet.init()`**: Every thread that uses networking must initialize xnet
-- **`xnet.poll()` in `__update`**: Ensure the event loop remains driven; a typical poll timeout is 5–20ms
+- **Every thread calls `xnet.init()`**: Every thread that uses networking must initialize xnet; the C layer then drives network polling for that thread
+- **Omit empty `__update` callbacks**: Define `__update` only for periodic Lua-side work such as timers, reconnect checks, or test timeouts
 - **Do not pass connection objects across threads**: `conn` objects belong to the Lua State that created them
 
 ### 16.2 Messaging
@@ -1795,7 +1788,7 @@ end
 |----------|--------------|
 | High concurrency connections | Increase the number of worker threads (usually CPU cores × 1–2) |
 | Large data packets | Increase `max_packet`; consider fragmentation and batching |
-| Low latency | Decrease the timeout for `xnet.poll()` (e.g., 1ms) |
+| Low latency | Keep Lua-side `__update` work small; tune the C-side polling cadence when needed |
 | High throughput | Use `conn:send_raw()` + manual fragmentation to reduce copying |
 | Static files | Use `conn:send_file_response()`, internal use of sendfile for efficiency |
 

@@ -153,9 +153,10 @@ local function __init()
     assert(xnet.init())
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- xnet.init() marks this thread as network-active; the C layer drives
+-- xpoll_poll(), so enable __update only when periodic Lua work is added.
+-- local function __update()
+-- end
 
 local function __uninit()
     for conn in pairs(connections) do
@@ -168,7 +169,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = router.handle,
 }

@@ -993,6 +993,8 @@ local function __init()
 end
 
 local function __update()
+    -- Network polling is driven by the C layer after xnet.init(); this
+    -- callback only handles Lua-side reconnect timers.
     local now = os.time()
     for _, c in ipairs(conns) do
         if not stopping and not c.connected and not c.connecting and c.retry_at > 0 and now >= c.retry_at then
@@ -1000,7 +1002,6 @@ local function __update()
             connect_one(c)
         end
     end
-    xnet.poll(10)
 end
 
 local function __uninit()

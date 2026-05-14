@@ -76,7 +76,8 @@ local function __init()
 end
 
 local function __update()
-    xnet.poll(10)
+    -- Network polling is driven by the C layer after xnet.init(); this
+    -- callback only handles the demo timeout.
     if not stopped and started_at and now_sec() - started_at >= TEST_SECONDS then
         stopped = true
         print('[XHTTPS-MAIN] finish: true https server demo timeout reached')

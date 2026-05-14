@@ -160,9 +160,10 @@ local function __init()
     assert(xnet.init())
 end
 
-local function __update()
-    xnet.poll(10)
-end
+-- xnet.init() marks this thread as network-active; the C layer drives
+-- xpoll_poll(), so enable __update only when periodic Lua work is added.
+-- local function __update()
+-- end
 
 local function __uninit()
     if client_conn then client_conn:close('worker_uninit') end
@@ -173,7 +174,7 @@ end
 
 return {
     __init = __init,
-    __update = __update,
+    -- __update = __update,
     __uninit = __uninit,
     __thread_handle = __thread_handle,
 }
