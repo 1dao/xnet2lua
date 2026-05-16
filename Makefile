@@ -138,9 +138,18 @@ ifeq ($(OS),Windows_NT)
 endif
 endif
 
-.PHONY: all xnet xthread_test clean test test-c test-lua-core test-lua-external test-lua-all run-lua
+XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c
+XDEBUG_DAP_TARGET := tools/xdebug_dap$(EXE_EXT)
 
-all: $(TARGET_LIB) $(XNET_TARGET) $(XTHREAD_TEST_TARGET)
+xdebug_dap: $(XDEBUG_DAP_TARGET)
+
+$(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
+	$(RM) $(XDEBUG_DAP_TARGET)
+	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 -o $@ $(XDEBUG_DAP_SRCS) $(SYS_LDFLAGS)
+
+.PHONY: all xnet xthread_test xdebug_dap clean test test-c test-lua-core test-lua-external test-lua-all run-lua
+
+all: $(TARGET_LIB) $(XNET_TARGET) $(XTHREAD_TEST_TARGET) $(XDEBUG_DAP_TARGET)
 
 xnet: $(XNET_TARGET)
 
@@ -197,6 +206,6 @@ run-lua: $(XNET_TARGET)
 	$(XNET_TARGET) $(SCRIPT)
 
 clean:
-	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_TARGET)
+	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
 
 -include $(CORE_DEPS)

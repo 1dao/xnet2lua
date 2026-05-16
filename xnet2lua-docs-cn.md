@@ -2157,36 +2157,43 @@ current=<current_thread_id> notified=<count> deferred=<count>
 
 ## 20. Lua 调试与 VSCode 调试
 
-xnet2lua 提供一套原生 Lua 调试器，用来调试多 OS 线程、多 `lua_State`、多 coroutine 的运行时。它不依赖 `Local Lua Debugger`，而是在进程内启动一个本地 TCP 调试服务，再由 `tools/xdebug_dap.js` 把它转换成 VSCode Debug Adapter Protocol。
+xnet2lua 提供一套原生 Lua 调试器，用来调试多 OS 线程、多 `lua_State`、多 coroutine 的运行时。它不依赖 `Local Lua Debugger`，而是在进程内启动一个本地 TCP 调试服务，再由 `tools/xdebug_dap.exe`（Windows）或 `tools/xdebug_dap`（Unix-like）把它转换成 VSCode Debug Adapter Protocol。旧的 `tools/xdebug_dap.js` Node 桥仍保留作备用。
 
 ### 20.1 文件与职责
 
 | 文件 | 作用 |
 |---|---|
 | `xlua/lua_xdebug.c` / `xlua/lua_xdebug.h` | C 层原生调试核心，负责 TCP 服务、断点、单步、栈、局部变量、线程状态 |
-| `tools/xdebug_dap.js` | VSCode DAP 桥，运行在开发机 Node.js 中 |
+| `tools/xdebug_dap.c` / `tools/xdebug_dap.exe` | VSCode DAP 桥，使用 `xpoll`/epoll 监听 DAP 端口 |
+| `tools/xdebug_dap.js` | 旧版 Node.js DAP 桥，作为无 C 桥产物时的备用 |
 | `.vscode/launch.json` | VSCode attach 配置 |
 | `.vscode/tasks.json` | 启动 DAP 桥的后台任务 |
 | `xdebug.md` | 调试器简版说明与原始 TCP 协议 |
 
 ### 20.2 构建
 
-默认构建不包含调试器：
+默认 `make` 会构建工具和普通 `bin/xnet`，其中普通 `bin/xnet` 不包含调试器，但会生成 DAP 桥 `tools/xdebug_dap.exe`（Windows）或 `tools/xdebug_dap`（Unix-like）：
 
 ```bash
-make xnet
+make
 ```
 
-要把调试能力编进 `bin/xnet`：
+只编 DAP 桥：
 
 ```bash
-mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 xnet
+mingw32-make xdebug_dap
+```
+
+要把调试能力编进 `bin/xnet`，同时默认构建 DAP 桥：
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1
 ```
 
 LuaJIT 后端也支持：
 
 ```bash
-mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit xnet
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit
 ```
 
 MSVC：
@@ -2258,12 +2265,12 @@ return running, port
 #### 20.5.1 前置条件
 
 - 已用 `WITH_XDEBUG=1` 构建 `bin/xnet.exe`（详见 §20.2）。
-- 已安装 Node.js（建议 ≥ 18）。`tools/xdebug_dap.js` 是 Node 脚本，VSCode 通过它把原生调试协议桥接到 DAP。
+- 已构建 `tools/xdebug_dap.exe`（Windows）或 `tools/xdebug_dap`（Unix-like）。默认 `make` 会构建它，也可以单独运行 `mingw32-make xdebug_dap`。
 - xnet 进程已在运行，并且已经通过 `XDEBUG_BOOT=1` 或 `xthread.xdebug_start(...)` 开启了调试服务（详见 §20.3 / §20.4）。
 
 #### 20.5.2 创建 `.vscode/tasks.json`
 
-把 DAP 桥挂成 attach 前置任务。VSCode 启动调试时会自动 `node tools/xdebug_dap.js ...`，在本地 `127.0.0.1:4711` 监听 DAP。
+把 DAP 桥挂成 attach 前置任务。VSCode 启动调试时会自动运行 `tools/xdebug_dap.exe ...`，在本地 `127.0.0.1:4711` 监听 DAP。
 
 ```json
 {
@@ -2272,9 +2279,8 @@ return running, port
         {
             "label": "xnet-xdebug-dap",
             "type": "shell",
-            "command": "node",
+            "command": "${workspaceFolder}/tools/xdebug_dap.exe",
             "args": [
-                "${workspaceFolder}/tools/xdebug_dap.js",
                 "--listen", "4711",
                 "--xdebug-host", "127.0.0.1",
                 "--xdebug-port", "19090",
@@ -2295,7 +2301,11 @@ return running, port
 }
 ```
 
-`beginsPattern` / `endsPattern` 与 `tools/xdebug_dap.js` 实际输出的 `xnet-xdebug-dap starting` 和 `xnet-xdebug-dap listening on 127.0.0.1:4711` 严格对齐，VSCode 才知道后台任务何时算“就绪”。
+`beginsPattern` / `endsPattern` 与原生 DAP 桥实际输出的 `xnet-xdebug-dap starting` 和 `xnet-xdebug-dap listening on 127.0.0.1:4711` 严格对齐，VSCode 才知道后台任务何时算“就绪”。
+
+如果暂时没有编出原生桥，也可以把 `"command"` 改回 `"node"`，并把 `"${workspaceFolder}/tools/xdebug_dap.js"` 放到 `args` 第一项继续使用旧版 JS 桥。
+
+在 Unix-like 系统上，把 `"command"` 改成 `"${workspaceFolder}/tools/xdebug_dap"`。
 
 桥参数说明：
 
@@ -2346,7 +2356,7 @@ return running, port
 4. VSCode 自动跑 `xnet-xdebug-dap` 后台任务（终端会看到 `xnet-xdebug-dap listening on 127.0.0.1:4711`），随后 attach。
 5. 在 Lua 文件中下断点，触发对应请求即可命中。
 
-VSCode 实际连接路径：`VSCode ──DAP──▶ 127.0.0.1:4711（Node 桥） ──原生协议──▶ 127.0.0.1:19090（xnet 内置）`。
+VSCode 实际连接路径：`VSCode ──DAP──▶ 127.0.0.1:4711（DAP 桥） ──原生协议──▶ 127.0.0.1:19090（xnet 内置）`。
 
 断点命中后，当前 xnet 线程会显示在三个地方：
 
@@ -2365,7 +2375,7 @@ xnet2lua/
 ├── .vscode/
 │   ├── tasks.json    ← 见 §20.5.2
 │   └── launch.json   ← 见 §20.5.3
-├── tools/xdebug_dap.js
+├── tools/xdebug_dap.exe
 ├── bin/xnet.exe
 └── ...
 ```
@@ -2388,11 +2398,11 @@ xnet2lua/
 
 - **端口冲突**：同时改 `tasks.json` 的 `--listen` 和 `launch.json` 的 `debugServer`（两者必须相等）。改 xnet 侧 `XDEBUG_PORT` 时，同步改 `tasks.json` 的 `--xdebug-port` 与 `launch.json` 的 `xdebugPort`。
 - **多目标并联**：复制一份 task（改 `label` 和 `--listen`）+ 复制一份 configuration（改 `name`、`debugServer`、`preLaunchTask`），F5 时分别选择即可同时 attach 多个 xnet 进程。
-- **Node 不在 PATH 上**：把 `tasks.json` 里的 `"command": "node"` 改成 Node 可执行文件的绝对路径，例如 `"C:/Program Files/nodejs/node.exe"`。
+- **原生桥不存在**：先运行 `mingw32-make xdebug_dap`，或临时切回 `node tools/xdebug_dap.js` 备用。
 - **JSON 校验失败**：标准 `.json` 不允许注释；如果想加注释把文件后缀改成 `jsonc`，或在 VSCode `files.associations` 里把 `tasks.json` / `launch.json` 关联到 `jsonc`。
 - **配置不生效**：确认仓库是用“打开文件夹”方式打开（不是单独打开某个文件），且 `.vscode/` 在工作区根目录，不是嵌套子目录。
 
-是否把 `.vscode/` 提交到 git 由项目自行决定。端口和 Node 路径因人而异，常见做法是把 `.vscode/` 加进本地 `.gitignore`，让每位开发者基于本节的样板各自维护一份。
+是否把 `.vscode/` 提交到 git 由项目自行决定。端口和本地工具路径因人而异，常见做法是把 `.vscode/` 加进本地 `.gitignore`，让每位开发者基于本节的样板各自维护一份。
 
 ### 20.6 多线程和 coroutine 行为
 
