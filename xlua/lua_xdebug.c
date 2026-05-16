@@ -441,6 +441,12 @@ static int xdbg_local_path(char* out, size_t cap, const char* name) {
     return snprintf(out, cap, "L:%s", hex) > 0;
 }
 
+static int xdbg_upvalue_path(char* out, size_t cap, const char* name) {
+    char hex[256];
+    xdbg_hex(hex, sizeof(hex), name, strlen(name));
+    return snprintf(out, cap, "U:%s", hex) > 0;
+}
+
 static int xdbg_key_path(char* out, size_t cap, lua_State* L, int idx) {
     int t = lua_type(L, idx);
     if (t == LUA_TSTRING) {
@@ -470,6 +476,27 @@ static int xdbg_push_local(lua_State* L, lua_Debug* ar, const char* name) {
     }
 }
 
+static int xdbg_skip_upvalue(const char* name) {
+    return !name || !*name || strcmp(name, "_ENV") == 0;
+}
+
+static int xdbg_push_upvalue(lua_State* L, lua_Debug* ar, const char* name) {
+    int i, top = lua_gettop(L), func;
+    if (!lua_getinfo(L, "f", ar)) return 0;
+    func = lua_gettop(L);
+    for (i = 1;; i++) {
+        const char* n = lua_getupvalue(L, func, i);
+        if (!n) break;
+        if (!xdbg_skip_upvalue(n) && strcmp(n, name) == 0) {
+            lua_remove(L, func);
+            return 1;
+        }
+        lua_pop(L, 1);
+    }
+    lua_settop(L, top);
+    return 0;
+}
+
 static int xdbg_push_key(lua_State* L, const char* s, size_t len) {
     char tmp[256];
     if (len < 2 || s[1] != ':') return 0;
@@ -496,12 +523,12 @@ static int xdbg_push_key(lua_State* L, const char* s, size_t len) {
 static int xdbg_push_path(lua_State* L, lua_Debug* ar, const char* path) {
     int top = lua_gettop(L);
     const char *p = path, *q;
-    char local[256];
-    if (!p || strncmp(p, "L:", 2) != 0) return 0;
+    char root[256];
+    if (!p || (p[0] != 'L' && p[0] != 'U') || p[1] != ':') return 0;
     q = strchr(p, '/');
     if (!q) q = p + strlen(p);
-    if (!xdbg_unhex_string(local, sizeof(local), p + 2, (size_t)(q - p - 2)) ||
-        !xdbg_push_local(L, ar, local)) {
+    if (!xdbg_unhex_string(root, sizeof(root), p + 2, (size_t)(q - p - 2)) ||
+        !(p[0] == 'L' ? xdbg_push_local(L, ar, root) : xdbg_push_upvalue(L, ar, root))) {
         lua_settop(L, top);
         return 0;
     }
@@ -568,6 +595,23 @@ static void xdbg_build_locals(XDbgState* st, int frame) {
         xdbg_local_path(path, sizeof(path), name);
         xdbg_emit_var(st->response, sizeof(st->response), name, L, -1, path);
         lua_pop(L, 1);
+    }
+    if (lua_getinfo(L, "f", &ar)) {
+        int top = lua_gettop(L);
+        int func = top;
+        for (i = 1;; i++) {
+            char path[XDBG_PATH_SIZE];
+            const char* name = lua_getupvalue(L, func, i);
+            if (!name) break;
+            if (xdbg_skip_upvalue(name)) {
+                lua_pop(L, 1);
+                continue;
+            }
+            xdbg_upvalue_path(path, sizeof(path), name);
+            xdbg_emit_var(st->response, sizeof(st->response), name, L, -1, path);
+            lua_pop(L, 1);
+        }
+        lua_settop(L, top - 1);
     }
     xdbg_finish(st->response, sizeof(st->response));
 }
