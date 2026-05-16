@@ -32,9 +32,10 @@
 **
 ** Current debugger transport:
 **   The native server listens on 127.0.0.1:XDEBUG_PORT (default 19090) and is
-**   normally reached by VSCode through tools/xdebug_dap.js. For remote devices,
-**   use port forwarding (ssh -L, adb forward, iproxy) instead of exposing the
-**   debug port directly.
+**   normally reached by VSCode through tools/xdebug_dap.exe on Windows or
+**   tools/xdebug_dap on Unix-like systems. tools/xdebug_dap.js is kept as a
+**   fallback bridge. For remote devices, use port forwarding (ssh -L, adb
+**   forward, iproxy) instead of exposing the debug port directly.
 */
 
 #ifndef XNET_WITH_XDEBUG

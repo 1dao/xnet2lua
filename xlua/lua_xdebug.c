@@ -3,6 +3,7 @@
 #if XNET_WITH_XDEBUG
 
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,10 @@ static void xdbg_cond_init(xdbg_cond* c) { pthread_cond_init(c, NULL); }
 
 #ifndef LUA_OK
 #define LUA_OK 0
+#endif
+#ifndef lua_absindex
+#define lua_absindex(L, i) \
+    (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
 #endif
 
 #define XDBG_MAX_STATES 128
@@ -257,7 +262,92 @@ static void xdbg_append(char* buf, size_t cap, const char* fmt, ...) {
     va_end(ap);
 }
 
-static void xdbg_value(char* out, size_t cap, lua_State* L, int idx) {
+static int xdbg_ident(const char* s) {
+    int i;
+    if (!s || !(isalpha((unsigned char)s[0]) || s[0] == '_')) return 0;
+    for (i = 1; s[i]; i++) {
+        if (!(isalnum((unsigned char)s[i]) || s[i] == '_')) return 0;
+    }
+    return 1;
+}
+
+static void xdbg_string(char* out, size_t cap, const char* s, size_t len) {
+    size_t i, o = 0;
+    if (cap == 0) return;
+    if (cap < 3) {
+        out[0] = '\0';
+        return;
+    }
+    out[o++] = '"';
+    for (i = 0; s && i < len && o + 3 < cap; i++) {
+        char c = s[i];
+        if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
+        else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
+        else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
+        else if (c == '"') { out[o++] = '\\'; out[o++] = '"'; }
+        else if (c == '\\') { out[o++] = '\\'; out[o++] = '\\'; }
+        else out[o++] = c;
+    }
+    if (o + 1 < cap) out[o++] = '"';
+    out[o] = '\0';
+}
+
+static void xdbg_value_depth(char* out, size_t cap, lua_State* L, int idx, int depth);
+
+static void xdbg_key(char* out, size_t cap, lua_State* L, int idx) {
+    int t = lua_type(L, idx);
+    if (t == LUA_TSTRING) {
+        size_t len = 0;
+        const char* s = lua_tolstring(L, idx, &len);
+        if (len < 64 && xdbg_ident(s)) snprintf(out, cap, "%s", s);
+        else {
+            char val[128];
+            size_t n;
+            xdbg_string(val, sizeof(val), s, len);
+            if (cap == 0) return;
+            if (cap < 3) {
+                out[0] = '\0';
+                return;
+            }
+            out[0] = '[';
+            n = strlen(val);
+            if (n > cap - 3) n = cap - 3;
+            memcpy(out + 1, val, n);
+            out[n + 1] = ']';
+            out[n + 2] = '\0';
+        }
+    } else if (t == LUA_TNUMBER) {
+        snprintf(out, cap, "[%.17g]", (double)lua_tonumber(L, idx));
+    } else {
+        snprintf(out, cap, "[%s:%p]", lua_typename(L, t), lua_topointer(L, idx));
+    }
+}
+
+static void xdbg_table(char* out, size_t cap, lua_State* L, int idx, int depth) {
+    int abs = lua_absindex(L, idx);
+    int count = 0;
+    snprintf(out, cap, "table:%p", lua_topointer(L, abs));
+    if (depth > 0) return;
+
+    xdbg_append(out, cap, " {");
+    lua_pushnil(L);
+    while (lua_next(L, abs) != 0) {
+        char key[128], val[192];
+        if (count >= 6) {
+            lua_pop(L, 1);
+            xdbg_append(out, cap, "%s...", count ? ", " : "");
+            break;
+        }
+        xdbg_key(key, sizeof(key), L, -2);
+        xdbg_value_depth(val, sizeof(val), L, -1, depth + 1);
+        xdbg_append(out, cap, "%s%s=%s", count ? ", " : "", key, val);
+        count++;
+        lua_pop(L, 1);
+    }
+    xdbg_append(out, cap, "}");
+}
+
+static void xdbg_value_depth(char* out, size_t cap, lua_State* L, int idx, int depth) {
     int t = lua_type(L, idx);
     switch (t) {
     case LUA_TNIL:
@@ -272,24 +362,20 @@ static void xdbg_value(char* out, size_t cap, lua_State* L, int idx) {
     case LUA_TSTRING: {
         size_t len = 0;
         const char* s = lua_tolstring(L, idx, &len);
-        size_t i, o = 0;
-        out[o++] = '"';
-        for (i = 0; s && i < len && o + 3 < cap; i++) {
-            char c = s[i];
-            if (c == '\n') { out[o++] = '\\'; out[o++] = 'n'; }
-            else if (c == '\r') { out[o++] = '\\'; out[o++] = 'r'; }
-            else if (c == '\t') { out[o++] = '\\'; out[o++] = 't'; }
-            else if (c == '"') { out[o++] = '\\'; out[o++] = '"'; }
-            else out[o++] = c;
-        }
-        if (o + 1 < cap) out[o++] = '"';
-        out[o] = '\0';
+        xdbg_string(out, cap, s, len);
         break;
     }
+    case LUA_TTABLE:
+        xdbg_table(out, cap, L, idx, depth);
+        break;
     default:
         snprintf(out, cap, "%s:%p", lua_typename(L, t), lua_topointer(L, idx));
         break;
     }
+}
+
+static void xdbg_value(char* out, size_t cap, lua_State* L, int idx) {
+    xdbg_value_depth(out, cap, L, idx, 0);
 }
 
 static void xdbg_build_stack(XDbgState* st) {
@@ -323,6 +409,10 @@ static void xdbg_build_locals(XDbgState* st, int frame) {
         char val[512];
         const char* name = lua_getlocal(L, &ar, i);
         if (!name) break;
+        if (name[0] == '(') {
+            lua_pop(L, 1);
+            continue;
+        }
         xdbg_value(val, sizeof(val), L, -1);
         xdbg_append(st->response, sizeof(st->response), "%s\t%s\n", name, val);
         lua_pop(L, 1);

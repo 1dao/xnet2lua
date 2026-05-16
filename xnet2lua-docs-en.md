@@ -2130,36 +2130,48 @@ current=<current_thread_id> notified=<count> deferred=<count>
 xnet2lua includes a native Lua debugger for its multi-OS-thread,
 multi-`lua_State`, coroutine-heavy runtime. It is not based on `Local Lua
 Debugger`. Instead, xnet starts a small in-process TCP debug service, and
-`tools/xdebug_dap.js` bridges that protocol to VSCode's Debug Adapter Protocol.
+`tools/xdebug_dap.exe` on Windows, or `tools/xdebug_dap` on Unix-like systems,
+bridges that protocol to VSCode's Debug Adapter Protocol. The older
+`tools/xdebug_dap.js` Node bridge is still kept as a fallback.
 
 ### 20.1 Files and Responsibilities
 
 | File | Purpose |
 |---|---|
 | `xlua/lua_xdebug.c` / `xlua/lua_xdebug.h` | Native C debug core: TCP service, breakpoints, stepping, stacks, locals, thread state |
-| `tools/xdebug_dap.js` | VSCode DAP bridge, run by Node.js on the development host |
+| `tools/xdebug_dap.c` / `tools/xdebug_dap.exe` | VSCode DAP bridge using `xpoll`/epoll for the DAP listener |
+| `tools/xdebug_dap.js` | Older Node.js DAP bridge, kept as a fallback when the native bridge is unavailable |
 | `.vscode/launch.json` | VSCode attach configuration |
 | `.vscode/tasks.json` | Background task that starts the DAP bridge |
 | `xdebug.md` | Short debugger guide and raw TCP protocol reference |
 
 ### 20.2 Build
 
-The default build does not include the debugger:
+The default `make` target builds the tools and the normal `bin/xnet`. The
+normal `bin/xnet` does not include debugger support, but the DAP bridge is built
+as `tools/xdebug_dap.exe` on Windows or `tools/xdebug_dap` on Unix-like systems:
 
 ```bash
-make xnet
+make
 ```
 
-Compile debugger support into `bin/xnet`:
+Build only the DAP bridge:
 
 ```bash
-mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 xnet
+mingw32-make xdebug_dap
+```
+
+Compile debugger support into `bin/xnet`, while also building the DAP bridge via
+the default target:
+
+```bash
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1
 ```
 
 LuaJIT is supported too:
 
 ```bash
-mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit xnet
+mingw32-make -B BUILD_MODE=debug WITH_HTTPS=0 WITH_XDEBUG=1 LUA_BACKEND=luajit
 ```
 
 MSVC:
@@ -2238,15 +2250,16 @@ creates them locally under the workspace root.
 #### 20.5.1 Prerequisites
 
 - `bin/xnet.exe` built with `WITH_XDEBUG=1` (see §20.2).
-- Node.js installed (≥ 18 recommended). `tools/xdebug_dap.js` is the Node
-  bridge that translates xnet's native debug protocol into DAP for VSCode.
+- `tools/xdebug_dap.exe` on Windows, or `tools/xdebug_dap` on Unix-like
+  systems. The default `make` target builds it; `mingw32-make xdebug_dap` builds
+  only the bridge.
 - An xnet process is running with the debug service enabled via either
   `XDEBUG_BOOT=1` (§20.3) or `xthread.xdebug_start(...)` (§20.4).
 
 #### 20.5.2 Create `.vscode/tasks.json`
 
 Wire the DAP bridge as a pre-launch task. VSCode will run
-`node tools/xdebug_dap.js ...` on F5 and the bridge listens for DAP on
+`tools/xdebug_dap.exe ...` on F5 and the bridge listens for DAP on
 `127.0.0.1:4711`.
 
 ```json
@@ -2256,9 +2269,8 @@ Wire the DAP bridge as a pre-launch task. VSCode will run
         {
             "label": "xnet-xdebug-dap",
             "type": "shell",
-            "command": "node",
+            "command": "${workspaceFolder}/tools/xdebug_dap.exe",
             "args": [
-                "${workspaceFolder}/tools/xdebug_dap.js",
                 "--listen", "4711",
                 "--xdebug-host", "127.0.0.1",
                 "--xdebug-port", "19090",
@@ -2280,9 +2292,15 @@ Wire the DAP bridge as a pre-launch task. VSCode will run
 ```
 
 `beginsPattern` / `endsPattern` exactly match the strings
-`tools/xdebug_dap.js` prints (`xnet-xdebug-dap starting` and
+the native DAP bridge prints (`xnet-xdebug-dap starting` and
 `xnet-xdebug-dap listening on 127.0.0.1:4711`) so VSCode can tell when the
 background task is ready.
+
+If the native bridge is not available yet, you can temporarily set `"command"`
+back to `"node"` and put `"${workspaceFolder}/tools/xdebug_dap.js"` as the
+first `args` entry to use the older JS bridge.
+
+On Unix-like systems, set `"command"` to `"${workspaceFolder}/tools/xdebug_dap"`.
 
 Bridge flags:
 
@@ -2336,7 +2354,7 @@ one local and one remote process.
    `xnet-xdebug-dap listening on 127.0.0.1:4711`), then attaches.
 5. Set breakpoints in Lua files and trigger the matching request.
 
-Connection chain: `VSCode ──DAP──▶ 127.0.0.1:4711 (Node bridge) ──native──▶ 127.0.0.1:19090 (xnet built-in)`.
+Connection chain: `VSCode ──DAP──▶ 127.0.0.1:4711 (DAP bridge) ──native──▶ 127.0.0.1:19090 (xnet built-in)`.
 
 When a breakpoint hits, the current xnet thread is visible in three places:
 
@@ -2356,7 +2374,7 @@ xnet2lua/
 ├── .vscode/
 │   ├── tasks.json    ← see §20.5.2
 │   └── launch.json   ← see §20.5.3
-├── tools/xdebug_dap.js
+├── tools/xdebug_dap.exe
 ├── bin/xnet.exe
 └── ...
 ```
@@ -2388,8 +2406,8 @@ Common tweaks:
 - **Attach multiple targets in parallel**: duplicate the task (change `label`
   and `--listen`) and duplicate the configuration (change `name`,
   `debugServer`, `preLaunchTask`). Pick the right entry when hitting F5.
-- **Node not on PATH**: replace `"command": "node"` in `tasks.json` with an
-  absolute path, e.g. `"C:/Program Files/nodejs/node.exe"`.
+- **Native bridge is missing**: run `mingw32-make xdebug_dap`, or temporarily
+  fall back to `node tools/xdebug_dap.js`.
 - **JSON parse errors**: standard `.json` forbids comments. Rename the file
   to `.jsonc` or add a `files.associations` entry mapping `tasks.json` /
   `launch.json` to `jsonc` if you want inline comments.
@@ -2398,8 +2416,8 @@ Common tweaks:
   root, not nested deeper.
 
 Whether to commit `.vscode/` to git is up to each project. Because ports and
-Node paths differ per developer, a common pattern is to add `.vscode/` to a
-local `.gitignore` and let everyone maintain their own copy based on the
+local tool paths differ per developer, a common pattern is to add `.vscode/` to
+a local `.gitignore` and let everyone maintain their own copy based on the
 templates above.
 
 ### 20.6 Threads and Coroutines
