@@ -409,17 +409,30 @@ class Session {
             });
             return;
         }
-        const lines = await this.xdbg.command(`locals ${scope.threadId} ${scope.frame}`);
+        const cmd = scope.kind === "fields"
+            ? `fields ${scope.threadId} ${scope.frame} ${scope.path || ""}`
+            : `locals ${scope.threadId} ${scope.frame}`;
+        const lines = await this.xdbg.command(cmd);
         const variables = [];
         for (const line of lines) {
             if (!line || line.startsWith("OK ")) continue;
             if (line.startsWith("ERR ")) break;
-            const i = line.indexOf("\t");
-            if (i < 0) continue;
+            const p = line.split("\t");
+            if (p.length < 2) continue;
+            let variablesReference = 0;
+            if (p[2] && p[3] === "1") {
+                variablesReference = this.nextVarId++;
+                this.variables.set(variablesReference, {
+                    kind: "fields",
+                    threadId: scope.threadId,
+                    frame: scope.frame,
+                    path: p[2]
+                });
+            }
             variables.push({
-                name: line.slice(0, i),
-                value: line.slice(i + 1),
-                variablesReference: 0
+                name: p[0],
+                value: p[1],
+                variablesReference
             });
         }
         this.sendResponse(req, { variables });

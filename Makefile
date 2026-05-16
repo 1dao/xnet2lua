@@ -2,6 +2,7 @@ LIB_NAME := xsock
 CC ?= gcc
 AR ?= ar
 ARFLAGS ?= rcs
+.DEFAULT_GOAL := all
 
 WITH_IO_URING ?= 0
 WITH_HTTP ?= 1
