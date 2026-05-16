@@ -242,6 +242,15 @@ static const char *find_key(const char *p, const char *e, const char *key) {
 
 static int json_int_at(const char *p, const char *e, int dflt) {
     p = skip_ws(p, e);
+    if (p < e && *p == '"') {
+        const char *q = p + 1;
+        while (q < e && *q != '"') {
+            if (*q == '\\') return dflt;
+            q++;
+        }
+        if (q >= e) return dflt;
+        return json_int_at(p + 1, q, dflt);
+    }
     int sign = 1, v = 0, any = 0;
     if (p < e && *p == '-') { sign = -1; p++; }
     while (p < e && isdigit((unsigned char)*p)) {

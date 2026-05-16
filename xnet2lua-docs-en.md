@@ -1,4 +1,4 @@
-﻿# xnet2lua Documentation
+# xnet2lua Documentation
 
 Version: Based on [github.com/1dao/xnet2lua](https://github.com/1dao/xnet2lua)  
 Language: C (Core) + Lua (Scripting Layer)  
@@ -2420,6 +2420,135 @@ local tool paths differ per developer, a common pattern is to add `.vscode/` to
 a local `.gitignore` and let everyone maintain their own copy based on the
 templates above.
 
+#### 20.5.6 Multi-process Debugging (pick a process on F5)
+
+When several xnet processes (e.g. `gate` / `passport` / `game` / `cent` /
+`manager` / `battl`) run on the same host, each one needs its **own
+`XDEBUG_PORT`** — a single `127.0.0.1:port` cannot be shared by two processes.
+
+Assign a stable port per process and start each with its own `XDEBUG_PORT`:
+
+| Process  | XDEBUG_PORT |
+|----------|-------------|
+| xadmin   | 19090 |
+| gate     | 19091 |
+| passport | 19092 |
+| game     | 19093 |
+| cent     | 19094 |
+| manager  | 19095 |
+| battl    | 19096 |
+
+To pick the target process at F5 time, add the same `pickString` input to
+**both** `.vscode/launch.json` and `.vscode/tasks.json`. VSCode input
+variables are file-scoped and not shared across files
+([microsoft/vscode#93412](https://github.com/microsoft/vscode/issues/93412)),
+so the `inputs` block must be duplicated. Modern VSCode (≥ 1.62) caches the
+input value within a single F5 session, so the dropdown only appears once.
+
+`launch.json`:
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "XNet Lua Attach (pick process)",
+            "type": "node",
+            "request": "attach",
+            "debugServer": 4711,
+            "preLaunchTask": "xnet-xdebug-dap",
+            "cwd": "${workspaceFolder}",
+            "xdebugHost": "127.0.0.1",
+            "xdebugPort": "${input:xdebugPort}"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "xdebugPort",
+            "type": "pickString",
+            "description": "Which xnet process to debug?",
+            "options": [
+                { "label": "xadmin   (19090)", "value": "19090" },
+                { "label": "gate     (19091)", "value": "19091" },
+                { "label": "passport (19092)", "value": "19092" },
+                { "label": "game     (19093)", "value": "19093" },
+                { "label": "cent     (19094)", "value": "19094" },
+                { "label": "manager  (19095)", "value": "19095" },
+                { "label": "battl    (19096)", "value": "19096" }
+            ],
+            "default": "19090"
+        }
+    ]
+}
+```
+
+`tasks.json` — change `--xdebug-port` to `${input:xdebugPort}` and append
+the same `inputs` block:
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "xnet-xdebug-dap",
+            "type": "shell",
+            "command": "${workspaceFolder}/tools/xdebug_dap.exe",
+            "args": [
+                "--listen", "4711",
+                "--xdebug-host", "127.0.0.1",
+                "--xdebug-port", "${input:xdebugPort}",
+                "--cwd", "${workspaceFolder}"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "xnet-xdebug-dap",
+                "pattern": { "regexp": ".*" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "xnet-xdebug-dap starting",
+                    "endsPattern": "xnet-xdebug-dap listening"
+                }
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "xdebugPort",
+            "type": "pickString",
+            "description": "Which xnet process to debug?",
+            "options": [
+                { "label": "xadmin   (19090)", "value": "19090" },
+                { "label": "gate     (19091)", "value": "19091" },
+                { "label": "passport (19092)", "value": "19092" },
+                { "label": "game     (19093)", "value": "19093" },
+                { "label": "cent     (19094)", "value": "19094" },
+                { "label": "manager  (19095)", "value": "19095" },
+                { "label": "battl    (19096)", "value": "19096" }
+            ],
+            "default": "19090"
+        }
+    ]
+}
+```
+
+Update both `options` arrays in lockstep when the port table changes,
+otherwise the two dropdowns will disagree.
+
+> **Parser gotcha**: `pickString` always yields a string value, so the launch
+> config sends `"xdebugPort": "19090"` (quoted) in the DAP `attach` body. The
+> original `tools/xdebug_dap.c` `json_int_at` only accepted bare integers; on
+> seeing the opening quote it fell through to the `--xdebug-port` command-line
+> default. Whenever the launch- and task-side ports diverged (or the cmdline
+> path was missing), the bridge connected to the wrong port and reported
+> `connection failed`. `json_int_at` has since been extended to also accept
+> quoted integer strings, so `pickString` no longer needs a workaround.
+
+Switching processes between F5 runs: `isBackground: true` means VSCode does
+**not** restart `xdebug_dap.exe` between sessions — the same bridge process on
+port 4711 accepts the new `attach` request and reconnects to the newly-picked
+xdebug port on its own. If the bridge ever gets stuck (rare), run **Terminal
+→ Run Task… → Tasks: Terminate Task** to kill it, then F5 again.
+
 ### 20.6 Threads and Coroutines
 
 Each xnet OS thread owns an independent `lua_State`. The debugger installs a
@@ -2444,13 +2573,50 @@ The native debug service listens on the target machine's own `127.0.0.1`.
 Do not expose the debug port directly to the public network. Use port
 forwarding instead.
 
-SSH remote host:
+SSH remote host (single process):
 
 ```bash
 ssh -L 19090:127.0.0.1:19090 user@remote-host
 ```
 
 Then keep VSCode attached to local `127.0.0.1:19090`.
+
+For multi-process debugging, forward each `XDEBUG_PORT`:
+
+```bash
+ssh -N -L 19090:127.0.0.1:19090 \
+       -L 19091:127.0.0.1:19091 \
+       -L 19092:127.0.0.1:19092 \
+       -L 19093:127.0.0.1:19093 \
+       user@192.168.1.132
+```
+
+Or move the forwards into `~/.ssh/config` so a single `ssh -N gameserver`
+opens all tunnels at once:
+
+```sshconfig
+Host gameserver
+    HostName 192.168.1.132
+    User your_user
+    LocalForward 19090 127.0.0.1:19090
+    LocalForward 19091 127.0.0.1:19091
+    LocalForward 19092 127.0.0.1:19092
+    LocalForward 19093 127.0.0.1:19093
+```
+
+Verify a tunnel works before launching VSCode — expect `OK xnet-xdebug` on
+the first line:
+
+```powershell
+$c = New-Object System.Net.Sockets.TcpClient
+$c.Connect("127.0.0.1", 19090)
+$r = New-Object System.IO.StreamReader($c.GetStream())
+$r.ReadLine()
+$c.Close()
+```
+
+If the handshake comes back, pair the tunneled port with §20.5.6's
+`pickString` and attach.
 
 Android device or emulator:
 
