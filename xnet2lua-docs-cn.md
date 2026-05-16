@@ -2404,6 +2404,115 @@ xnet2lua/
 
 是否把 `.vscode/` 提交到 git 由项目自行决定。端口和本地工具路径因人而异，常见做法是把 `.vscode/` 加进本地 `.gitignore`，让每位开发者基于本节的样板各自维护一份。
 
+#### 20.5.6 多进程调试（按 F5 选择目标进程）
+
+同一台机器上同时跑多个 xnet 进程（例如 `gate` / `passport` / `game` / `cent` / `manager` / `battl`）时，每个进程都需要**独立的 `XDEBUG_PORT`** —— 一个 `127.0.0.1:port` 不能被两个进程同时监听。
+
+按进程约定端口表，启动各进程时分别带上自己的 `XDEBUG_PORT`：
+
+| 进程 | XDEBUG_PORT |
+|---|---|
+| xadmin   | 19090 |
+| gate     | 19091 |
+| passport | 19092 |
+| game     | 19093 |
+| cent     | 19094 |
+| manager  | 19095 |
+| battl    | 19096 |
+
+要在 F5 时弹下拉框选择进程，在 `.vscode/launch.json` 和 `.vscode/tasks.json` **都**加一段同 id 的 `pickString` input。VSCode 的 input 变量按文件作用域解析、两个文件之间不共享（[microsoft/vscode#93412](https://github.com/microsoft/vscode/issues/93412)），所以必须复制一份；好在 VSCode ≥ 1.62 在一次 F5 会话内会缓存输入值，下拉框只会弹一次。
+
+`launch.json`：
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "XNet Lua Attach (pick process)",
+            "type": "node",
+            "request": "attach",
+            "debugServer": 4711,
+            "preLaunchTask": "xnet-xdebug-dap",
+            "cwd": "${workspaceFolder}",
+            "xdebugHost": "127.0.0.1",
+            "xdebugPort": "${input:xdebugPort}"
+        }
+    ],
+    "inputs": [
+        {
+            "id": "xdebugPort",
+            "type": "pickString",
+            "description": "Which xnet process to debug?",
+            "options": [
+                { "label": "xadmin   (19090)", "value": "19090" },
+                { "label": "gate     (19091)", "value": "19091" },
+                { "label": "passport (19092)", "value": "19092" },
+                { "label": "game     (19093)", "value": "19093" },
+                { "label": "cent     (19094)", "value": "19094" },
+                { "label": "manager  (19095)", "value": "19095" },
+                { "label": "battl    (19096)", "value": "19096" }
+            ],
+            "default": "19090"
+        }
+    ]
+}
+```
+
+`tasks.json` 把 `--xdebug-port` 也改成 `${input:xdebugPort}`，并在文件末尾追加同样的 `inputs` 段：
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "xnet-xdebug-dap",
+            "type": "shell",
+            "command": "${workspaceFolder}/tools/xdebug_dap.exe",
+            "args": [
+                "--listen", "4711",
+                "--xdebug-host", "127.0.0.1",
+                "--xdebug-port", "${input:xdebugPort}",
+                "--cwd", "${workspaceFolder}"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "xnet-xdebug-dap",
+                "pattern": { "regexp": ".*" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "xnet-xdebug-dap starting",
+                    "endsPattern": "xnet-xdebug-dap listening"
+                }
+            }
+        }
+    ],
+    "inputs": [
+        {
+            "id": "xdebugPort",
+            "type": "pickString",
+            "description": "Which xnet process to debug?",
+            "options": [
+                { "label": "xadmin   (19090)", "value": "19090" },
+                { "label": "gate     (19091)", "value": "19091" },
+                { "label": "passport (19092)", "value": "19092" },
+                { "label": "game     (19093)", "value": "19093" },
+                { "label": "cent     (19094)", "value": "19094" },
+                { "label": "manager  (19095)", "value": "19095" },
+                { "label": "battl    (19096)", "value": "19096" }
+            ],
+            "default": "19090"
+        }
+    ]
+}
+```
+
+端口表如有变动，两个文件的 `options` 数组**必须同步**改，否则下拉项不一致。
+
+> **解析陷阱**：`pickString` 的 value 永远是字符串，所以 launch 配置发到桥的 DAP `attach` 报文里 `xdebugPort` 字段是 `"19090"`（带引号）。原先 `tools/xdebug_dap.c` 的 `json_int_at` 只识别裸数字、看到 `"` 直接 fallback 到 `--xdebug-port` 命令行参数；只要 launch 和 task 两边端口选的不一样（或者命令行那段没传），桥就会连到错误的端口并报 `connection failed`。`json_int_at` 已扩成也接受带引号的整数字符串，使用 `pickString` 时不再需要绕过。
+
+切换进程间的注意点：`isBackground: true` 意味着上一次启动的 `xdebug_dap.exe` 不会自动重启 —— VSCode 复用同一个 4711 桥进程接受新的 `attach` 请求即可，桥会主动断掉旧的 xdebug 连接并连到新选的端口。如果桥卡死（极少见），用 **Terminal → Run Task… → Tasks: Terminate Task** 杀掉，再 F5 即可。
+
 ### 20.6 多线程和 coroutine 行为
 
 每个 xnet OS 线程都有独立 `lua_State`。调试器会为每个已注册 Lua state 安装 line hook，并包装 `coroutine.create` / `coroutine.wrap`，让新建 coroutine 继承调试 hook。
@@ -2422,13 +2531,47 @@ xnet2lua/
 
 调试服务默认只监听目标机器自己的 `127.0.0.1`，不要直接暴露到公网。远程调试推荐端口转发。
 
-SSH 远程主机：
+SSH 远程主机（单进程）：
 
 ```bash
 ssh -L 19090:127.0.0.1:19090 user@remote-host
 ```
 
 然后本地 VSCode 仍然 attach `127.0.0.1:19090`。
+
+多进程时把每个 `XDEBUG_PORT` 都加一条 `-L`：
+
+```bash
+ssh -N -L 19090:127.0.0.1:19090 \
+       -L 19091:127.0.0.1:19091 \
+       -L 19092:127.0.0.1:19092 \
+       -L 19093:127.0.0.1:19093 \
+       user@192.168.1.132
+```
+
+或者把转发写进 `~/.ssh/config`，平时一条 `ssh -N gameserver` 就能把整段端口转过来：
+
+```sshconfig
+Host gameserver
+    HostName 192.168.1.132
+    User your_user
+    LocalForward 19090 127.0.0.1:19090
+    LocalForward 19091 127.0.0.1:19091
+    LocalForward 19092 127.0.0.1:19092
+    LocalForward 19093 127.0.0.1:19093
+```
+
+隧道连通后，可以用 telnet 或 PowerShell 直接握手验证某个端口：
+
+```powershell
+$c = New-Object System.Net.Sockets.TcpClient
+$c.Connect("127.0.0.1", 19090)
+$r = New-Object System.IO.StreamReader($c.GetStream())
+$r.ReadLine()    # 应当输出: OK xnet-xdebug
+$c.Close()
+```
+
+收到 `OK xnet-xdebug` 就说明端口转发 + 远端 xdebug 都正常，本地 VSCode 配合 §20.5.6 的 pickString 选对端口即可 attach。
 
 Android 设备或模拟器：
 
