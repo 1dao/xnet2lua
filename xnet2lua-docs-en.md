@@ -2362,7 +2362,7 @@ When a breakpoint hits, the current xnet thread is visible in three places:
 |---|---|
 | Call Stack thread name | `T60 stopped scripts/xadmin/xadmin_app.lua:165 (xadmin_worker.lua)` |
 | Debug Console | `[xnet] breakpoint: T60 stopped at scripts/xadmin/xadmin_app.lua:165 ...` |
-| Variables panel | `XNet Thread` scope with `xnet_thread_id`, `script`, and `stopped_at` |
+| Variables panel | `XNet Thread` scope with `xnet_thread_id`, `script`, and `stopped_at`; Lua tables under `Locals` are collapsed by default and loaded lazily when expanded |
 
 #### 20.5.5 `.vscode/` Layout and Setup
 
