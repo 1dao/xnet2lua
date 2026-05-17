@@ -64,6 +64,17 @@ router.reg('get', '/headers', function(req)
     return text(200, tostring(req.headers['x-demo'] or '') .. '\n')
 end)
 
+router.reg('get', '/api/upper', function(req)
+    local input = req.query.text or ''
+    local ok, val = xthread.rpc(xthread.MAIN, 'upper', 1000, input)
+    if not ok then error(val) end
+    return text(200, val)
+end)
+
+router.reg('get', '/api/throw', function()
+    error('intentional handler error for test')
+end)
+
 router.reg('head', '/head', function()
     return text(200, 'head-body-not-sent')
 end)

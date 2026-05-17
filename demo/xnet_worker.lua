@@ -1,180 +1,116 @@
--- xnet_worker.lua - worker thread for the xnet/xchannel demo.
--- Owns both client and accepted server-side connections.
+-- xnet_worker.lua -- worker thread for the xnet smoke test.
+--
+-- Server-side of the cmsgpack/len32 protocol used by demo/xnet_main.lua.
+-- Built on scripts/core/share/xsession.lua + scripts/core/share/xrouter.lua:
+--   * len32 framing, application frames are cmsgpack-packed
+--   * rpc   kind -- handled serially by the per-fd session coroutine
+--   * query kind -- handled by an independent side coroutine (parallel)
+--   * post  kind -- fire-and-forget side coroutine, no response
+--
+-- Handler convention is xrouter native: function(arg1, arg2, ...) -> ret1, ret2,...
+-- xsession wraps via pcall and ships (ok, rets...) to send_response.
+--
+-- xrouter.stubs holds both 'accepted_fd' (xthread message, dispatched via
+-- __thread_handle) and the socket pts ('echo' etc., dispatched via xsession).
+-- Different entry points read the same table; only same-name reuse collides.
 
+local xsession = dofile('scripts/core/share/xsession.lua')
+local xrouter  = dofile('scripts/core/share/xrouter.lua')
 local cmsgpack = require 'cmsgpack'
 
-local MAIN_ID = xthread.MAIN
+xrouter.set_log_prefix('XNET-WORKER')
 
-local client_conn
-local server_conn
-local finished = false
+local counter  = 0
+local table_pack = table.pack or function(...) return { n = select('#', ...), ... } end
 
-_stubs = {}
-_thread_replys = {}
-_net_stubs = {}
+-- Socket-side protocol handlers (positional, xrouter convention) -----------
+-- Each handler returns ret1, ret2, ...; xsession packs them as
+-- (id, ok=true, ret1, ret2, ...). A raised error becomes (id, false, errmsg).
 
-local unpack_args = table.unpack or unpack
+xrouter.register('echo', function(payload)
+    return payload
+end)
 
-function xthread.register(pt, h)
-    _stubs[pt] = h
-end
+xrouter.register('arg_count', function(...)
+    return select('#', ...)
+end)
 
-function xnet.register(pt, h)
-    _net_stubs[pt] = h
-end
+xrouter.register('get_counter', function()
+    return counter
+end)
 
-local function __thread_handle(reply_router, k1, k2, k3, ...)
-    if reply_router then
-        io.stderr:write('[XNET-WORKER] unexpected RPC message: ' .. tostring(k3) .. '\n')
-        return
-    end
+xrouter.register('counter_inc', function()
+    counter = counter + 1
+    -- No return value. Post kind: response discarded; rpc kind: client gets
+    -- the canonical success-no-payload reply (id, true).
+end)
 
-    local h = _stubs[k1]
-    if h then
-        h(k2, k3, ...)
-    elseif k1 then
-        io.stderr:write('[XNET-WORKER] no handler for pt=' .. tostring(k1) .. '\n')
-    end
-end
+xrouter.register('parallel_echo', function(payload)
+    return 'q:' .. tostring(payload)
+end)
 
-local function send_packet(conn, pt, ...)
-    local body = cmsgpack.pack(pt, ...)
-    assert(conn:send(body), 'conn:send failed')
-end
+-- xsession server handler --------------------------------------------------
 
-local function finish(ok, msg)
-    if finished then return end
-    finished = true
-    print('[XNET-WORKER] finish:', ok, msg)
-    xthread.post(MAIN_ID, 'xnet_done', ok, msg)
-end
+local handler = xsession.make({
+    framing = { type = 'len32', max_packet = 1 * 1024 * 1024 },
 
-local function pack_args(...)
-    return { n = select('#', ...), ... }
-end
+    parse_packet = function(data, pos)
+        -- len32 framing -> data is one frame body, pos == 1.
+        -- Wire layout: pack(id, kind, pt, arg1, arg2, ...)
+        local vals = table_pack(cmsgpack.unpack(data))
+        local id, kind, pt = vals[1], vals[2], vals[3]
+        if id == nil then
+            return nil, pos, 'bad cmsgpack'
+        end
+        -- Collect remaining values as positional args. Capture explicit
+        -- length to survive trailing nils.
+        local nargs = vals.n - 3
+        if nargs < 0 then nargs = 0 end
+        local args = { n = nargs }
+        for i = 1, nargs do args[i] = vals[i + 3] end
+        return { id = id, kind = kind, pt = pt, args = args }, #data + 1
+    end,
 
-local function dispatch_net_packet(side, conn, body)
-    local args = pack_args(cmsgpack.unpack(body))
-    local pt = args[1]
-    print('[XNET-WORKER] ' .. side .. ' recv:', unpack_args(args, 1, args.n))
+    classify = function(req) return req.kind end,
 
-    local h = _net_stubs[pt]
-    if not h then
-        finish(false, side .. ' unknown pt=' .. tostring(pt))
-        return
-    end
+    -- router path (positional): send_response receives (conn, req, ok, ret1, ret2, ...).
+    send_response = function(conn, req, ok, ...)
+        local body = cmsgpack.pack(req.id, ok and true or false, ...)
+        conn:send(body)
+    end,
 
-    print(string.format('[XNET-WORKER] %s dispatch stub: %s', side, tostring(pt)))
-    h(side, conn, unpack_args(args, 2, args.n))
-end
+    router = xrouter,
 
-local server_handler = {}
+    on_connect = function(conn, ip, port)
+        print(string.format('[XNET-WORKER] accept fd=%s from %s:%s',
+            tostring(conn:fd()), tostring(ip), tostring(port)))
+    end,
+    on_close = function(_, reason)
+        print('[XNET-WORKER] close: ' .. tostring(reason))
+    end,
 
-function server_handler.on_connect(conn, ip, port)
-    server_conn = conn
-    print(string.format('[XNET-WORKER] server-side fd attached from %s:%s', tostring(ip), tostring(port)))
-    conn:set_framing({ type = 'len32', max_packet = 1024 * 1024 })
-    print('[XNET-WORKER] server framing: len32')
-end
+    log_prefix    = 'XNET-WORKER',
+    max_queue_len = 256,
+})
 
-function server_handler.on_packet(conn, body)
-    dispatch_net_packet('server', conn, body)
-end
-
-function server_handler.on_close(_, reason)
-    print('[XNET-WORKER] server-side close:', reason)
-end
-
-local client_handler = {}
-
-function client_handler.on_connect(conn, ip, port)
-    client_conn = conn
-    print(string.format('[XNET-WORKER] client connected to %s:%s', tostring(ip), tostring(port)))
-    conn:set_framing({ type = 'len32', max_packet = 1024 * 1024 })
-    print('[XNET-WORKER] client framing: len32')
-    send_packet(conn, 'hello', 'from-client', 17, 25)
-end
-
-function client_handler.on_packet(conn, body)
-    dispatch_net_packet('client', conn, body)
-end
-
-function client_handler.on_close(_, reason)
-    print('[XNET-WORKER] client close:', reason)
-end
-
-xthread.register('accepted_fd', function(fd, ip, port)
+-- xthread message: accepted fd from main thread
+xrouter.register('accepted_fd', function(fd, ip, port)
     print(string.format('[XNET-WORKER] attach accepted fd=%s', tostring(fd)))
-    local conn, err = xnet.attach(fd, server_handler, ip, port)
+    local conn, err = xnet.attach(fd, handler, ip, port)
     if not conn then
-        finish(false, 'xnet.attach failed: ' .. tostring(err))
+        io.stderr:write('[XNET-WORKER] attach failed: ' .. tostring(err) .. '\n')
     end
 end)
-
-xthread.register('start_client', function(host, port)
-    print(string.format('[XNET-WORKER] connect to %s:%s', tostring(host), tostring(port)))
-    local conn, err = xnet.connect(host, port, client_handler)
-    if not conn then
-        finish(false, 'xnet.connect failed: ' .. tostring(err))
-    end
-end)
-
-xnet.register('hello', function(side, conn, arg1, arg2, arg3)
-    if side ~= 'server' then
-        finish(false, 'hello arrived on ' .. side)
-        return
-    end
-    if arg1 ~= 'from-client' or arg2 ~= 17 or arg3 ~= 25 then
-        finish(false, 'server received invalid hello')
-        return
-    end
-    send_packet(conn, 'pong', 'from-server', arg2 + arg3, 'ok')
-end)
-
-xnet.register('pong', function(side, conn, arg1, arg2, arg3)
-    if side ~= 'client' then
-        finish(false, 'pong arrived on ' .. side)
-        return
-    end
-    if arg1 ~= 'from-server' or arg2 ~= 42 or arg3 ~= 'ok' then
-        finish(false, 'client received invalid pong')
-        return
-    end
-    send_packet(conn, 'done', 'client-ok', arg2, arg3)
-end)
-
-xnet.register('done', function(side, _, arg1, arg2, arg3)
-    if side ~= 'server' then
-        finish(false, 'done arrived on ' .. side)
-        return
-    end
-    if arg1 == 'client-ok' and arg2 == 42 and arg3 == 'ok' then
-        finish(true, 'len32 cmsgpack exchange ok')
-    else
-        finish(false, 'server received invalid done')
-    end
-end)
-
-local function __init()
-    print('[XNET-WORKER] init')
-    assert(xnet.init())
-end
-
--- xnet.init() marks this thread as network-active; the C layer drives
--- xpoll_poll(), so enable __update only when periodic Lua work is added.
--- local function __update()
--- end
-
-local function __uninit()
-    if client_conn then client_conn:close('worker_uninit') end
-    if server_conn then server_conn:close('worker_uninit') end
-    xnet.uninit()
-    print('[XNET-WORKER] uninit')
-end
 
 return {
-    __init = __init,
-    -- __update = __update,
-    __uninit = __uninit,
-    __thread_handle = __thread_handle,
+    __init = function()
+        print('[XNET-WORKER] init')
+        assert(xnet.init())
+    end,
+    __uninit = function()
+        handler.close_all('worker_uninit')
+        xnet.uninit()
+        print('[XNET-WORKER] uninit')
+    end,
+    __thread_handle = xrouter.handle,  -- routes 'accepted_fd' (and only that, here)
 }
