@@ -102,6 +102,11 @@ local server_handler = xsession.make({
         local status = (err == 'request too large' or err == 'request body too large')
             and 413 or 400
         codec.send_error(conn, status, err, { server_name = server_name })
+        -- HTTP/1.1 has no in-stream resync; once we've rejected the request
+        -- line/headers, anything further on this conn is unparseable bytes.
+        -- xsession's soft parse-error policy keeps the fd alive by default,
+        -- so we explicitly close here to match standard HTTP server behavior.
+        conn:close('parse_error')
     end,
 
     http_router = app_router,
