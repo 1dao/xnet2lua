@@ -160,6 +160,8 @@ static xThread* _threads[XTHR_MAX];
 static xMutex   _lock;
 static bool     _init = false;
 
+static int xthread_wakeup_init_ctx(xThread* ctx);
+static void xthread_wakeup_uninit_ctx(xThread* ctx);
 void xthread_wakeup_uninit(void);
 
 #ifdef _WIN32
@@ -758,10 +760,8 @@ static void xthread_notify(xThread* target, bool need_notify) {
 ** xthread_wakeup_uninit must be called from the same thread (e.g. on_cleanup)
 ** before the poll instance is destroyed.
 ** ========================================================================== */
-int xthread_wakeup_init() {
-    xThread* ctx = xthread_current();
-    assert(ctx != NULL);
-
+static int xthread_wakeup_init_ctx(xThread* ctx) {
+    if (!ctx) return -1;
     xPollState* poll = xpoll_get_default();
 
     if (ctx->poll) {
@@ -823,8 +823,16 @@ int xthread_wakeup_init() {
     return 0;
 }
 
-void xthread_wakeup_uninit(void) {
+int xthread_wakeup_init() {
     xThread* ctx = xthread_current();
+    if (!ctx) {
+        XLOGE("xthread_wakeup_init: current thread is not registered");
+        return -1;
+    }
+    return xthread_wakeup_init_ctx(ctx);
+}
+
+static void xthread_wakeup_uninit_ctx(xThread* ctx) {
     if (!ctx || !ctx->poll) return;
 
     xpoll_del_event(ctx->notify_rfd, XPOLL_READABLE);
@@ -842,6 +850,10 @@ void xthread_wakeup_uninit(void) {
     ctx->notify_wfd = INVALID_SOCKET;
 
     XLOGI("Thread[%d:%s] wakeup uninit", ctx->id, ctx->name);
+}
+
+void xthread_wakeup_uninit(void) {
+    xthread_wakeup_uninit_ctx(xthread_current());
 }
 
 
@@ -890,8 +902,9 @@ static bool xthread_register_main(int id, const char* name) {
 ** thread internal init / uninit
 ** ========================================================================== */
 static inline void xthread_internal_init(xThread* ctx) {
+    if (!ctx || !atomic_load(&ctx->running)) return;
     if (ctx->on_init) ctx->on_init(ctx);
-    xthread_wakeup_init();
+    if (atomic_load(&ctx->running)) xthread_wakeup_init_ctx(ctx);
 }
 
 static inline void xthread_internal_update(xThread* ctx) {
@@ -900,7 +913,7 @@ static inline void xthread_internal_update(xThread* ctx) {
 }
 
 static inline void xthread_internal_uninit(xThread* ctx) {
-    xthread_wakeup_uninit(); // must first uninit
+    xthread_wakeup_uninit_ctx(ctx); // must first uninit
     if (ctx->on_cleanup) ctx->on_cleanup(ctx);
 }
 

@@ -161,7 +161,7 @@ static int lua_json_table_is_array(lua_State *L, int idx, lua_Integer *out_len) 
     }
 
     lua_settop(L, base);
-    if (is_array && count == max) {
+    if (is_array && count > 0 && count == max) {
         *out_len = max;
         return 1;
     }
@@ -383,6 +383,9 @@ static int lua_json_push_value(lua_State *L, const yyjson_val *val, int depth) {
 }
 
 static int l_util_json_pack(lua_State *L) {
+    luaL_checkstack(L, LUA_UTIL_JSON_MAX_DEPTH * 4 + 32,
+                    "json pack: too many nested values");
+
     yyjson_mut_doc *doc = yyjson_mut_doc_new(&g_xj_alc);
     if (!doc) {
         return json_error(L, "json pack: out of memory");
@@ -411,6 +414,9 @@ static int l_util_json_pack(lua_State *L) {
 }
 
 static int l_util_json_unpack(lua_State *L) {
+    luaL_checkstack(L, LUA_UTIL_JSON_MAX_DEPTH * 4 + 32,
+                    "json unpack: too many nested values");
+
     size_t len = 0;
     const char *text = luaL_checklstring(L, 1, &len);
     yyjson_read_err err;

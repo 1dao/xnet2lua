@@ -1,8 +1,9 @@
--- xhttp_worker.lua - worker-side HTTP connection dispatcher.
+-- xhttp_worker.lua - worker-side HTTP connection dispatcher through xsession.
 -- HTTP parsing and response serialization live in shared Lua modules.
 
-local codec = dofile('scripts/core/share/xhttp_codec.lua')
-local router = dofile('scripts/core/share/xrouter.lua')
+local xsession = dofile('scripts/core/share/xsession.lua')
+local codec    = dofile('scripts/core/share/xhttp_codec.lua')
+local router   = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('XHTTP-WORKER')
 router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
     local _ = reply_router
@@ -61,54 +62,64 @@ local function dispatch_request(req)
     return { status = 404, body = 'not found\n' }
 end
 
-local server_handler = {}
-
-function server_handler.on_connect(conn, ip, port)
-    connections[conn] = { ip = ip, port = port }
-    conn:set_framing({ type = 'raw', max_packet = max_request_size })
-    print(string.format('[XHTTP-WORKER] accepted fd=%s from %s:%s',
-        tostring(conn:fd()), tostring(ip), tostring(port)))
-end
-
-function server_handler.on_packet(conn, data)
-    local state = connections[conn]
-    local pos = 1
-    local consumed = 0
-    local data_len = #data
-    local send_opts = { server_name = server_name }
-
-    while pos <= data_len do
-        local req, next_pos, err = codec.parse_request(data, pos, {
-            max_request_size = max_request_size,
-            state = state,
-        })
-        if not req then
-            if err == 'incomplete' then
-                break
-            end
-            codec.send_error(conn, err == 'request body too large' and 413 or 400, err, send_opts)
-            return data_len
-        end
-
+local app_router = {
+    handle = function(req)
         local ok, resp = pcall(dispatch_request, req)
-        if ok then
-            codec.send_response(conn, req, resp, send_opts)
-        else
+        if not ok then
             io.stderr:write('[XHTTP-WORKER] app error: ' .. tostring(resp) .. '\n')
-            codec.send_error(conn, 500, 'internal server error', send_opts)
+            return {
+                status = 500,
+                body = 'internal server error\n',
+                headers = { ['Content-Type'] = 'text/plain; charset=utf-8' },
+            }
         end
+        if type(resp) ~= 'table' then
+            return {
+                status = 500,
+                body = 'invalid app response\n',
+                headers = { ['Content-Type'] = 'text/plain; charset=utf-8' },
+            }
+        end
+        return resp
+    end,
+}
 
-        consumed = next_pos - 1
-        pos = next_pos
-    end
+local server_handler = xsession.make({
+    parse_packet = function(data, pos, _, cstate)
+        return codec.parse_request(data, pos, {
+            max_request_size = max_request_size,
+            state = cstate,
+        })
+    end,
 
-    return consumed
-end
+    classify = function(_) return 'rpc' end,
 
-function server_handler.on_close(conn, reason)
-    connections[conn] = nil
-    print('[XHTTP-WORKER] close:', reason)
-end
+    send_response = function(conn, req, resp)
+        codec.send_response(conn, req, resp, { server_name = server_name })
+    end,
+
+    on_parse_error = function(conn, err)
+        local status = (err == 'request too large' or err == 'request body too large')
+            and 413 or 400
+        codec.send_error(conn, status, err, { server_name = server_name })
+    end,
+
+    http_router = app_router,
+
+    on_connect = function(conn, ip, port)
+        conn:set_framing({ type = 'raw', max_packet = max_request_size })
+        print(string.format('[XHTTP-WORKER] accepted fd=%s from %s:%s',
+            tostring(conn:fd()), tostring(ip), tostring(port)))
+    end,
+
+    on_close = function(_, reason)
+        print('[XHTTP-WORKER] close:', reason)
+    end,
+
+    log_prefix    = 'XHTTP-WORKER',
+    max_queue_len = 256,
+    connections   = connections,
+})
 
 xthread.register('xhttp_worker_start', function(script_path, max_size, name,
                                                https, cert_file, key_file, key_password)
@@ -143,9 +154,7 @@ xthread.register('xhttp_accept', function(fd, ip, port)
 end)
 
 xthread.register('xhttp_worker_stop', function()
-    for conn in pairs(connections) do
-        conn:close('xhttp_worker_stop')
-    end
+    server_handler.close_all('xhttp_worker_stop')
 end)
 
 local function __init()
@@ -159,10 +168,7 @@ end
 -- end
 
 local function __uninit()
-    for conn in pairs(connections) do
-        conn:close('worker_uninit')
-    end
-    connections = {}
+    server_handler.close_all('worker_uninit')
     xnet.uninit()
     print('[XHTTP-WORKER] uninit')
 end

@@ -1,7 +1,7 @@
 -- xadmin_app.lua - HTTP routes for the xadmin console.
 --
--- Each route runs inside a per-request coroutine spawned by xadmin_worker.
--- That means routes can call yielding APIs (notably xnats.rpc) and just
+-- Each fd has one session coroutine managed by xadmin_worker/xsession.
+-- That means routes can call yielding APIs (notably xnats.rpc/xthread.rpc) and just
 -- `return` the response synchronously; xnats.rpc routes self-targeted calls
 -- straight to the local business worker (caller-side short-circuit) and
 -- only goes over NATS for cross-process targets.

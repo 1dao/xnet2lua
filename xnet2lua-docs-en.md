@@ -544,6 +544,8 @@ if not ok then error("Failed to create thread: " .. tostring(err)) end
 local ok, err = xthread.shutdown_thread(thread_id)
 ```
 
+`shutdown_thread` marks the target thread as stopping, wakes it, and waits for the worker to finish cleanup on its own OS thread. Cleanup closes the wakeup fd, runs Lua `__uninit`, then calls `lua_close`. Shutting a thread down immediately after creation is supported: wakeup cleanup uses the saved `xThread*` instead of looking up `xthread_current()` after the thread has been removed from the registry.
+
 ### 4.4 POST — Asynchronous Message (fire-and-forget)
 
 ```
@@ -1224,6 +1226,13 @@ print(data.name)   -- alice
 print(data.score)  -- 100
 ```
 
+Encoding rules:
+
+- An empty Lua table is encoded as a JSON object: `{}`.
+- A table with contiguous positive integer keys `1..N` is encoded as a JSON array; sparse tables, mixed keys, and string-keyed tables are encoded as JSON objects.
+- There is no separate empty-array sentinel today; if an empty array is meaningful, make that part of your protocol contract.
+- `json_pack` and `json_unpack` reserve Lua C stack space for the maximum JSON nesting depth. Inputs that are too deep or unsupported should return `nil, err` instead of corrupting the Lua heap. JSON `null` round-trips through `xutils.json_null`.
+
 ---
 
 ## 11. Configuration Files
@@ -1828,7 +1837,7 @@ end
 
 Key design points:
 
-- **HTTP routes run inside a per-request coroutine.** A route handler may call yielding APIs (`xnats.rpc`, `xthread.rpc`) directly and just `return` the response. The worker keeps a per-connection queue so HTTP/1.1 pipelining order is preserved.
+- **HTTP connections run inside per-fd session coroutines.** `scripts/core/share/xsession.lua` creates one session coroutine for each fd. Complete HTTP requests parsed from the same connection are queued into that session, and the session is resumed when a request arrives or a yielding RPC returns. Route handlers can still call `xnats.rpc(...)` / `xthread.rpc(...)` in synchronous style, while HTTP/1.1 pipelining response order is preserved. After socket close, the session drains already parsed requests but skips response sending because the fd may no longer be writable.
 - **Local RPC short-circuits at the caller side.** `xnats.rpc(self, ...)` never touches the NATS wire — it hits the local business worker directly via `xthread.rpc`. See §18.4.
 - **State survives reload.** Connections, peer cache, in-flight RPC context all live in `_G`, so top-level `dofile` doesn't disturb them. See §19.2.
 
@@ -2066,7 +2075,7 @@ if state.counter == nil then state.counter = 0 end
 local connections = state.connections   -- old code, new code, all coroutines: same table
 ```
 
-`xhttp.lua`, `xnats.lua`, `xnats_worker.lua`, `xadmin_worker.lua`, `xrouter.lua`, `xhttp_router.lua` all follow this pattern — use them as references.
+`xhttp.lua`, `xnats.lua`, `xnats_worker.lua`, `xadmin_worker.lua`, `xsession.lua`, `xrouter.lua`, `xhttp_router.lua` all follow this pattern — use them as references. `xsession.lua` can also receive a caller-owned `connections` table so fd/session state survives worker reload.
 
 ### 19.3 Three ways to trigger reload
 
@@ -2120,7 +2129,7 @@ current=<current_thread_id> notified=<count> deferred=<count>
 3. **Cross-reload state lives in `_G[STATE_KEY]`** — connection tables, counters, caches, in-flight bookkeeping.
 4. **Register handlers via `xthread.register(pt, h)` or `router.register(pt, h)`** — both go through the xrouter singleton and support in-place overwrite.
 5. **Use the `local foo = state.foo` aliasing pattern** so old and new code (and old/new coroutines) reference the same sub-table.
-6. **Coroutine-shaped request dispatch** — let yielding APIs (`xnats.rpc`, `xthread.rpc`, `xtimer` callbacks) be called synchronously inside the handler; the response flows back through the coroutine naturally. `scripts/xadmin/xadmin_worker.lua`'s `start_request` + per-connection `queue` is the reference implementation.
+6. **Coroutine-shaped request dispatch** — let yielding APIs (`xnats.rpc`, `xthread.rpc`, `xtimer` callbacks) be called synchronously inside the handler; the response flows back through the coroutine naturally. Use `scripts/core/share/xsession.lua` and `scripts/xadmin/xadmin_worker.lua` as references: one session coroutine per fd, complete requests queued before resume, close events draining queued work while skipping response sends when the fd is no longer writable.
 7. **Smoke-test**: change one line → `POST /api/reload {target:"self"}` → confirm new behavior live → revert + reload again → confirm gone. No process restart in either step.
 
 ---
