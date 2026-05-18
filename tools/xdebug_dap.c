@@ -49,7 +49,7 @@ typedef struct {
 typedef struct Session {
     SOCKET_T fd, xfd;
     Options opts;
-    int seq, next_frame, next_var, polling, closed;
+    int seq, next_frame, next_var, polling, closed, configured, received_set_breakpoints;
     long64 next_poll;
     char *in;
     size_t in_len, in_cap;
@@ -477,6 +477,23 @@ static int bp_set(Breakpoints *bps, const char *file, int *lines, int n) {
     return 1;
 }
 
+static int bp_add_line(Breakpoints *bps, const char *file, int line) {
+    BpFile *bp = bp_find(bps, file);
+    if (!bp) {
+        int one = line;
+        return bp_set(bps, file, &one, 1);
+    }
+    for (int i = 0; i < bp->n; i++) {
+        if (bp->lines[i] == line) return 1;
+    }
+    int *new_lines = (int *)realloc(bp->lines, sizeof(int) * (size_t)(bp->n + 1));
+    if (!new_lines) return 0;
+    bp->lines = new_lines;
+    bp->lines[bp->n++] = line;
+    bp->cap = bp->n;
+    return 1;
+}
+
 static void breakpoints_free(Breakpoints *bps) {
     for (int i = 0; i < bps->n; i++) {
         free(bps->v[i].file);
@@ -543,6 +560,8 @@ static void session_close(Session *s) {
         s->fd = INVALID_SOCKET_VAL;
     }
     if (s->xfd != INVALID_SOCKET_VAL) {
+        send_all(s->xfd, "continue all\n", 13);
+        send_all(s->xfd, "clear\n", 6);
         send_all(s->xfd, "quit\n", 5);
         xsock_close(s->xfd);
         s->xfd = INVALID_SOCKET_VAL;
@@ -640,6 +659,35 @@ static int ensure_xdebug(Session *s, Request *req, char *err) {
     return 1;
 }
 
+static int seed_default_breakpoints(Session *s, Request *req) {
+    const char *a, *b, *p;
+    if (!json_array_range(req->json, req->end, "defaultBreakpoints", &a, &b)) return 1;
+    p = skip_ws(a + 1, b);
+    while (p < b && *p && *p != ']') {
+        if (*p == '{') {
+            const char *q = match_bracket(p, b, '{', '}');
+            if (!q) return 0;
+            char *path = json_get_string(p, q, "path");
+            if (!path) path = json_get_string(p, q, "file");
+            int line = json_get_int(p, q, "line", 0);
+            if (path && line > 0) {
+                if (!bp_add_line(&s->bps, path, line)) {
+                    free(path);
+                    return 0;
+                }
+            }
+            free(path);
+            p = q;
+        } else {
+            p++;
+        }
+        p = skip_ws(p, b);
+        if (p < b && *p == ',') p++;
+        p = skip_ws(p, b);
+    }
+    return 1;
+}
+
 static int apply_breakpoints(Session *s, char *err) {
     Lines lines;
     if (s->xfd == INVALID_SOCKET_VAL) return 1;
@@ -647,6 +695,17 @@ static int apply_breakpoints(Session *s, char *err) {
     lines_free(&lines);
     for (int i = 0; i < s->bps.n; i++) {
         char *p = debug_path(s->opts.cwd, s->bps.v[i].file);
+        if (s->bps.v[i].n > 0) {
+            Str msg = {0};
+            sb_printf(&msg, "[xnet] apply break %s -> [", p ? p : "");
+            for (int j = 0; j < s->bps.v[i].n; j++) {
+                if (j) sb_add(&msg, ", ");
+                sb_printf(&msg, "%d", s->bps.v[i].lines[j]);
+            }
+            sb_add(&msg, "]");
+            output(s, "%s", msg.p ? msg.p : "");
+            sb_free(&msg);
+        }
         for (int j = 0; j < s->bps.v[i].n; j++) {
             if (!xcmd(s, &lines, err, "break %s %d", p, s->bps.v[i].lines[j])) {
                 free(p);
@@ -734,14 +793,16 @@ static int poll_threads(Session *s) {
             sb_free(&b);
         }
         if (t->stopped && (!prev || !prev->stopped || strcmp(prev->file, t->file) != 0 || prev->line != t->line)) {
-            const char *r = reason_take(s, t->id, reason);
-            stopped_output(s, t, r);
-            Str b = {0};
-            sb_add(&b, "{\"reason\":");
-            sb_json(&b, r);
-            sb_printf(&b, ",\"threadId\":%d,\"allThreadsStopped\":false}", t->id);
-            send_event(s, "stopped", b.p);
-            sb_free(&b);
+            if (s->configured) {
+                const char *r = reason_take(s, t->id, reason);
+                stopped_output(s, t, r);
+                Str b = {0};
+                sb_add(&b, "{\"reason\":");
+                sb_json(&b, r);
+                sb_printf(&b, ",\"threadId\":%d,\"allThreadsStopped\":false}", t->id);
+                send_event(s, "stopped", b.p);
+                sb_free(&b);
+            }
         }
     }
     for (int i = 0; i < s->threads.n; i++) {
@@ -782,6 +843,12 @@ static void on_initialize(Session *s, Request *req) {
 
 static void on_attach(Session *s, Request *req) {
     char err[XSOCK_ERR_LEN] = {0};
+    s->received_set_breakpoints = 0;
+    s->configured = 0;
+    if (!seed_default_breakpoints(s, req)) {
+        send_response(s, req, "{}", 0, "out of memory");
+        return;
+    }
     if (!ensure_xdebug(s, req, err) || !apply_breakpoints(s, err)) {
         send_response(s, req, "{}", 0, err[0] ? err : "attach failed");
         return;
@@ -792,6 +859,10 @@ static void on_attach(Session *s, Request *req) {
 }
 
 static void on_config_done(Session *s, Request *req) {
+    s->configured = 1;
+    for (int i = 0; i < s->threads.n; i++) {
+        s->threads.v[i].stopped = 0;
+    }
     send_response(s, req, "{}", 1, NULL);
     poll_threads(s);
 }
@@ -831,11 +902,23 @@ static char *request_source_path(Request *req) {
 static void on_set_breakpoints(Session *s, Request *req) {
     char *file = request_source_path(req);
     int *lines = NULL, n = 0;
+    s->received_set_breakpoints = 1;
     if (!parse_breakpoint_lines(req, &lines, &n) || !bp_set(&s->bps, file, lines, n)) {
         free(file);
         free(lines);
         send_response(s, req, "{}", 0, "out of memory");
         return;
+    }
+    {
+        Str msg = {0};
+        sb_printf(&msg, "[xnet] setBreakpoints %s -> [", file ? file : "");
+        for (int i = 0; i < n; i++) {
+            if (i) sb_add(&msg, ", ");
+            sb_printf(&msg, "%d", lines[i]);
+        }
+        sb_add(&msg, "]");
+        output(s, "%s", msg.p ? msg.p : "");
+        sb_free(&msg);
     }
     free(lines);
 

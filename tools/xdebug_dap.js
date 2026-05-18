@@ -178,8 +178,10 @@ class XdebugClient {
         this.sock.write(this.pending.text + "\n");
     }
 
-    close() {
+    close(forceContinue = false) {
         if (this.sock) {
+            if (forceContinue) this.sock.write("continue all\n");
+            if (forceContinue) this.sock.write("clear\n");
             this.sock.write("quit\n");
             this.sock.end();
         }
@@ -201,8 +203,11 @@ class Session {
         this.nextFrameId = 1000;
         this.nextVarId = 1;
         this.stopReasons = new Map();
+        this.receivedSetBreakpoints = false;
+        this.attachArgs = {};
+        this.configured = false;
         this.wire = new DapWire(socket, socket, msg => this.handle(msg));
-        socket.on("close", () => this.close());
+        socket.on("close", () => this.close(true));
     }
 
     sendResponse(req, body, success = true, message) {
@@ -262,7 +267,9 @@ class Session {
 
     async on_attach(req, args) {
         await this.ensureXdebug(args);
-        await this.applyBreakpoints();
+        this.attachArgs = args || {};
+        this.receivedSetBreakpoints = false;
+        this.configured = false;
         this.startPolling();
         this.sendResponse(req, {});
     }
@@ -272,18 +279,52 @@ class Session {
     }
 
     async on_configurationDone(req) {
+        if (!this.receivedSetBreakpoints) {
+            this.seedDefaultBreakpoints(this.attachArgs);
+            await this.applyBreakpoints();
+        }
+        this.configured = true;
+        for (const [id, old] of this.threads) {
+            this.threads.set(id, { ...old, stopped: false });
+        }
         this.sendResponse(req, {});
         this.pollThreads().catch(() => {});
     }
 
     async on_setBreakpoints(req, args) {
+        this.receivedSetBreakpoints = true;
         const file = args.source && args.source.path ? args.source.path : "";
         const lines = (args.breakpoints || []).map(b => b.line).filter(Boolean);
         this.breakpoints.set(file, lines);
+        this.output(`[xnet] setBreakpoints ${slash(file)} -> [${lines.join(", ")}]`);
         await this.applyBreakpoints();
         this.sendResponse(req, {
             breakpoints: lines.map(line => ({ verified: true, line }))
         });
+    }
+
+    seedDefaultBreakpoints(args) {
+        const defs = Array.isArray(args && args.defaultBreakpoints) ? args.defaultBreakpoints : [];
+        if (!defs.length) return;
+        for (const lines of this.breakpoints.values()) {
+            if (Array.isArray(lines) && lines.length) return;
+        }
+        for (const bp of defs) {
+            if (!bp) continue;
+            const file = bp.path || bp.file || "";
+            const lines = [];
+            if (Array.isArray(bp.lines)) {
+                for (const n of bp.lines) {
+                    const line = Number(n);
+                    if (Number.isInteger(line) && line > 0) lines.push(line);
+                }
+            } else {
+                const line = Number(bp.line);
+                if (Number.isInteger(line) && line > 0) lines.push(line);
+            }
+            if (!file || !lines.length) continue;
+            this.breakpoints.set(file, lines);
+        }
     }
 
     async applyBreakpoints() {
@@ -291,6 +332,7 @@ class Session {
         await this.xdbg.command("clear");
         for (const [file, lines] of this.breakpoints) {
             const p = toDebugPath(this.opts.cwd, file);
+            if (lines.length) this.output(`[xnet] apply break ${p} -> [${lines.join(", ")}]`);
             for (const line of lines) await this.xdbg.command(`break ${p} ${line}`);
         }
     }
@@ -336,7 +378,7 @@ class Session {
             const prev = this.threads.get(t.id);
             next.set(t.id, t);
             if (!prev) this.sendEvent("thread", { reason: "started", threadId: t.id });
-            if (t.stopped && (!prev || !prev.stopped || prev.file !== t.file || prev.line !== t.line)) {
+            if (this.configured && t.stopped && (!prev || !prev.stopped || prev.file !== t.file || prev.line !== t.line)) {
                 const reason = this.stopReasons.get(t.id) || "breakpoint";
                 this.stopReasons.delete(t.id);
                 this.output(stoppedText(t, reason));
@@ -479,12 +521,45 @@ class Session {
         this.sendResponse(req, {});
     }
 
+    async continueAllBeforeClose() {
+        if (!this.xdbg) return;
+        if (this.pollTimer) {
+            clearInterval(this.pollTimer);
+            this.pollTimer = null;
+        }
+        const withTimeout = (promise, ms, tag) => Promise.race([
+            promise,
+            new Promise((_, reject) => setTimeout(() => reject(new Error(`${tag} timeout`)), ms))
+        ]);
+        const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+        try {
+            let quietRounds = 0;
+            const deadline = Date.now() + 5000;
+            while (Date.now() < deadline) {
+                await withTimeout(this.xdbg.command("continue all"), 500, "continue all");
+                const list = await withTimeout(this.getThreads(), 500, "threads");
+                for (const t of list) this.threads.set(t.id, t);
+                if (list.some(t => t.stopped)) {
+                    quietRounds = 0;
+                } else {
+                    quietRounds++;
+                    if (quietRounds >= 6) break;
+                }
+                await sleep(120);
+            }
+        } catch (err) {
+            this.output(`[xnet] continue-before-close skipped: ${err.message || String(err)}`);
+        }
+    }
+
     async on_disconnect(req) {
+        await this.continueAllBeforeClose();
         this.sendResponse(req, {});
         this.close();
     }
 
     async on_terminate(req) {
+        await this.continueAllBeforeClose();
         this.sendResponse(req, {});
         this.close();
     }
@@ -496,7 +571,7 @@ class Session {
     close() {
         if (this.pollTimer) clearInterval(this.pollTimer);
         this.pollTimer = null;
-        if (this.xdbg) this.xdbg.close();
+        if (this.xdbg) this.xdbg.close(true);
         this.xdbg = null;
         if (this.onClose) {
             const cb = this.onClose;
