@@ -794,7 +794,18 @@ static void xdbg_continue_locked(XDbgState* st, XDbgStep mode) {
     st->step_mode = mode;
     st->stopped = 0;
     st->stop_L = NULL;
+    st->pause_requested = 0;
     st->req = XDBG_REQ_NONE;
+}
+
+static void xdbg_release_all_locked(void) {
+    int i;
+    for (i = 0; i < XDBG_MAX_STATES; i++) {
+        XDbgState* st = &g_dbg.states[i];
+        if (!st->active) continue;
+        xdbg_continue_locked(st, XDBG_STEP_NONE);
+    }
+    g_dbg.wait_on_attach = 0;
 }
 
 static void xdbg_cmd_continue(SOCKET_T fd, const char* id, XDbgStep mode) {
@@ -897,6 +908,11 @@ static void xdbg_client(SOCKET_T fd) {
     while (g_dbg.running && xdbg_readline(fd, line, sizeof(line)) >= 0) {
         if (!xdbg_handle_line(fd, line)) break;
     }
+    xdbg_mutex_lock(&g_dbg.lock);
+    g_dbg.break_count = 0;
+    xdbg_release_all_locked();
+    xdbg_cond_signal(&g_dbg.cond);
+    xdbg_mutex_unlock(&g_dbg.lock);
 }
 
 #ifdef _WIN32
