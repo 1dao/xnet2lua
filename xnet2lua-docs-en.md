@@ -61,7 +61,7 @@ xnet2lua is divided into four layers:
 ## 2. Building and Integration
 
 > ⚙️ **Build system reorganized.** The root Makefile now produces all three artifacts —
-> `libxsock.a`, `bin/xnet`, and `bin/xthread_test` — in a single pass. The previous
+> `libxnet.a`, `bin/xnet`, and `bin/xthread_test` — in a single pass. The previous
 > two-stage build (`make` at root, then `cd demo && make`) is **no longer required**.
 > A new top-level `build.bat` provides an MSVC all-source build, and **LuaJIT** is now
 > supported as an optional Lua backend.
@@ -108,7 +108,7 @@ make LUA_BACKEND=luajit                    # see 2.5
 ### 2.2 Windows / MSVC build (`build.bat`)
 
 The repository root now ships `build.bat` — an **all-source** MSVC build (it does
-not consume `libxsock.a`) that auto-locates `vcvarsall.bat` and loads the x64
+not consume `libxnet.a`) that auto-locates `vcvarsall.bat` and loads the x64
 toolchain. `demo/build.bat` still works but only forwards arguments to the root
 script.
 
@@ -234,7 +234,7 @@ module-name or signature changes.
 
 To embed xnet2lua into your own C project:
 
-1. Link `libxsock.a`.
+1. Link `libxnet.a`.
 2. Pick a Lua backend and define the matching macro:
    - `-DLUA_EMBEDDED`: include `3rd/minilua.h` directly (with `#define LUA_IMPL`
      in exactly one `.c` file).
@@ -651,6 +651,74 @@ registered Lua threads enable their debug hooks on their next update tick, which
 keeps all hook installation inside the owning OS thread and avoids touching
 another thread's `lua_State` directly.
 
+### 4.8 Logging
+
+Lua logging uses explicit level APIs. Lua does not provide macro-style
+`XLOGI/XLOGE` functions:
+
+```lua
+xthread.log_info("server started: %s:%d", host, port)
+xthread.log_system("config: workers=%d mode=%s", workers, mode)
+xthread.log_warn("slow request", path, cost_ms)
+xthread.log_error("request failed: %s", tostring(err))
+```
+
+Available APIs:
+
+| Method | Purpose |
+|---|---|
+| `xthread.log_init()` | Enable an independent log file for the current Lua thread, using the name registered when the thread was created |
+| `xthread.log_verbose(...)` | verbose log |
+| `xthread.log_debug(...)` | debug log |
+| `xthread.log_info(...)` | info log |
+| `xthread.log_system(...)` | system/lifecycle log for startup configuration, reload, normal shutdown, and other important state |
+| `xthread.log_warn(...)` | warn log |
+| `xthread.log_error(...)` | error log |
+| `xthread.log_fatal(...)` | fatal log |
+| `xthread.set_level(level)` | Set the minimum emitted level; `4` hides verbose/debug |
+| `xthread.get_level()` | Return the current minimum emitted level |
+
+Level numbers start from Android's verbose/debug/info priorities:
+`verbose=2`, `debug=3`, `info=4`, `system=5`, `warn=6`, `error=7`,
+`fatal=8`. `set_level(5)` keeps system and higher logs visible; `set_level(6)`
+hides system and keeps only warn/error/fatal.
+
+Arguments are rendered in two modes:
+
+- If the first argument is a format string and enough arguments are present,
+  `string.format` is used. Extra arguments not consumed by the format string
+  are appended with tabs.
+- Otherwise arguments are joined with tabs, like `print`.
+
+```lua
+xthread.log_info("user=%s score=%d", user, score, "trace", trace_id)
+-- user=alice score=100    trace    trace-1
+
+xthread.log_info("user", user, "score", score)
+-- user    alice    score    100
+```
+
+Every log call writes one line by default. `print(...)` is redirected to
+`xthread.log_info(...)`, and `io.stderr:write(...)` is redirected to error
+logs.
+
+**Recommended initialization policy:**
+
+- Call `xthread.log_init()` in the main thread so it owns its own log
+  file.
+- Business worker threads may call `xthread.log_init()` from
+  their `__init` when independent per-worker logs are useful.
+- Use `xthread.log_system(...)` for startup configuration summaries, reload, and
+  normal shutdown lifecycle messages.
+- Service threads such as Redis / MySQL / NATS / HTTP usually should not call
+  `xthread.log_init`. Their Lua logs are formatted in the service thread and
+  then posted to the main thread, where the main thread writes them to the main
+  log file.
+- Service-thread business errors should preferably be returned to the request
+  caller, and the caller should log them in its own context. Internal errors or
+  errors that cannot be attributed to a request can be posted to the main thread
+  for centralized logging.
+
 ---
 
 ## 5. xnet Module — Asynchronous Networking
@@ -949,6 +1017,7 @@ local ok, err = xhttp.start({
     host         = "0.0.0.0",
     port         = 8080,
     worker_count = 4,             -- number of worker threads
+    worker_name  = "api-worker",  -- worker name prefix; actual names are api-worker-01, api-worker-02...
     app_script   = "my_app.lua",  -- application routing script path
 })
 
@@ -965,6 +1034,7 @@ local ok, err = xhttp.start({
     cert_file    = "certs/server.crt",
     key_file     = "certs/server.key",
     worker_count = 2,
+    worker_name  = "api-worker",
     app_script   = "my_app.lua",
 })
 ```
@@ -981,6 +1051,7 @@ local ok, err = xhttp.start({
 | key_password | string | "" | Private key password (optional) |
 | worker_count | number | 2 | Number of worker threads |
 | worker_base | number | xthread.WORKER_GRP3 | Starting worker thread ID |
+| worker_name | string | (required) | Worker name prefix; `xhttp` appends `-01`, `-02`, etc. |
 | worker_script | string | "scripts/core/server/xhttp_worker.lua" | Worker script path |
 | app_script | string | (required) | Application routing script path (for example "demo/xhttp_app.lua") |
 | max_request_size | number | 16MB | Maximum request body size (bytes) |
@@ -1503,6 +1574,7 @@ local function __init()
         host         = xutils.get_config("HTTP_HOST", "0.0.0.0"),
         port         = tonumber(xutils.get_config("HTTP_PORT", "8080")),
         worker_count = tonumber(xutils.get_config("HTTP_WORKERS", "4")),
+        worker_name  = "api-worker",
         app_script   = "api_app.lua",
     })
 

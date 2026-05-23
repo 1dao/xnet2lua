@@ -676,6 +676,7 @@ int main(int argc, char** argv) {
         printf("Failed to initialize rpmalloc\n");
         return -1;
     }
+    xlog_init("logs", "xthread_test", 1);
 
     printf("========================================\n");
     printf("xthread library test demo\n");
@@ -685,6 +686,7 @@ int main(int argc, char** argv) {
        This automatically registers main thread and initializes wakeup */
     if (!xthread_init()) {
         printf("Failed to initialize xthread library\n");
+        xlog_uninit();
         rpmalloc_finalize();
         return -1;
     }
@@ -740,6 +742,7 @@ int main(int argc, char** argv) {
 cleanup:
     /* Final cleanup */
     xthread_uninit();
+    xlog_uninit();
     rpmalloc_finalize();
 
     return ret;

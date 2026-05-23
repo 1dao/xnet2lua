@@ -63,6 +63,7 @@ local function __init()
         https = true,
         worker_count = WORKERS,
         worker_base = xthread.WORKER_GRP3,
+        worker_name = 'xhttps-worker',
         app_script = 'demo/xhttp_app.lua',
         cert_file = CERT,
         key_file = KEY,

@@ -1,4 +1,4 @@
-LIB_NAME := xsock
+LIB_NAME := xnet
 CC ?= gcc
 AR ?= ar
 ARFLAGS ?= rcs
@@ -44,7 +44,7 @@ OBJ_DIR := obj
 BIN_DIR := bin
 
 TARGET_LIB := lib$(LIB_NAME).a
-CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c
+CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
 
@@ -56,7 +56,7 @@ MV := mv -f
 
 ifeq ($(OS),Windows_NT)
 	EXE_EXT := .exe
-	SYS_LDFLAGS += -lws2_32
+	SYS_LDFLAGS += -lws2_32 -ladvapi32
 	RM := /usr/bin/rm -rf
 	MV := /usr/bin/mv -f
 else
@@ -74,8 +74,8 @@ XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(EXE_EXT)
 
-# rpmalloc is consumed by everything that uses libxsock.a or compiles xthread.c
-# directly. libxsock.a itself does NOT contain rpmalloc symbols, so both the
+# rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
+# directly. libxnet.a itself does NOT contain rpmalloc symbols, so both the
 # xnet target and the xthread_test target add it to their own source lists.
 # Empty when WITH_RPMALLOC=0 — xmacro.h then stubs the lifecycle API.
 ifeq ($(WITH_RPMALLOC),1)
@@ -84,7 +84,7 @@ else
     RPMALLOC_SRC :=
 endif
 
-XTHREAD_TEST_SRCS := demo/xthread_test.c xthread.c xpoll.c xsock.c $(RPMALLOC_SRC)
+XTHREAD_TEST_SRCS := demo/xthread_test.c xthread.c xpoll.c xsock.c xdaemon.c xlog.c $(RPMALLOC_SRC)
 XTHREAD_TEST_BUILD := $(BIN_DIR)/xthread_test_build$(EXE_EXT)
 XTHREAD_TEST_TARGET := $(BIN_DIR)/xthread_test$(EXE_EXT)
 
@@ -139,7 +139,7 @@ ifeq ($(OS),Windows_NT)
 endif
 endif
 
-XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c
+XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(EXE_EXT)
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)

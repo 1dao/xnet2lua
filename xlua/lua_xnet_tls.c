@@ -271,7 +271,7 @@ static void tls_close_internal(LuaTlsConn* c, const char* reason, bool notify) {
             push_tls_self(L, c);
             lua_pushstring(L, reason ? reason : "closed");
             if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-                XLOGE("xnet: tls on_close error: %s", lua_tostring(L, -1));
+                xloge("xnet: tls on_close error: %s", lua_tostring(L, -1));
             }
         }
         lua_settop(L, base);
@@ -320,7 +320,7 @@ static void tls_call_connect(LuaTlsConn* c) {
         else lua_pushnil(L);
 
         if (lua_pcall(L, 3, LUA_MULTRET, 0) != LUA_OK) {
-            XLOGE("xnet: tls on_connect error: %s", lua_tostring(L, -1));
+            xloge("xnet: tls on_connect error: %s", lua_tostring(L, -1));
             lua_settop(L, base);
             tls_close_internal(c, "handler_error", true);
             return;
@@ -364,7 +364,7 @@ static void tls_process_input(LuaTlsConn* c) {
         push_tls_self(L, c);
         lua_pushlstring(L, c->inbuf, c->inlen);
         if (lua_pcall(L, 2, LUA_MULTRET, 0) != LUA_OK) {
-            XLOGE("xnet: tls on_packet error: %s", lua_tostring(L, -1));
+            xloge("xnet: tls on_packet error: %s", lua_tostring(L, -1));
             lua_settop(L, base);
             tls_close_internal(c, "handler_error", true);
             return;
@@ -417,7 +417,7 @@ static void tls_drive_handshake(LuaTlsConn* c) {
 
         char errbuf[160];
         tls_errmsg(rc, errbuf, sizeof(errbuf));
-        XLOGE("xnet: tls handshake failed: %s (%d)", errbuf, rc);
+        xloge("xnet: tls handshake failed: %s (%d)", errbuf, rc);
         tls_close_internal(c, "tls_handshake_error", true);
         return;
     }
@@ -449,7 +449,7 @@ static void tls_flush_output(LuaTlsConn* c) {
 
         char errbuf[160];
         tls_errmsg(rc, errbuf, sizeof(errbuf));
-        XLOGE("xnet: tls write failed: %s (%d)", errbuf, rc);
+        xloge("xnet: tls write failed: %s (%d)", errbuf, rc);
         tls_close_internal(c, "tls_write_error", true);
         return;
     }
@@ -513,7 +513,7 @@ static void tls_read_plain(LuaTlsConn* c) {
 
         char errbuf[160];
         tls_errmsg(rc, errbuf, sizeof(errbuf));
-        XLOGE("xnet: tls read failed: %s (%d)", errbuf, rc);
+        xloge("xnet: tls read failed: %s (%d)", errbuf, rc);
         tls_close_internal(c, "tls_read_error", true);
         return;
     }

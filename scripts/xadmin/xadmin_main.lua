@@ -16,7 +16,7 @@ router.set_log_prefix('XADMIN-MAIN')
 local CONFIG_FILE = 'xnet.cfg'
 local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
 if not ok_cfg then
-    io.stderr:write('[XADMIN-MAIN] config not loaded: ' .. tostring(cfg_err) .. '\n')
+    xthread.log_error('[XADMIN-MAIN] config not loaded: %s', tostring(cfg_err))
 end
 
 local SERVER_NAME = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'xadmin1')
@@ -27,7 +27,7 @@ local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local HEARTBEAT_MS = tonumber(xutils.get_config('XADMIN_HEARTBEAT_MS', '5000')) or 5000
 local TOKEN = xutils.get_config('XADMIN_TOKEN', '')
-local HTTP_WORKER_COUNT = 1
+local HTTP_WORKER_COUNT = 10
 local HTTP_WORKER_BASE = xthread.WORKER_GRP3
 
 local function to_bool(v, default)
@@ -60,13 +60,13 @@ xthread.register('xadmin_remote_exec', function(src)
 end)
 
 local function __init()
-    print(string.format('[XADMIN-MAIN] init server=%s http=%s://%s:%d nats=%s:%d prefix=%s',
+    xthread.log_system('[XADMIN-MAIN] init server=%s http=%s://%s:%d nats=%s:%d prefix=%s',
         SERVER_NAME, HTTPS and 'https' or 'http', HTTP_HOST, HTTP_PORT,
-        NATS_HOST, NATS_PORT, NATS_PREFIX))
+        NATS_HOST, NATS_PORT, NATS_PREFIX)
     if TOKEN ~= '' then
-        print('[XADMIN-MAIN] auth: X-Xadmin-Token required')
+        xthread.log_info('[XADMIN-MAIN] auth: X-Xadmin-Token required')
     else
-        print('[XADMIN-MAIN] auth: open (set XADMIN_TOKEN to require a token)')
+        xthread.log_info('[XADMIN-MAIN] auth: open (set XADMIN_TOKEN to require a token)')
     end
 
     assert(xnet.init())
@@ -97,6 +97,7 @@ local function __init()
         key_password = KEY_PASSWORD,
         worker_count = HTTP_WORKER_COUNT,
         worker_base = HTTP_WORKER_BASE,
+        worker_name = 'xadmin-worker',
         worker_script = 'scripts/xadmin/xadmin_worker.lua',
         app_script = 'scripts/xadmin/xadmin_app.lua',
         max_request_size = 4 * 1024 * 1024,
@@ -115,14 +116,14 @@ local function __init()
     heartbeat()
     xtimer.add(HEARTBEAT_MS, heartbeat, -1)
 
-    print(string.format('[XADMIN-MAIN] open %s://%s:%d/', HTTPS and 'https' or 'http', HTTP_HOST, HTTP_PORT))
+    xthread.log_system('[XADMIN-MAIN] open %s://%s:%d/', HTTPS and 'https' or 'http', HTTP_HOST, HTTP_PORT)
 end
 
 local function __uninit()
     xhttp.stop()
     xnats.stop(true)
     xnet.uninit()
-    print('[XADMIN-MAIN] uninit')
+    xthread.log_system('[XADMIN-MAIN] uninit')
 end
 
 return {

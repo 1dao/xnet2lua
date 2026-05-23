@@ -223,7 +223,7 @@ static void lua_conn_connect_cb(xChannel* ch, void* ud) {
         else lua_pushnil(L);
 
         if (lua_pcall(L, 3, LUA_MULTRET, 0) != LUA_OK) {
-            XLOGE("xnet: on_connect error: %s", lua_tostring(L, -1));
+            xloge("xnet: on_connect error: %s", lua_tostring(L, -1));
             lua_settop(L, base);
             if (c->ch) xchannel_close(c->ch, "handler_error");
             return;
@@ -254,7 +254,7 @@ static size_t lua_conn_packet_cb(xChannel* ch, const char* data, size_t len, voi
     push_conn_self(L, c);
     lua_pushlstring(L, data, len);
     if (lua_pcall(L, 2, LUA_MULTRET, 0) != LUA_OK) {
-        XLOGE("xnet: on_packet error: %s", lua_tostring(L, -1));
+        xloge("xnet: on_packet error: %s", lua_tostring(L, -1));
         lua_settop(L, base);
         if (c->ch) xchannel_close(c->ch, "handler_error");
         return 0;
@@ -282,7 +282,7 @@ static void lua_conn_close_cb(xChannel* ch, const char* reason, void* ud) {
         push_conn_self(L, c);
         lua_pushstring(L, reason ? reason : "closed");
         if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-            XLOGE("xnet: on_close error: %s", lua_tostring(L, -1));
+            xloge("xnet: on_close error: %s", lua_tostring(L, -1));
         }
     }
 
@@ -354,7 +354,7 @@ static void listener_close_internal(LuaNetListener* s, const char* reason) {
         push_listener_self(L, s);
         lua_pushstring(L, reason ? reason : "closed");
         if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
-            XLOGE("xnet: listener on_close error: %s", lua_tostring(L, -1));
+            xloge("xnet: listener on_close error: %s", lua_tostring(L, -1));
         }
     }
     ref_unref(L, &s->handler_ref);
@@ -445,7 +445,7 @@ static void listener_accept_fd_cb(SOCKET_T fd, int mask,
             else lua_pushnil(L);
 
             if (lua_pcall(L, 4, 1, 0) != LUA_OK) {
-                XLOGE("xnet: on_accept error: %s", lua_tostring(L, -1));
+                xloge("xnet: on_accept error: %s", lua_tostring(L, -1));
                 lua_settop(L, base);
             } else {
                 transfer = !lua_isboolean(L, -1) || lua_toboolean(L, -1);

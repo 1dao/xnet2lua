@@ -55,6 +55,7 @@ local function normalize_config(cfg)
         port = tonumber(cfg.port) or 18080,
         https = to_bool(cfg.https, false),
         server_name = cfg.server_name or cfg.name or 'xnet-http',
+        worker_name = cfg.worker_name,
         worker_script = cfg.worker_script or DEFAULT_WORKER_SCRIPT,
         app_script = cfg.app_script,
         cert_file = cfg.cert_file or cfg.cert or '',
@@ -96,6 +97,9 @@ function M.start(cfg)
     if type(conf.app_script) ~= 'string' or conf.app_script:match('^%s*$') then
         return false, 'xhttp.start requires non-empty app_script'
     end
+    if type(conf.worker_name) ~= 'string' or conf.worker_name:match('^%s*$') then
+        return false, 'xhttp.start requires non-empty worker_name'
+    end
     if conf.https and XNET_WITH_HTTPS == false then
         return false, 'HTTPS support is not compiled in; rebuild with WITH_HTTPS=1'
     end
@@ -109,7 +113,8 @@ function M.start(cfg)
     state.rr_index = 0
 
     for i, id in ipairs(conf.workers) do
-        local ok, err = xthread.create_thread(id, 'xhttp-worker-' .. tostring(i), conf.worker_script)
+        local worker_name = string.format('%s-%02d', conf.worker_name, i)
+        local ok, err = xthread.create_thread(id, worker_name, conf.worker_script)
         if not ok then
             shutdown_workers()
             return false, err

@@ -114,6 +114,8 @@ bool xthread_register_ex(int id, const char* name,
                          void* userdata);
 
 /* Register a thread group (base_id … base_id+count-1). */
+/* name_pattern may contain one printf-style integer placeholder, e.g.
+** "worker-%02d". Without a placeholder, names become "name:00", "name:01"... */
 bool xthread_register_group(int base_id, int count,
                             ThreadSelStrategy strategy,
                             const char* name_pattern,

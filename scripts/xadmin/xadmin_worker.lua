@@ -22,7 +22,7 @@ router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
     _ = co_id
     _ = sk
     _ = ...
-    io.stderr:write('[XADMIN-WORKER] unexpected RPC message: ' .. tostring(pt) .. '\n')
+    xthread.log_error('[XADMIN-WORKER] unexpected RPC message: %s', tostring(pt))
 end)
 
 local app = nil
@@ -133,7 +133,7 @@ local function load_app(path)
     if type(app.setup) == 'function' then
         local ok, err = pcall(app.setup, build_app_context())
         if not ok then
-            io.stderr:write('[XADMIN-WORKER] app.setup failed: ' .. tostring(err) .. '\n')
+            xthread.log_error('[XADMIN-WORKER] app.setup failed: %s', tostring(err))
         end
     end
     state.app = app
@@ -143,7 +143,7 @@ end
 if app_script then
     local ok, err = pcall(load_app, app_script)
     if not ok then
-        io.stderr:write('[XADMIN-WORKER] reload app failed: ' .. tostring(err) .. '\n')
+        xthread.log_error('[XADMIN-WORKER] reload app failed: %s', tostring(err))
     end
 end
 
@@ -160,7 +160,7 @@ local app_router = {
         end
         local ok, resp = pcall(app.handle, req)
         if not ok then
-            io.stderr:write('[XADMIN-WORKER] app error: ' .. tostring(resp) .. '\n')
+            xthread.log_error('[XADMIN-WORKER] app error: %s', tostring(resp))
             return { status = 500, body = 'internal server error\n' }
         end
         if type(resp) ~= 'table' then
@@ -226,8 +226,8 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
     state.use_https = use_https
     state.tls_config = tls_config
     load_app(script_path)
-    print(string.format('[XADMIN-WORKER] start scheme=%s app=%s',
-        use_https and 'https' or 'http', tostring(script_path)))
+    xthread.log_system('[XADMIN-WORKER] start scheme=%s app=%s',
+        use_https and 'https' or 'http', tostring(script_path))
 end)
 
 xthread.register('xhttp_accept', function(fd, ip, port)
@@ -238,7 +238,7 @@ xthread.register('xhttp_accept', function(fd, ip, port)
         conn, err = xnet.attach(fd, handler, ip, port)
     end
     if not conn then
-        io.stderr:write('[XADMIN-WORKER] attach failed: ' .. tostring(err) .. '\n')
+        xthread.log_error('[XADMIN-WORKER] attach failed: %s', tostring(err))
     end
 end)
 
@@ -247,14 +247,15 @@ xthread.register('xhttp_worker_stop', function()
 end)
 
 local function __init()
-    print('[XADMIN-WORKER] init')
+    xthread.log_init()
+    xthread.log_system('[XADMIN-WORKER] init')
     assert(xnet.init())
 end
 
 local function __uninit()
     handler.close_all('worker_uninit')
     xnet.uninit()
-    print('[XADMIN-WORKER] uninit')
+    xthread.log_system('[XADMIN-WORKER] uninit')
 end
 
 return {

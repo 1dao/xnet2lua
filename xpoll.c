@@ -35,6 +35,7 @@
 #endif
 
 #include "xpoll.h"
+#include "xlog.h"
 #include "xhash.h"      /* transitively pulls xmacro.h */
 #include "xmacro.h"     /* explicit, in case xhash.h is replaced */
 
@@ -817,7 +818,7 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;
-        perror("[xpoll] epoll_wait");
+        xloge("[xpoll] epoll_wait: %s", strerror(errno));
         return -1;
     }
 
@@ -855,9 +856,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] epoll close/error fd=%d events=0x%x\n",
-                (int)sfd, e->events);
+            xlogw("[xpoll] epoll close/error fd=%d events=0x%x",
+                  (int)sfd, e->events);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }
@@ -880,7 +880,7 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;
-        perror("[xpoll] kevent");
+        xloge("[xpoll] kevent: %s", strerror(errno));
         return -1;
     }
 
@@ -912,9 +912,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] kqueue close/error fd=%d flags=0x%x\n",
-                (int)sfd, ke->flags);
+            xlogw("[xpoll] kqueue close/error fd=%d flags=0x%x",
+                  (int)sfd, ke->flags);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }
@@ -935,8 +934,7 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
     if (num_ready < 0) {
         if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
             return 0;
-        fprintf(stderr,
-            "[xpoll] poll error nfds=%d: %s\n", nfds, strerror(errno));
+        xloge("[xpoll] poll error nfds=%d: %s", nfds, strerror(errno));
         return -1;
     }
     if (num_ready == 0) return 0;
@@ -976,9 +974,8 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
-            fprintf(stderr,
-                "[xpoll] poll close/error fd=%d revents=0x%x\n",
-                (int)fd, (unsigned)revents);
+            xlogw("[xpoll] poll close/error fd=%d revents=0x%x",
+                  (int)fd, (unsigned)revents);
             fe->efileProc(fd, mask & (XPOLL_ERROR | XPOLL_CLOSE),
                           fe->clientData, NULL);
         }

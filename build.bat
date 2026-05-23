@@ -15,6 +15,7 @@ set "WITH_HTTP=1"
 set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
 set "WITH_XDEBUG=0"
+set "WITH_RPMALLOC=1"
 set "LUA_BACKEND=minilua"
 set "TARGET=all"
 set "RUN_SCRIPT="
@@ -28,6 +29,7 @@ for %%A in (%*) do (
     if /I "!ARG!"=="nohttps" set "WITH_HTTPS=0"
     if /I "!ARG!"=="xdebug" set "WITH_XDEBUG=1"
     if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
+    if /I "!ARG!"=="norpmalloc" set "WITH_RPMALLOC=0"
     if /I "!ARG!"=="iouring" set "WITH_IO_URING=1"
     if /I "!ARG!"=="luajit" set "LUA_BACKEND=luajit"
     if /I "!ARG!"=="minilua" set "LUA_BACKEND=minilua"
@@ -59,7 +61,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% rpmalloc=%WITH_RPMALLOC%
 
 set "VS_VCVARS="
 if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
@@ -114,7 +116,8 @@ set "BIN_DIR=bin"
 set "XNET_EXE=%BIN_DIR%\xnet.exe"
 set "THREAD_EXE=%BIN_DIR%\xthread_test.exe"
 
-set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c"
+set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c"
+if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
 set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c 3rd\yyjson.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
@@ -125,6 +128,11 @@ set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimer
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG%"
+if "%WITH_RPMALLOC%"=="1" (
+    set "DEFS=%DEFS% /DENABLE_OVERRIDE=0 /DXMACRO_USE_RPMALLOC=1"
+) else (
+    set "DEFS=%DEFS% /DXMACRO_USE_RPMALLOC=0"
+)
 set "INCS=/I."
 if "%WITH_HTTPS%"=="1" (
     set "INCS=%INCS% /I3rd\mbedtls3\include"
@@ -290,6 +298,7 @@ if "%NEED_BUILD_XNET%"=="1" (
     )
 
     set "XNET_LIBS=ws2_32.lib"
+    if "%WITH_RPMALLOC%"=="1" set "XNET_LIBS=!XNET_LIBS! Advapi32.lib"
     if "%WITH_HTTPS%"=="1" set "XNET_LIBS=!XNET_LIBS! bcrypt.lib"
     if defined XNET_LUA_LIB set "XNET_LIBS=!XNET_LIBS! !XNET_LUA_LIB!"
 
@@ -304,11 +313,19 @@ if "%NEED_BUILD_XNET%"=="1" (
 if "%NEED_BUILD_THREAD%"=="1" (
     if "%NEED_BUILD_XNET%"=="0" (
         echo %GREEN%[INFO]%RESET% Compiling thread test dependencies...
-        for %%F in (xthread.c xpoll.c xsock.c) do (
+        for %%F in (xthread.c xpoll.c xsock.c xdaemon.c xlog.c) do (
             echo %GREEN%[INFO]%RESET% cl %%F
             cl %CFLAGS% /c "%%~F" /Fo"%OBJDIR%\%%~nF.obj"
             if errorlevel 1 (
                 echo %RED%[ERROR]%RESET% Failed to compile %%F
+                exit /b 1
+            )
+        )
+        if "%WITH_RPMALLOC%"=="1" (
+            echo %GREEN%[INFO]%RESET% cl 3rd\rpmalloc\rpmalloc.c
+            cl %CFLAGS% /c "3rd\rpmalloc\rpmalloc.c" /Fo"%OBJDIR%\rpmalloc.obj"
+            if errorlevel 1 (
+                echo %RED%[ERROR]%RESET% Failed to compile 3rd\rpmalloc\rpmalloc.c
                 exit /b 1
             )
         )
@@ -325,7 +342,11 @@ if "%NEED_BUILD_THREAD%"=="1" (
     )
 
     echo %GREEN%[INFO]%RESET% Linking %THREAD_EXE%...
-    link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj ws2_32.lib
+    set "THREAD_RPMALLOC_OBJ="
+    if "%WITH_RPMALLOC%"=="1" set "THREAD_RPMALLOC_OBJ=%OBJDIR%\rpmalloc.obj"
+    set "THREAD_LIBS=ws2_32.lib"
+    if "%WITH_RPMALLOC%"=="1" set "THREAD_LIBS=!THREAD_LIBS! Advapi32.lib"
+    link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj %OBJDIR%\xdaemon.obj %OBJDIR%\xlog.obj !THREAD_RPMALLOC_OBJ! !THREAD_LIBS!
     if errorlevel 1 (
         echo %RED%[ERROR]%RESET% Link failed for %THREAD_EXE%
         exit /b 1

@@ -295,6 +295,7 @@ local function __init()
         port = PORT,
         worker_count = WORKERS,
         worker_base = xthread.WORKER_GRP3,
+        worker_name = 'xhttp-worker',
         app_script = 'demo/xhttp_app.lua',
         max_request_size = 1024 * 1024,
         server_name = 'xnet-http-demo',

@@ -120,7 +120,7 @@ struct xThread {
     atomic_int   notify_pending;    /* 0 = idle, 1 = wakeup already in flight  */
 #endif
     int          id;
-    char         name[16];  /* fixed-size name buffer, no allocation needed */
+    char         name[32];  /* fixed-size name buffer, no allocation needed */
     atomic_bool  running;
     xQueue       queue;
     void*        userdata;
@@ -145,7 +145,7 @@ struct xThread {
 struct xThreadPool {
     int         group_id;
     int         strategy;
-    const char* name;
+    char        name[32];
     xThread*    threads[XTHR_GROUP_MAX];
     atomic_int  thread_count;
     atomic_int  queue_sizes[XTHR_GROUP_MAX];
@@ -717,14 +717,14 @@ static void xthread_notify(xThread* target, bool need_notify) {
         if (send((SOCKET)target->notify_wfd, &c, 1, 0) < 0) {
             int err = WSAGetLastError();
             if (atomic_load(&target->running)) {
-                XLOGE("Thread[%d:%s] notify send failed: %d",
+                xloge("Thread[%d:%s] notify send failed: %d",
                       target->id, target->name, err);
             }
         }
 #else
         if (write((int)target->notify_wfd, &c, 1) < 0 && errno != EAGAIN) {
             if (atomic_load(&target->running)) {
-                XLOGE("Thread[%d:%s] notify write failed: %s",
+                xloge("Thread[%d:%s] notify write failed: %s",
                       target->id, target->name, strerror(errno));
             }
         }
@@ -777,15 +777,13 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
 #ifdef _WIN32
         SOCKET fds[2] = { INVALID_SOCKET, INVALID_SOCKET };
         if (win_socketpair(fds) != 0) {
-            XLOGE("Thread[%d:%s] win_socketpair failed: %d",
-                  ctx->id, ctx->name, WSAGetLastError());
+            xloge("win_socketpair failed: %d", WSAGetLastError());
             return -1;
         }
 #else
         int fds[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
-            XLOGE("Thread[%d:%s] socketpair failed: %s",
-                  ctx->id, ctx->name, strerror(errno));
+            xloge("socketpair failed: %s", strerror(errno));
             return -1;
         }
         fcntl(fds[0], F_SETFL, O_NONBLOCK);
@@ -794,7 +792,7 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
         /* Register the read-end in the poll instance */
         if (xpoll_add_event((SOCKET_T)fds[1], XPOLL_READABLE,
                             notify_read_cb, NULL, NULL, ctx) != 0) {
-            XLOGE("Thread[%d:%s] xpoll_add_event failed", ctx->id, ctx->name);
+            xloge("xpoll_add_event failed");
 #ifdef _WIN32
             closesocket(fds[0]); closesocket(fds[1]);
 #else
@@ -807,15 +805,14 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
         ctx->notify_wfd = (SOCKET_T)fds[0]; /* push writes here   */
         ctx->notify_rfd = (SOCKET_T)fds[1]; /* poll monitors this */
 
-        XLOGI("Thread[%d:%s] wakeup=fd  wfd=%d rfd=%d",
-              ctx->id, ctx->name, (int)fds[0], (int)fds[1]);
+        xlogi("wakeup=fd wfd=%d rfd=%d", (int)fds[0], (int)fds[1]);
     } else {
         /* ── cond / Event wakeup (primitives already in xQueue) ─ */
         ctx->poll       = NULL;
         ctx->notify_wfd = INVALID_SOCKET;
         ctx->notify_rfd = INVALID_SOCKET;
 
-        XLOGI("Thread[%d:%s] wakeup=cond", ctx->id, ctx->name);
+        xlogi("wakeup=cond");
     }
 
     /* Dispatch any tasks that were posted before the wakeup fd was ready */
@@ -826,7 +823,7 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
 int xthread_wakeup_init() {
     xThread* ctx = xthread_current();
     if (!ctx) {
-        XLOGE("xthread_wakeup_init: current thread is not registered");
+        xloge("xthread_wakeup_init: current thread is not registered");
         return -1;
     }
     return xthread_wakeup_init_ctx(ctx);
@@ -849,7 +846,7 @@ static void xthread_wakeup_uninit_ctx(xThread* ctx) {
     ctx->notify_rfd = INVALID_SOCKET;
     ctx->notify_wfd = INVALID_SOCKET;
 
-    XLOGI("Thread[%d:%s] wakeup uninit", ctx->id, ctx->name);
+    xlogi("wakeup uninit");
 }
 
 void xthread_wakeup_uninit(void) {
@@ -894,6 +891,7 @@ static bool xthread_register_main(int id, const char* name) {
 
     _threads[id] = ctx;
     tls_set(id);
+    xlog_set_thread(id, ctx->name);
     xnet_mutex_unlock(&_lock);
     return true;
 }
@@ -928,12 +926,13 @@ static void* worker_func(void* arg) {
 #endif
     xThread* ctx = (xThread*)arg;
     tls_set(ctx->id);
+    xlog_set_thread(ctx->id, ctx->name);
 
     /* Register this worker with rpmalloc BEFORE any allocation happens.
     ** xthread_internal_init may call into user on_init which allocates. */
     rpmalloc_thread_initialize();
 
-    XLOGI("Thread[%d:%s] started", ctx->id, ctx->name);
+    xlogi("started");
 
     xthread_internal_init(ctx);
     /* on_init is expected to call xthread_wakeup_init(), which sets ctx->poll */
@@ -952,7 +951,8 @@ static void* worker_func(void* arg) {
 
     process_tasks(ctx); /* flush tasks posted after stop was requested */
     xthread_internal_uninit(ctx);
-    XLOGI("Thread[%d:%s] stopped", ctx->id, ctx->name);
+    xlogi("stopped");
+    xlog_clear_thread();
 
     /* Flush this thread's cache back to the global pool. Any cross-thread
     ** frees still in flight will be reclaimed by their owner thread. */
@@ -987,7 +987,7 @@ bool xthread_init(void) {
         /* TLS is empty → calling thread is not yet registered.
            Treat it as the main thread and register it now. */
         if (!xthread_register_main(XTHR_MAIN, "main")) {
-            XLOGE("xthread_wakeup_init: register_main(%d, '%s') failed", XTHR_MAIN, "main");
+            xloge("xthread_wakeup_init: register_main(%d, '%s') failed", XTHR_MAIN, "main");
             return false;
         }
         xthread_wakeup_init();
@@ -1120,6 +1120,9 @@ void xthread_unregister(int id) {
     ** remaining nodes so we don't leak. */
     xmpscq_drain_destroy(ctx);
 #endif
+    if (!is_worker && id == tls_get()) {
+        xlog_clear_thread();
+    }
     free(ctx);
 }
 
@@ -1163,14 +1166,14 @@ int xthread_post_deadline(int target_id, XThreadFunc func,
                           uint64_t deadline_ms) {
     xThread* target = xthread_get(target_id);
     if (!target || !atomic_load(&target->running)) {
-        XLOGE("xthread_post: no thread available for id=%d", target_id);
+        xloge("xthread_post: no thread available for id=%d", target_id);
         return -1;
     }
 
     xThreadPool* group    = target->group;
     xThread*     selected = group ? xthread_pool_select_thread(group) : target;
     if (!selected) {
-        XLOGE("xthread_post: no thread available for id=%d", target_id);
+        xloge("xthread_post: no thread available for id=%d", target_id);
         return -1;
     }
 
@@ -1248,7 +1251,7 @@ int xthread_post_reply(int target_id, XThreadFunc func,
                        const void* arg, size_t arg_len) {
     xThread* target = xthread_get(target_id);
     if (!target || !atomic_load(&target->running)) {
-        XLOGE("xthread_post_reply: no thread available for id=%d", target_id);
+        xloge("xthread_post_reply: no thread available for id=%d", target_id);
         return -1;
     }
 
@@ -1283,17 +1286,112 @@ void        xthread_set_userdata(xThread* thr, void* data) { if (thr) thr->userd
 ** Thread pool
 ** ========================================================================== */
 
+static int xthread_is_digit_char(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static const char* xthread_parse_int_format(const char* p) {
+    if (!p || *p != '%') return NULL;
+    p++;
+    if (*p == '%') return p + 1;
+
+    while (*p == '-' || *p == '+' || *p == ' ' || *p == '#' || *p == '0') p++;
+    if (*p == '*') return NULL;
+    while (xthread_is_digit_char(*p)) p++;
+
+    if (*p == '.') {
+        p++;
+        if (*p == '*') return NULL;
+        while (xthread_is_digit_char(*p)) p++;
+    }
+
+    if ((p[0] == 'h' && p[1] == 'h') || (p[0] == 'l' && p[1] == 'l')) {
+        p += 2;
+    } else if (*p == 'h' || *p == 'l' || *p == 'j' || *p == 'z' || *p == 't') {
+        p++;
+    }
+
+    return (*p == 'd' || *p == 'i' || *p == 'u' ||
+            *p == 'o' || *p == 'x' || *p == 'X') ? p + 1 : NULL;
+}
+
+static int xthread_count_int_formats(const char* pattern,
+                                     const char** first,
+                                     const char** first_end) {
+    int count = 0;
+    if (first) *first = NULL;
+    if (first_end) *first_end = NULL;
+    if (!pattern) return 0;
+
+    for (const char* p = pattern; *p; ) {
+        if (*p != '%') {
+            p++;
+            continue;
+        }
+        if (p[1] == '%') {
+            p += 2;
+            continue;
+        }
+
+        const char* end = xthread_parse_int_format(p);
+        if (!end) return -1;
+        if (count == 0) {
+            if (first) *first = p;
+            if (first_end) *first_end = end;
+        }
+        count++;
+        p = end;
+    }
+    return count;
+}
+
+static void xthread_format_group_thread_name(char* dst, size_t cap,
+                                             const char* pattern, int index) {
+    if (!dst || cap == 0) return;
+    if (!pattern || !pattern[0]) pattern = "thread";
+
+    if (xthread_count_int_formats(pattern, NULL, NULL) == 1) {
+        snprintf(dst, cap, pattern, index);
+    } else {
+        snprintf(dst, cap, "%s:%02d", pattern, index);
+    }
+}
+
+static void xthread_format_group_name(char* dst, size_t cap, const char* pattern) {
+    if (!dst || cap == 0) return;
+    if (!pattern || !pattern[0]) pattern = "thread";
+
+    const char* first = NULL;
+    const char* first_end = NULL;
+    if (xthread_count_int_formats(pattern, &first, &first_end) == 1 && first) {
+        size_t n = (size_t)(first - pattern);
+        while (n > 0 && (pattern[n - 1] == '-' || pattern[n - 1] == '_' ||
+                         pattern[n - 1] == ':' || pattern[n - 1] == '.')) {
+            n--;
+        }
+        if (n > 0) {
+            if (n >= cap) n = cap - 1;
+            memcpy(dst, pattern, n);
+            dst[n] = '\0';
+            return;
+        }
+        (void)first_end;
+    }
+
+    snprintf(dst, cap, "%s", pattern);
+}
+
 xThreadPool* xthread_pool_create(int group_id, int strategy, const char* name) {
     xThreadPool* pool = (xThreadPool*)calloc(1, sizeof(xThreadPool));
     if (!pool) return NULL;
+    xthread_format_group_name(pool->name, sizeof(pool->name), name);
     if (strategy == XTHSTRATEGY_LEAST_QUEUE) {
-        XLOGW("ThreadPool[%s]: LEAST_QUEUE is temporarily disabled, fallback to ROUND_ROBIN",
-              name ? name : "unnamed");
+        xlogw("ThreadPool[%s]: LEAST_QUEUE is temporarily disabled, fallback to ROUND_ROBIN",
+              pool->name);
         strategy = XTHSTRATEGY_ROUND_ROBIN;
     }
     pool->group_id = group_id;
     pool->strategy = strategy;
-    pool->name     = name;
     atomic_store(&pool->thread_count, 0);
     atomic_store(&pool->next_index,   0);
     for (int i = 0; i < XTHR_GROUP_MAX; i++)
@@ -1308,14 +1406,14 @@ void xthread_pool_destroy(xThreadPool* pool) {
 bool xthread_pool_add_thread(xThreadPool* pool, xThread* thread) {
     int count = atomic_load(&pool->thread_count);
     if (count >= XTHR_GROUP_MAX) {
-        XLOGE("ThreadPool[%s] reached max threads (%d)", pool->name, XTHR_GROUP_MAX);
+        xloge("ThreadPool[%s] reached max threads (%d)", pool->name, XTHR_GROUP_MAX);
         return false;
     }
     thread->group       = pool;
     pool->threads[count] = thread;
     atomic_store(&pool->queue_sizes[count], 0);
     atomic_store(&pool->thread_count, count + 1);
-    XLOGI("Thread[%d:%s] added to pool[%d:%s]",
+    xlogi("Thread[%d:%s] added to pool[%d:%s]",
           thread->id, thread->name[0] ? thread->name : "unnamed",
           pool->group_id, pool->name);
     return true;
@@ -1374,10 +1472,10 @@ bool xthread_register_group(int base_id, int count,
     for (int i = 0; i < count; i++) {
         int  thread_id = base_id + i;
         char name[32];
-        snprintf(name, sizeof(name), "%s:%02d", name_pattern, i);
+        xthread_format_group_thread_name(name, sizeof(name), name_pattern, i);
 
         if (!xthread_register(thread_id, name, on_init, on_update, on_cleanup)) {
-            XLOGE("xthread_register_group: failed to register thread %d", thread_id);
+            xloge("xthread_register_group: failed to register thread %d", thread_id);
             all_ok = false;
             continue;
         }

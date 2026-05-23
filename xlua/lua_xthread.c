@@ -34,6 +34,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <stddef.h>
 #include "xpoll.h"
 
 /* Use embedded minilua when building with xlua_test */
@@ -54,6 +55,16 @@
 #include "lua_xdebug.h"
 
 #include "../xmacro.h"   /* explicit, in case header chain changes */
+
+#if defined(_MSC_VER)
+#define XLUA_TLS __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define XLUA_TLS _Thread_local
+#else
+#define XLUA_TLS __thread
+#endif
+
+static XLUA_TLS int _log_local = 0;
 
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
 static void luaL_requiref(lua_State* L, const char* modname,
@@ -158,17 +169,17 @@ static lua_Integer pack_to_lua_stack(lua_State* L, int nargs) {
     /* Call cmsgpack.pack(...) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_PACK_KEY);
     if (!lua_isfunction(L, -1)) {
-        XLOGE("xthread: pack function not found (did you call xthread.init?)");
+        xloge("xthread: pack function not found (did you call xthread.init?)");
         return -1;
     }
     lua_insert(L, lua_gettop(L) - nargs); /* move function before args */
     if (lua_pcall(L, nargs, 1, 0) != LUA_OK) {
-        XLOGE("xthread: pack failed: %s", lua_tostring(L, -1));
+        xloge("xthread: pack failed: %s", lua_tostring(L, -1));
         return -1;
     }
     /* Result is a string on top */
     if (!lua_isstring(L, -1)) {
-        XLOGE("xthread: pack did not return a string");
+        xloge("xthread: pack did not return a string");
         lua_pop(L, 1);
         return -1;
     }
@@ -186,13 +197,13 @@ static int unpack_raw(lua_State* L, const char* data, size_t len) {
     /* Call cmsgpack.unpack(buf) */
     lua_getfield(L, LUA_REGISTRYINDEX, XTHREAD_UNPACK_KEY);
     if (!lua_isfunction(L, -1)) {
-        XLOGE("xthread: unpack function not found (did you call xthread.init?)");
+        xloge("xthread: unpack function not found (did you call xthread.init?)");
         lua_settop(L, base);
         return -1;
     }
     lua_pushlstring(L, data, len);
     if (lua_pcall(L, 1, LUA_MULTRET, 0) != LUA_OK) {
-        XLOGE("xthread: unpack failed: %s", lua_tostring(L, -1));
+        xloge("xthread: unpack failed: %s", lua_tostring(L, -1));
         lua_settop(L, base);
         return -1;
     }
@@ -296,7 +307,7 @@ static int l_reply_func(lua_State* L) {
 
     lua_Integer pkt_len = pack_to_lua_stack(L, nargs + 2); /* +2 for nil + "@async_resume" */
     if (pkt_len < 0) {
-        XLOGE("xthread.reply: failed to pack message");
+        xloge("xthread.reply: failed to pack message");
         lua_settop(L, 0);
         lua_pushboolean(L, 0);
         return 1;
@@ -310,7 +321,7 @@ static int l_reply_func(lua_State* L) {
                                      pkt_data, (size_t)pkt_len);
         lua_pop(L, 1);  /* pop packed string */
         if (err != 0) {
-            XLOGE("xthread.reply: failed to post to thread %d (err=%d)", target_id, err);
+            xloge("xthread.reply: failed to post to thread %d (err=%d)", target_id, err);
         }
         lua_pushboolean(L, err == 0);
     }
@@ -402,7 +413,7 @@ static int lua_thread_reload_current(lua_State* L) {
     }
 
     int base = lua_gettop(L);
-    XLOGI("xnet.__reload: loading thread script '%s' for thread %d",
+    xlogi("xnet.__reload: loading thread script '%s' for thread %d",
           td->script_path, xthread_get_id(thr));
 
     if (luaL_dofile(L, td->script_path) != LUA_OK) {
@@ -454,29 +465,29 @@ static void call_xnet_reload_noresult(lua_State* L, int thread_id) {
     int base = lua_gettop(L);
     lua_getglobal(L, "xnet");
     if (!lua_istable(L, -1)) {
-        XLOGE("xthread: xnet table missing while reloading thread %d", thread_id);
+        xloge("xthread: xnet table missing while reloading thread %d", thread_id);
         lua_settop(L, base);
         return;
     }
     lua_getfield(L, -1, "__reload");
     if (!lua_isfunction(L, -1)) {
-        XLOGE("xthread: xnet.__reload missing on thread %d", thread_id);
+        xloge("xthread: xnet.__reload missing on thread %d", thread_id);
         lua_settop(L, base);
         return;
     }
 
     if (lua_pcall(L, 0, 2, 0) != LUA_OK) {
-        XLOGE("xthread: xnet.__reload failed on thread %d: %s",
+        xloge("xthread: xnet.__reload failed on thread %d: %s",
               thread_id, lua_tostring(L, -1));
         lua_settop(L, base);
         return;
     }
 
     if (!lua_toboolean(L, -2)) {
-        XLOGE("xthread: xnet.__reload reported failure on thread %d: %s",
+        xloge("xthread: xnet.__reload reported failure on thread %d: %s",
               thread_id, lua_tostring(L, -1));
     } else {
-        XLOGI("xthread: %s", lua_tostring(L, -1));
+        xlogi("xthread: %s", lua_tostring(L, -1));
     }
     lua_settop(L, base);
 }
@@ -485,7 +496,7 @@ static int thread_data_gc(lua_State* L) {
     ThreadData* td = (ThreadData*)luaL_checkudata(L, 1, THREAD_DATA_META);
     if (!td) return 0;
 
-    XLOGD("thread_data_gc: reclaiming ThreadData for thread");
+    xlogd("thread_data_gc: reclaiming ThreadData for thread");
 
     /* Free script path copy */
     if (td->script_path) {
@@ -518,7 +529,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
     ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
 
     if (!td || !td->L) {
-        XLOGE("xthread: no lua state for thread %d", xthread_get_id(thr));
+        xloge("xthread: no lua state for thread %d", xthread_get_id(thr));
         return;
     }
 
@@ -548,7 +559,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
         }
 
         if (k1 && strcmp(k1, "@async_resume") == 0) {
-            XLOGI("C INTERCEPT: @async_resume on thread %d will resume coroutine", xthread_current_id());
+            xlogi("C INTERCEPT: @async_resume on thread %d will resume coroutine", xthread_current_id());
             /* Got it - intercept this in C, do NOT pass to Lua handler */
             /* Layout: nil (reply_router), "@async_resume", co_id, sk, req_pt, ok, r, ...
             **   base+1 = nil               (reply_router = nil for REPLY)
@@ -561,17 +572,17 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
             ** nresume = (ok + results) = nvals - 5
             */
             if (nvals < 6) {
-                XLOGE("xthread: malformed @async_resume (nvals=%d)", nvals);
+                xloge("xthread: malformed @async_resume (nvals=%d)", nvals);
                 lua_settop(L, base);
                 return;
             }
             lua_Integer co_id = lua_tointeger(L, base + 3);
             int nresume = nvals - 5; /* ok + results */
 
-            XLOGD("xthread: @async_resume looking up co_id=%lld in thread %d pending table", (long long)co_id, xthread_current_id());
+            xlogd("xthread: @async_resume looking up co_id=%lld in thread %d pending table", (long long)co_id, xthread_current_id());
             lua_State* co = pending_pop(L, co_id, true);
             if (!co) {
-                XLOGD("xthread: @async_resume co_id=%lld not found (late reply or timeout)", (long long)co_id);
+                xlogd("xthread: @async_resume co_id=%lld not found (late reply or timeout)", (long long)co_id);
                 lua_settop(L, base);
                 return;
             }
@@ -586,7 +597,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
             int nresults = 0;
             int status = xthread_resume_coroutine(co, L, nresume, &nresults);
             if (status != LUA_OK && status != LUA_YIELD) {
-                XLOGE("xthread: coroutine error: %s", lua_tostring(co, -1));
+                xloge("xthread: coroutine error: %s", lua_tostring(co, -1));
                 lua_settop(co, 0);
             }
             lua_settop(L, base);           /* restore original stack height */
@@ -602,7 +613,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
         int errfunc = base + 1;
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
         if (!lua_isfunction(L, -1)) {
-            XLOGE("xthread: no handler on thread %d (did you call xthread.init?)", id);
+            xloge("xthread: no handler on thread %d (did you call xthread.init?)", id);
             lua_settop(L, base);
             return;
         }
@@ -610,13 +621,13 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
         lua_insert(L, base + 2);
         /* Call: handler(reply_router, k1, k2, k3, ...) */
         if (lua_pcall(L, nvals, 0, errfunc) != LUA_OK) {
-            XLOGE("xthread: handler error on thread %d: %s", id, lua_tostring(L, -1));
+            xloge("xthread: handler error on thread %d: %s", id, lua_tostring(L, -1));
             lua_settop(L, base);
             return;
         }
         lua_settop(L, base);
     } else {
-        XLOGE("xthread: no handler on thread %d (did you call xthread.init(handler)?)", id);
+        xloge("xthread: no handler on thread %d (did you call xthread.init(handler)?)", id);
         lua_settop(L, base);
     }
 }
@@ -712,7 +723,7 @@ static int l_xthread_init(lua_State* L) {
         td->sync_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
         lua_pop(L, 1);
-        XLOGW("xthread.init: no handler set for thread %d – "
+        xlogw("xthread.init: no handler set for thread %d – "
               "call xthread.init(handler) or ensure __thread_handle exists", xthread_get_id(thr));
     }
 
@@ -737,7 +748,7 @@ static int l_xthread_init(lua_State* L) {
     lua_setmetatable(L, -2); /* setmetatable(_thread_replys, mt) */
     lua_pop(L, 1); /* pop _thread_replys */
 
-    XLOGI("xthread.init: thread %d initialised", xthread_get_id(thr));
+    xlogi("xthread.init: thread %d initialised", xthread_get_id(thr));
     return 0;
 }
 
@@ -953,6 +964,134 @@ static int l_current_id(lua_State* L) {
     return 1;
 }
 
+typedef struct {
+    size_t len;
+    char msg[1];
+} XThreadLogPayload;
+
+static void xthread_log_post_task(xThread* thr, void* arg, int arg_len) {
+    (void)thr;
+    if (!arg || arg_len < (int)offsetof(XThreadLogPayload, msg)) return;
+    XThreadLogPayload* payload = (XThreadLogPayload*)arg;
+    size_t cap = (size_t)arg_len - offsetof(XThreadLogPayload, msg);
+    size_t len = payload->len <= cap ? payload->len : cap;
+    xlog_write_raw(payload->msg, len);
+}
+
+static size_t xthread_log_record_cap(size_t header) {
+    size_t cap = (size_t)XLOG_RECORD_MAX_BYTES;
+    size_t post_cap = header < (size_t)INT_MAX ? (size_t)INT_MAX - header : 0u;
+
+    if (cap == 0u || cap > post_cap) cap = post_cap;
+    if (cap == 0u) cap = 1u;
+    return cap;
+}
+
+static int xthread_log_post_to_main(lua_State* L, int level, const char* level_name) {
+    size_t len = 0;
+    const char* msg = luaL_optlstring(L, 1, "", &len);
+    int append_newline = lua_isnoneornil(L, 2) ? 1 : lua_toboolean(L, 2);
+    if (!xlog_is_enabled(level)) {
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+
+    size_t header = offsetof(XThreadLogPayload, msg);
+    size_t newline_len = (append_newline && (len == 0 || msg[len - 1] != '\n')) ? 1u : 0u;
+    size_t max_record_cap = xthread_log_record_cap(header);
+    size_t record_cap = max_record_cap;
+    size_t total_alloc;
+    size_t record_len;
+    size_t total;
+    char stack_payload[offsetof(XThreadLogPayload, msg) + XLOG_RECORD_STACK_BYTES + 1u];
+    int heap_payload = 1;
+
+    if (len <= ((size_t)-1) - 256u - newline_len) {
+        size_t wanted = 256u + len + newline_len;
+        if (wanted < record_cap) record_cap = wanted;
+    }
+    total_alloc = header + record_cap + 1u;
+
+    XThreadLogPayload* payload = (XThreadLogPayload*)malloc(total_alloc);
+    if (!payload) {
+        record_cap = (size_t)XLOG_RECORD_STACK_BYTES;
+        if (record_cap == 0u) record_cap = 1u;
+        if (record_cap > max_record_cap) {
+            record_cap = max_record_cap;
+        }
+        payload = (XThreadLogPayload*)stack_payload;
+        heap_payload = 0;
+    }
+
+    record_len = xlog_format(level, level_name, msg, len, append_newline,
+                             payload->msg, record_cap + 1u);
+    if (record_len > record_cap) record_len = record_cap;
+    payload->len = record_len;
+    total = header + record_len;
+
+    int err = xthread_post_reply(XTHR_MAIN, xthread_log_post_task, payload, total);
+    if (heap_payload) free(payload);
+
+    lua_pushboolean(L, err == 0);
+    if (err != 0) {
+        lua_pushfstring(L, "xthread.log: post to main failed (err=%d)", err);
+        return 2;
+    }
+    return 1;
+}
+
+static int xthread_log(lua_State* L, int level, const char* level_name, const char* console_tag) {
+    if (_log_local) {
+        size_t len = 0;
+        const char* msg = luaL_optlstring(L, 1, "", &len);
+        int append_newline = lua_isnoneornil(L, 2) ? 1 : lua_toboolean(L, 2);
+        xlog_write(level, level_name, console_tag, msg, len, append_newline);
+        return 0;
+    }
+    return xthread_log_post_to_main(L, level, level_name);
+}
+
+static int l_xthread_log_enabled(lua_State* L) {
+    int level = (int)luaL_checkinteger(L, 1);
+    lua_pushboolean(L, xlog_is_enabled(level));
+    return 1;
+}
+
+static int l_xthread_log_init(lua_State* L) {
+    xThread* thr = xthread_current();
+    int id = xthread_current_id();
+    if (id <= 0 || !thr) {
+        lua_pushboolean(L, 0);
+        lua_pushliteral(L, "xthread.log_init: current thread is not registered");
+        return 2;
+    }
+    xlog_set_thread(id, xthread_get_name(thr));
+    _log_local = 1;
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+static int l_xthread_log_verbose(lua_State* L) { return xthread_log(L, XLOG_LEVEL_VERBOSE, XLOG_LEVEL_NAME_VERBOSE, XLOG_TAG_VERBOSE); }
+static int l_xthread_log_debug(lua_State* L) { return xthread_log(L, XLOG_LEVEL_DEBUG, XLOG_LEVEL_NAME_DEBUG, XLOG_TAG_DEBUG); }
+static int l_xthread_log_info(lua_State* L) { return xthread_log(L, XLOG_LEVEL_INFO, XLOG_LEVEL_NAME_INFO, XLOG_TAG_INFO); }
+static int l_xthread_log_system(lua_State* L) { return xthread_log(L, XLOG_LEVEL_SYSM, XLOG_LEVEL_NAME_SYSM, XLOG_TAG_SYSM); }
+static int l_xthread_log_warn(lua_State* L) { return xthread_log(L, XLOG_LEVEL_WARN, XLOG_LEVEL_NAME_WARN, XLOG_TAG_WARN); }
+static int l_xthread_log_error(lua_State* L) { return xthread_log(L, XLOG_LEVEL_ERROR, XLOG_LEVEL_NAME_ERROR, XLOG_TAG_ERROR); }
+static int l_xthread_log_fatal(lua_State* L) { return xthread_log(L, XLOG_LEVEL_FATAL, XLOG_LEVEL_NAME_FATAL, XLOG_TAG_FATAL); }
+
+static int l_xthread_set_log_level(lua_State* L) {
+    int level = (int)luaL_checkinteger(L, 1);
+    xlog_set_level(level);
+    lua_pushboolean(L, 1);
+    lua_pushinteger(L, xlog_get_level());
+    return 2;
+}
+
+static int l_xthread_get_log_level(lua_State* L) {
+    lua_pushinteger(L, xlog_get_level());
+    return 1;
+}
+
 static int push_thread_stats(lua_State* L, int id) {
     xThread* thr = xthread_get(id);
     if (!thr) return 0;
@@ -1021,14 +1160,14 @@ static int l_xthread_all_stats(lua_State* L) {
 static void lua_thread_on_init(xThread* thr) {
     ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
     if (!td) {
-        XLOGE("lua_thread_on_init: no ThreadData for thread %d", xthread_get_id(thr));
+        xloge("lua_thread_on_init: no ThreadData for thread %d", xthread_get_id(thr));
         return;
     }
 
     /* Create NEW Lua state for this thread */
     lua_State* L = luaL_newstate();
     if (!L) {
-        XLOGE("lua_thread_on_init: failed to create Lua state for thread %d", xthread_get_id(thr));
+        xloge("lua_thread_on_init: failed to create Lua state for thread %d", xthread_get_id(thr));
         return;
     }
     td->L = L;
@@ -1062,9 +1201,9 @@ static void lua_thread_on_init(xThread* thr) {
 
     /* Load the script in THIS THREAD'S own Lua state
     ** Script returns the definition table with callbacks */
-    XLOGI("lua_thread_on_init: loading script '%s' for thread %d", td->script_path, xthread_get_id(thr));
+    xlogi("lua_thread_on_init: loading script '%s' for thread %d", td->script_path, xthread_get_id(thr));
     if (luaL_dofile(L, td->script_path) != LUA_OK) {
-        XLOGE("lua_thread_on_init: failed to load script '%s': %s",
+        xloge("lua_thread_on_init: failed to load script '%s': %s",
               td->script_path, lua_tostring(L, -1));
         xdebug_detach_state(L);
         lua_close(L);
@@ -1074,7 +1213,7 @@ static void lua_thread_on_init(xThread* thr) {
 
     /* Script should return the definition table */
     if (!lua_istable(L, -1)) {
-        XLOGE("lua_thread_on_init: script '%s' did not return a definition table", td->script_path);
+        xloge("lua_thread_on_init: script '%s' did not return a definition table", td->script_path);
         xdebug_detach_state(L);
         lua_close(L);
         td->L = NULL;
@@ -1087,7 +1226,7 @@ static void lua_thread_on_init(xThread* thr) {
         td->sync_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
         lua_pop(L, 1);
-        XLOGW("lua_thread_on_init: no __thread_handle in script '%s'", td->script_path);
+        xlogw("lua_thread_on_init: no __thread_handle in script '%s'", td->script_path);
         td->sync_handler_ref = LUA_NOREF;
     }
 
@@ -1129,7 +1268,7 @@ static void lua_thread_on_init(xThread* thr) {
         nargs = 1;
     }
     if (lua_pcall(L, nargs, 0, 0) != LUA_OK) {
-        XLOGE("lua_thread_on_init: xthread.init failed: %s", lua_tostring(L, -1));
+        xloge("lua_thread_on_init: xthread.init failed: %s", lua_tostring(L, -1));
         lua_settop(L, base);
     }
 
@@ -1138,7 +1277,7 @@ static void lua_thread_on_init(xThread* thr) {
         base = lua_gettop(L);
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->init_ref);
         if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-            XLOGE("lua_thread_on_init: user init callback error: %s", lua_tostring(L, -1));
+            xloge("lua_thread_on_init: user init callback error: %s", lua_tostring(L, -1));
             lua_settop(L, base);
         }
     }
@@ -1158,7 +1297,7 @@ static void lua_thread_on_init(xThread* thr) {
         }
     }
 
-    XLOGI("lua_thread_on_init: thread %d fully initialized", xthread_get_id(thr));
+    xlogi("lua_thread_on_init: thread %d fully initialized", xthread_get_id(thr));
 }
 
 #define XTHR_AUTO_WAIT_CAP 16
@@ -1176,7 +1315,7 @@ static void lua_thread_on_update(xThread* thr) {
         int errfunc = base + 1;
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->update_ref);
         if (lua_pcall(L, 0, 0, errfunc) != LUA_OK) {
-            XLOGE("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
+            xloge("lua_thread_on_update: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
             lua_settop(L, base);
             return;
         }
@@ -1207,7 +1346,7 @@ static void lua_thread_on_cleanup(xThread* thr) {
 
         lua_rawgeti(L, LUA_REGISTRYINDEX, td->uninit_ref);
         if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
-            XLOGE("lua_thread_on_cleanup: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
+            xloge("lua_thread_on_cleanup: thread %d error: %s", xthread_get_id(thr), lua_tostring(L, -1));
             lua_settop(L, base);
         }
     }
@@ -1233,7 +1372,7 @@ static void lua_thread_on_cleanup(xThread* thr) {
 
     /* xthread will unregister, clear the userdata reference */
     xthread_set_userdata(thr, NULL);
-    XLOGI("lua_thread_on_cleanup: thread %d cleaned up", xthread_get_id(thr));
+    xlogi("lua_thread_on_cleanup: thread %d cleaned up", xthread_get_id(thr));
 }
 
 /* xthread.create_thread(id, name, script_path) → boolean
@@ -1297,7 +1436,7 @@ static int l_xthread_create_thread(lua_State* L) {
     /* Store script path copy - the new thread will load it in its own Lua state */
     td->script_path = malloc(strlen(script_path) + 1);
     if (!td->script_path) {
-        XLOGE("xthread.create_thread: out of memory copying script path");
+        xloge("xthread.create_thread: out of memory copying script path");
         lua_pushboolean(L, 0);
         lua_pushstring(L, "xthread.create_thread: out of memory");
         return 2;
@@ -1316,7 +1455,7 @@ static int l_xthread_create_thread(lua_State* L) {
                                 lua_thread_on_cleanup
                                 , td);
     if (!ok) {
-        XLOGE("xthread.create_thread: failed to register thread %d", id);
+        xloge("xthread.create_thread: failed to register thread %d", id);
         /* Clean up references */
         if (td->sync_handler_ref != LUA_NOREF)
             luaL_unref(L, LUA_REGISTRYINDEX, td->sync_handler_ref);
@@ -1338,13 +1477,13 @@ static int l_xthread_create_thread(lua_State* L) {
     /* Get the xThread pointer and attach ThreadData */
     xThread* thr = xthread_get(id);
     if (!thr) {
-        XLOGE("xthread.create_thread: xthread_get failed after registration");
+        xloge("xthread.create_thread: xthread_get failed after registration");
         lua_pushboolean(L, 0);
         lua_pushstring(L, "xthread.create_thread: xthread_get failed");
         return 2;
     }
 
-    XLOGI("xthread.create_thread: created thread %d '%s'", id, name);
+    xlogi("xthread.create_thread: created thread %d '%s'", id, name);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1369,7 +1508,7 @@ static int l_xthread_shutdown_thread(lua_State* L) {
         luaL_unref(L, LUA_REGISTRYINDEX, td->sentinel_ref);
         td->sentinel_ref = LUA_NOREF;
     }
-    XLOGI("xthread.shutdown_thread: unregistered thread %d", id);
+    xlogi("xthread.shutdown_thread: unregistered thread %d", id);
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -1412,6 +1551,17 @@ static const luaL_Reg xthread_funcs[] = {
     { "set_queue_max",    l_xthread_set_queue_max },
     { "stats",            l_xthread_stats },
     { "all_stats",        l_xthread_all_stats },
+    { "_log_init",        l_xthread_log_init },
+    { "_log_enabled",     l_xthread_log_enabled },
+    { "_log_verbose",     l_xthread_log_verbose },
+    { "_log_debug",       l_xthread_log_debug },
+    { "_log_info",        l_xthread_log_info },
+    { "_log_system",      l_xthread_log_system },
+    { "_log_warn",        l_xthread_log_warn },
+    { "_log_error",       l_xthread_log_error },
+    { "_log_fatal",       l_xthread_log_fatal },
+    { "_set_log_level",   l_xthread_set_log_level },
+    { "_get_log_level",   l_xthread_get_log_level },
     { "rpc",              l_xthread_rpc },
     { "_rpc_timeout",     l_xthread_rpc_timeout },
     { "current_id",       l_current_id   },
@@ -1461,6 +1611,12 @@ static const char* XTHREAD_LUA_WRAPPERS =
 "end\n"
 "return xthread\n";
 
+static int lua_xthread_load_xlog(lua_State* L) {
+    if (luaL_loadfile(L, "xlua/lua_xlog.lua") == LUA_OK) return LUA_OK;
+    lua_pop(L, 1);
+    return luaL_loadfile(L, "../xlua/lua_xlog.lua");
+}
+
 static const struct { const char* name; int val; } THREAD_CONSTS[] = {
     { "MAIN",        XTHR_MAIN        },
     { "REDIS",       XTHR_REDIS       },
@@ -1501,6 +1657,15 @@ LUALIB_API int luaopen_xthread(lua_State* L) {
         lua_pushinteger(L, THREAD_CONSTS[i].val);
         lua_setfield(L, -2, THREAD_CONSTS[i].name);
     }
+
+    if (lua_xthread_load_xlog(L) != LUA_OK) {
+        return lua_error(L);
+    }
+    lua_pushvalue(L, -2); /* module table */
+    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+        return lua_error(L);
+    }
+    lua_pop(L, 1); /* lua_xlog returned module */
 
     if (luaL_loadstring(L, XTHREAD_LUA_WRAPPERS) != LUA_OK) {
         return lua_error(L);

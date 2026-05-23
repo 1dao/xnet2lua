@@ -85,7 +85,7 @@ static void timer_callback_bridge(void* ud) {
             else
                 lua_pushnil(L);
             if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
-                XLOGE("xtimer: callback error: %s", lua_tostring(L, -1));
+                xloge("xtimer: callback error: %s", lua_tostring(L, -1));
                 lua_pop(L, 1);
             }
         } else {

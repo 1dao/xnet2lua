@@ -59,6 +59,7 @@ local function __init()
         key_password = KEY_PASSWORD,
         worker_count = 1,
         worker_base = xthread.WORKER_GRP3,
+        worker_name = 'xpac-worker',
         app_script = 'scripts/xpac/xpac_app.lua',
         max_request_size = 1024 * 1024,
         server_name = 'xnet-pac-demo',

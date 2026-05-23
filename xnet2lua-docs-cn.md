@@ -59,7 +59,7 @@ xnet2lua 分为四层：
 
 ## 2. 编译与集成
 
-> ⚙️ **构建系统已重组**：根 Makefile 现在直接构建出 `libxsock.a`、`bin/xnet`、`bin/xthread_test`
+> ⚙️ **构建系统已重组**：根 Makefile 现在直接构建出 `libxnet.a`、`bin/xnet`、`bin/xthread_test`
 > 三件产物，**不再需要先 `make` 再 `cd demo && make` 的两段式构建**。
 > 仓库根目录新增了 `build.bat`（MSVC 全源编译），并支持 LuaJIT 作为可选 Lua 后端。
 
@@ -102,7 +102,7 @@ make LUA_BACKEND=luajit                    # 详见 2.5
 
 ### 2.2 Windows / MSVC 构建（`build.bat`）
 
-仓库根目录的 `build.bat` 是**全源编译**入口（不消费 `libxsock.a`），自动定位 `vcvarsall.bat` 并加载 x64 工具链。`demo/build.bat` 仍可用，但内部仅做参数透传。
+仓库根目录的 `build.bat` 是**全源编译**入口（不消费 `libxnet.a`），自动定位 `vcvarsall.bat` 并加载 x64 工具链。`demo/build.bat` 仍可用，但内部仅做参数透传。
 
 ```bat
 :: 默认 release，构建 bin\xnet.exe + bin\xthread_test.exe
@@ -207,7 +207,7 @@ luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 
 要把 xnet2lua 嵌入自己的 C 项目：
 
-1. 链接 `libxsock.a`；
+1. 链接 `libxnet.a`；
 2. 选择 Lua 后端并定义对应宏：
    - `-DLUA_EMBEDDED`：直接 `#include "3rd/minilua.h"`（在某一个 `.c` 中 `#define LUA_IMPL`）。
    - `-DXLUA_USE_LUAJIT=1`：`#include "lua.h" / "lauxlib.h" / "lualib.h" / "luajit.h"`，并链接 LuaJIT 静态库。
@@ -627,6 +627,60 @@ return ok, msg
 
 服务启动后，当前执行脚本的 Lua 线程会立即启用调试；其它已注册 Lua 线程会在自己的下一次 update tick 中安全启用调试 hook，避免跨线程直接操作别的 `lua_State`。
 
+### 4.8 日志
+
+Lua 侧日志使用明确的 level API，不提供 `XLOGI/XLOGE` 这类宏风格函数：
+
+```lua
+xthread.log_info("server started: %s:%d", host, port)
+xthread.log_system("config: workers=%d mode=%s", workers, mode)
+xthread.log_warn("slow request", path, cost_ms)
+xthread.log_error("request failed: %s", tostring(err))
+```
+
+可用接口：
+
+| 方法 | 用途 |
+|---|---|
+| `xthread.log_init()` | 在当前 Lua 线程启用本线程独立日志文件，文件名使用线程创建时注册的名称 |
+| `xthread.log_verbose(...)` | verbose 日志 |
+| `xthread.log_debug(...)` | debug 日志 |
+| `xthread.log_info(...)` | info 日志 |
+| `xthread.log_system(...)` | system/lifecycle 日志，用于启动配置、reload、正常退出等重要状态 |
+| `xthread.log_warn(...)` | warn 日志 |
+| `xthread.log_error(...)` | error 日志 |
+| `xthread.log_fatal(...)` | fatal 日志 |
+| `xthread.set_level(level)` | 设置最小输出等级；例如 `4` 表示屏蔽 verbose/debug |
+| `xthread.get_level()` | 返回当前最小输出等级 |
+
+日志等级数值从 Android log priority 的 verbose/debug/info 起步：
+`verbose=2`、`debug=3`、`info=4`、
+`system=5`、`warn=6`、`error=7`、`fatal=8`。`set_level(5)` 会显示
+system 及以上日志；`set_level(6)` 会进一步屏蔽 system，只保留 warn/error/fatal。
+
+日志参数支持两种写法：
+
+- 首参是格式串且参数足够时，会按 `string.format` 格式化；格式串消耗后的剩余参数用 `\t` 追加。
+- 普通多参数写法按 `print` 风格用 `\t` 拼接。
+
+```lua
+xthread.log_info("user=%s score=%d", user, score, "trace", trace_id)
+-- user=alice score=100    trace    trace-1
+
+xthread.log_info("user", user, "score", score)
+-- user    alice    score    100
+```
+
+每条日志默认写成一行。`print(...)` 会转为 `xthread.log_info(...)`，`io.stderr:write(...)` 会转为 error 日志。
+
+**推荐初始化策略：**
+
+- 主线程调用 `xthread.log_init()`，让主线程拥有自己的日志文件。
+- 业务 worker 线程如果需要独立排查，也在自己的 `__init` 中调用 `xthread.log_init()`。
+- 启动配置摘要、reload、正常退出等重要生命周期信息推荐用 `xthread.log_system(...)`。
+- Redis / MySQL / NATS / HTTP 等服务类线程通常不要调用 `xthread.log_init`。这些线程里的 Lua 日志默认会先在本线程拼成完整日志记录，再投递到 main 线程，由 main 线程写入主日志文件。
+- 服务类线程的业务异常优先返回给请求方，由请求方在自己的上下文里写日志；只有内部错误或无法归属到请求方的异常，才建议 post 到 main 线程统一记录。
+
 ---
 
 ## 5. xnet 模块——异步网络
@@ -978,6 +1032,7 @@ local ok, err = xhttp.start({
     host         = "0.0.0.0",
     port         = 8080,
     worker_count = 4,             -- worker 线程数
+    worker_name  = "api-worker",  -- worker 名称前缀，实际线程名为 api-worker-01、api-worker-02...
     app_script   = "my_app.lua",  -- 应用路由脚本路径
 })
 
@@ -994,6 +1049,7 @@ local ok, err = xhttp.start({
     cert_file    = "certs/server.crt",
     key_file     = "certs/server.key",
     worker_count = 2,
+    worker_name  = "api-worker",
     app_script   = "my_app.lua",
 })
 ```
@@ -1010,6 +1066,7 @@ local ok, err = xhttp.start({
 | `key_password` | string | "" | 私钥密码（可选） |
 | `worker_count` | number | 2 | worker 线程数量 |
 | `worker_base` | number | xthread.WORKER_GRP3 | worker 线程起始 ID |
+| `worker_name` | string | （必填） | worker 名称前缀，`xhttp` 会自动追加 `-01`、`-02` 等序号 |
 | `worker_script` | string | "scripts/core/server/xhttp_worker.lua" | worker 脚本路径 |
 | `app_script` | string | （必填） | 应用路由脚本路径（例如 "demo/xhttp_app.lua"） |
 | `max_request_size` | number | 16MB | 最大请求体大小（字节）|
@@ -1527,6 +1584,7 @@ local function __init()
         host         = xutils.get_config("HTTP_HOST", "0.0.0.0"),
         port         = tonumber(xutils.get_config("HTTP_PORT", "8080")),
         worker_count = tonumber(xutils.get_config("HTTP_WORKERS", "4")),
+        worker_name  = "api-worker",
         app_script   = "api_app.lua",
     })
 

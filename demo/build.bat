@@ -82,7 +82,7 @@ set "OBJDIR=.obj-msvc"
 set "XNET_EXE=xnet.exe"
 set "THREAD_EXE=xthread_test.exe"
 
-set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c"
+set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c ..\xdaemon.c ..\xlog.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% ..\3rd\rpmalloc\rpmalloc.c"
 set "XNET_SOURCES=..\xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
 set "THREAD_SOURCES=xthread_test.c"
@@ -234,6 +234,10 @@ if "%WITH_HTTPS%"=="1" (
 
 set "THREAD_LIBS=ws2_32.lib"
 set "XNET_LIBS=ws2_32.lib"
+if "%WITH_RPMALLOC%"=="1" (
+    set "THREAD_LIBS=%THREAD_LIBS% Advapi32.lib"
+    set "XNET_LIBS=%XNET_LIBS% Advapi32.lib"
+)
 if "%WITH_HTTPS%"=="1" (
     set "XNET_LIBS=%XNET_LIBS% bcrypt.lib"
 )
@@ -245,7 +249,7 @@ set "THREAD_RPMALLOC_OBJ="
 if "%WITH_RPMALLOC%"=="1" set "THREAD_RPMALLOC_OBJ=%OBJDIR%\rpmalloc.obj"
 
 echo %GREEN%[INFO]%RESET% Linking %THREAD_EXE%...
-link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj %THREAD_RPMALLOC_OBJ% %THREAD_LIBS%
+link /nologo %LDFLAGS% /OUT:%THREAD_EXE% %THREAD_OBJECTS% %OBJDIR%\xthread.obj %OBJDIR%\xpoll.obj %OBJDIR%\xsock.obj %OBJDIR%\xdaemon.obj %OBJDIR%\xlog.obj %THREAD_RPMALLOC_OBJ% %THREAD_LIBS%
 if errorlevel 1 (
     echo %RED%[ERROR]%RESET% Link failed for %THREAD_EXE%
     exit /b 1
