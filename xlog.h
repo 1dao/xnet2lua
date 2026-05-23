@@ -61,7 +61,7 @@ void xlog_set_level(int min_level);
 int  xlog_get_level(void);
 int  xlog_is_enabled(int level);
 void xlog_printf(int level, const char* level_name, const char* console_tag, const char* fmt, ...);
-void xlog_set_thread(int id, const char* name);
+void xlog_set_thread(int id, const char* name, const char* thread_label);
 void xlog_clear_thread(void);
 size_t xlog_format(int level, const char* level_name, const char* msg, size_t len, int append_newline, char* buf, size_t cap);
 void xlog_write(int level, const char* level_name, const char* console_tag, const char* msg, size_t len, int append_newline);

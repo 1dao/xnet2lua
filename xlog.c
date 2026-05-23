@@ -1,5 +1,4 @@
 #include "xlog.h"
-#include "xthread.h"
 
 #ifndef __ANDROID__
 
@@ -35,6 +34,7 @@ typedef struct {
     int file_open_attempted;
     char name[64];
     char file_name[64];
+    char tag[96];
     char path[512];
     FILE* file;
 } xLogThreadState;
@@ -150,34 +150,22 @@ typedef struct {
     char ts[32];
     const char* level_name;
     const char* console_tag;
-    const char* thread_name;
-    char thread_tag[32];
-    int thread_id;
+    char thread_tag[96];
 } xLogRecordContext;
 
-static int xlog_is_group_thread(int id) {
-    static const int bases[] = {
-        XTHR_WORKER_GRP1,
-        XTHR_WORKER_GRP2,
-        XTHR_WORKER_GRP3,
-        XTHR_WORKER_GRP4,
-        XTHR_WORKER_GRP5
-    };
-    for (int i = 0; i < (int)(sizeof(bases) / sizeof(bases[0])); ++i) {
-        if (id >= bases[i] && id < bases[i] + XTHR_GROUP_MAX) {
-            return 1;
-        }
-    }
-    return 0;
-}
+static void xlog_make_thread_tag(char* dst, size_t cap, int id, const char* name, const char* thread_label) {
+    const char* safe_name = (name && name[0]) ? name : "unknown";
+    if (!dst || cap == 0) return;
 
-static void xlog_format_thread_tag(char* buf, size_t cap, int id, const char* name) {
-    if (xlog_is_group_thread(id)) {
-        snprintf(buf, cap, "[G%d:%s]", id, name && name[0] ? name : "unknown");
-    } else if (id == XTHR_MAIN) {
-        snprintf(buf, cap, "[T%d:MAIN]", id);
+    if (thread_label && thread_label[0]) {
+        snprintf(dst, cap, "[%s]", thread_label);
+        return;
+    }
+
+    if (id > 0) {
+        snprintf(dst, cap, "[T%d:%s]", id, safe_name);
     } else {
-        snprintf(buf, cap, "[T%d:%s]", id, name && name[0] ? name : "unknown");
+        snprintf(dst, cap, "[T0:%s]", safe_name);
     }
 }
 
@@ -186,10 +174,12 @@ static void xlog_record_context(const char* level_name, const char* console_tag,
     xlog_now(ctx->ts, sizeof(ctx->ts));
     ctx->level_name = (level_name && level_name[0]) ? level_name : "LOG";
     ctx->console_tag = (console_tag && console_tag[0]) ? console_tag : NULL;
-    ctx->thread_name = st->name[0] ? st->name : "unknown";
-    ctx->thread_id = st->id;
-    xlog_format_thread_tag(ctx->thread_tag, sizeof(ctx->thread_tag),
-                           ctx->thread_id, ctx->thread_name);
+    if (st->tag[0]) {
+        xlog_copy(ctx->thread_tag, sizeof(ctx->thread_tag), st->tag, "[T0:unknown]");
+    } else {
+        xlog_make_thread_tag(ctx->thread_tag, sizeof(ctx->thread_tag),
+                             st->id, st->name, NULL);
+    }
 }
 
 static int xlog_format_needs_newline(const char* fmt) {
@@ -366,7 +356,7 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
     g_console_enabled = enable_console ? 1 : 0;
     if (g_console_enabled) xlog_enable_vt100();
     g_configured = 1;
-    xlog_set_thread(1, "main");
+    xlog_set_thread(1, "main", "T1:MAIN");
 }
 
 void xlog_uninit(void) {
@@ -374,24 +364,28 @@ void xlog_uninit(void) {
     g_configured = 0;
 }
 
-void xlog_set_thread(int id, const char* name) {
+void xlog_set_thread(int id, const char* name, const char* thread_label) {
     xLogThreadState* st = &g_thread_log;
     char display_name[64];
     char file_name[64];
+    char thread_tag[96];
     xlog_copy(display_name, sizeof(display_name), name, id == 1 ? "main" : "thread");
     xlog_copy(file_name, sizeof(file_name), display_name, id == 1 ? "main" : "thread");
+    xlog_make_thread_tag(thread_tag, sizeof(thread_tag), id, display_name, thread_label);
     xlog_sanitize(file_name);
 
     if ((st->file || st->file_open_attempted) &&
         st->id == id &&
         strcmp(st->name, display_name) == 0 &&
-        strcmp(st->file_name, file_name) == 0) {
+        strcmp(st->file_name, file_name) == 0 &&
+        strcmp(st->tag, thread_tag) == 0) {
         return;
     }
     xlog_clear_thread();
     st->id = id;
     xlog_copy(st->name, sizeof(st->name), display_name, id == 1 ? "main" : "thread");
     xlog_copy(st->file_name, sizeof(st->file_name), file_name, st->name);
+    xlog_copy(st->tag, sizeof(st->tag), thread_tag, "[T0:unknown]");
 }
 
 void xlog_clear_thread(void) {
@@ -440,6 +434,7 @@ static FILE* xlog_open_thread_file(void) {
         st->id = 0;
         xlog_copy(st->name, sizeof(st->name), "unknown", "unknown");
         xlog_copy(st->file_name, sizeof(st->file_name), "unknown", "unknown");
+        xlog_copy(st->tag, sizeof(st->tag), "[T0:unknown]", "[T0:unknown]");
     }
 
     char proc[64];
@@ -548,7 +543,7 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
 }
 
 void xlog_uninit(void) {}
-void xlog_set_thread(int id, const char* name) { (void)id; (void)name; }
+void xlog_set_thread(int id, const char* name, const char* thread_label) { (void)id; (void)name; (void)thread_label; }
 void xlog_clear_thread(void) {}
 void xlog_set_level(int min_level) {
     if (min_level < XLOG_LEVEL_VERBOSE) min_level = XLOG_LEVEL_VERBOSE;

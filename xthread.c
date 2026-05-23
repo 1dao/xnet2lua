@@ -121,6 +121,7 @@ struct xThread {
 #endif
     int          id;
     char         name[32];  /* fixed-size name buffer, no allocation needed */
+    char         log_label[64];
     atomic_bool  running;
     xQueue       queue;
     void*        userdata;
@@ -853,6 +854,27 @@ void xthread_wakeup_uninit(void) {
     xthread_wakeup_uninit_ctx(xthread_current());
 }
 
+static int xthread_single_thread_max_id(void) {
+    return XTHR_HTTP;
+}
+
+static int xthread_is_group_thread_id(int id) {
+    return id > xthread_single_thread_max_id();
+}
+
+static void xthread_format_log_label(char* dst, size_t cap, int id, const char* name) {
+    const char* thread_name = (name && name[0]) ? name : "unknown";
+    if (!dst || cap == 0) return;
+
+    if (id == XTHR_MAIN) {
+        snprintf(dst, cap, "T%d:MAIN", id);
+    } else if (xthread_is_group_thread_id(id)) {
+        snprintf(dst, cap, "G%d:%s", id, thread_name);
+    } else {
+        snprintf(dst, cap, "T%d:%s", id, thread_name);
+    }
+}
+
 
 /* ============================================================================
 ** Internal: register the calling (main) thread without creating an OS thread
@@ -870,6 +892,7 @@ static bool xthread_register_main(int id, const char* name) {
     ctx->id         = id;
     strncpy(ctx->name, name, sizeof(ctx->name) - 1);
     ctx->name[sizeof(ctx->name) - 1] = '\0';  /* ensure null-terminated */
+    xthread_format_log_label(ctx->log_label, sizeof(ctx->log_label), id, ctx->name);
     ctx->group      = NULL;
     ctx->poll       = NULL;
     ctx->notify_wfd = INVALID_SOCKET;
@@ -891,7 +914,7 @@ static bool xthread_register_main(int id, const char* name) {
 
     _threads[id] = ctx;
     tls_set(id);
-    xlog_set_thread(id, ctx->name);
+    xlog_set_thread(id, ctx->name, ctx->log_label);
     xnet_mutex_unlock(&_lock);
     return true;
 }
@@ -926,7 +949,7 @@ static void* worker_func(void* arg) {
 #endif
     xThread* ctx = (xThread*)arg;
     tls_set(ctx->id);
-    xlog_set_thread(ctx->id, ctx->name);
+    xlog_set_thread(ctx->id, ctx->name, ctx->log_label);
 
     /* Register this worker with rpmalloc BEFORE any allocation happens.
     ** xthread_internal_init may call into user on_init which allocates. */
@@ -1026,6 +1049,7 @@ bool xthread_register_ex(int id, const char* name,
     ctx->id         = id;
     strncpy(ctx->name, name, sizeof(ctx->name) - 1);
     ctx->name[sizeof(ctx->name) - 1] = '\0';  /* ensure null-terminated */
+    xthread_format_log_label(ctx->log_label, sizeof(ctx->log_label), id, ctx->name);
     ctx->on_init    = on_init;
     ctx->on_update  = on_update;
     ctx->on_cleanup = on_cleanup;

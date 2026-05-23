@@ -1057,15 +1057,41 @@ static int l_xthread_log_enabled(lua_State* L) {
     return 1;
 }
 
+static int lua_xthread_single_thread_max_id(void) {
+    return XTHR_HTTP;
+}
+
+static int lua_xthread_is_group_thread_id(int id) {
+    return id > lua_xthread_single_thread_max_id();
+}
+
+static void lua_xthread_format_log_label(char* dst, size_t cap, int id, const char* name) {
+    const char* thread_name = (name && name[0]) ? name : "unknown";
+    if (!dst || cap == 0) return;
+
+    if (id == XTHR_MAIN) {
+        snprintf(dst, cap, "T%d:MAIN", id);
+    } else if (lua_xthread_is_group_thread_id(id)) {
+        snprintf(dst, cap, "G%d:%s", id, thread_name);
+    } else {
+        snprintf(dst, cap, "T%d:%s", id, thread_name);
+    }
+}
+
 static int l_xthread_log_init(lua_State* L) {
     xThread* thr = xthread_current();
     int id = xthread_current_id();
+    const char* name;
+    char thread_label[96];
     if (id <= 0 || !thr) {
         lua_pushboolean(L, 0);
         lua_pushliteral(L, "xthread.log_init: current thread is not registered");
         return 2;
     }
-    xlog_set_thread(id, xthread_get_name(thr));
+
+    name = xthread_get_name(thr);
+    lua_xthread_format_log_label(thread_label, sizeof(thread_label), id, name);
+    xlog_set_thread(id, name, thread_label);
     _log_local = 1;
     lua_pushboolean(L, 1);
     return 1;
