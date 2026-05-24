@@ -83,6 +83,11 @@ struct xChannel {
     xChannelPacketProc packet_cb;
     xChannelCloseProc close_cb;
     void* userdata;
+
+    xChannelRecvTransform recv_transform;
+    xChannelSendTransform send_transform;
+    xChannelTransformDtor transform_dtor;
+    void* transform_ud;
 };
 
 static void xchannel_read_event(SOCKET_T fd, int mask,
@@ -194,6 +199,7 @@ static void close_pending_file(xChannel* ch) {
 static bool valid_frame(xChannelFrame frame) {
     return frame == XCHANNEL_FRAME_RAW ||
            frame == XCHANNEL_FRAME_LEN32 ||
+           frame == XCHANNEL_FRAME_LEN16 ||
            frame == XCHANNEL_FRAME_CRLF;
 }
 
@@ -212,12 +218,27 @@ static uint32_t read_u32be(const char* p) {
            (uint32_t)b[3];
 }
 
+static void write_u16be(char* p, uint16_t v) {
+    p[0] = (char)((v >> 8) & 0xff);
+    p[1] = (char)(v & 0xff);
+}
+
+static uint16_t read_u16be(const char* p) {
+    const unsigned char* b = (const unsigned char*)p;
+    return (uint16_t)(((uint16_t)b[0] << 8) | (uint16_t)b[1]);
+}
+
 static void xchannel_retain(xChannel* ch) {
     if (ch) ch->refcount++;
 }
 
 static void xchannel_free_storage(xChannel* ch) {
     if (!ch) return;
+    if (ch->transform_ud && ch->transform_dtor) {
+        ch->transform_dtor(ch->transform_ud);
+        ch->transform_ud = NULL;
+        ch->transform_dtor = NULL;
+    }
     close_pending_file(ch);
     xbuf_free(&ch->in);
     xbuf_free(&ch->out);
@@ -243,7 +264,26 @@ static size_t find_crlf(const char* buf, size_t len) {
 static size_t emit_packet(xChannel* ch, const char* data, size_t len) {
     if (!ch || ch->closed || !ch->packet_cb) return 0;
     xchannel_retain(ch);
-    size_t consumed = ch->packet_cb(ch, data, len, ch->userdata);
+
+    size_t consumed = 0;
+    if (ch->recv_transform) {
+        char* plain = NULL;
+        size_t plain_len = 0;
+        int rc = ch->recv_transform(ch, data, len, &plain, &plain_len,
+                                     ch->transform_ud);
+        if (rc != 0) {
+            xchannel_close(ch, "recv_transform_error");
+            free(plain);
+            xchannel_release(ch);
+            return 0;
+        }
+        consumed = ch->packet_cb(ch, plain_len > 0 ? plain : "",
+                                  plain_len, ch->userdata);
+        free(plain);
+    } else {
+        consumed = ch->packet_cb(ch, data, len, ch->userdata);
+    }
+
     xchannel_release(ch);
     return consumed;
 }
@@ -259,9 +299,7 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
 #if defined(XCHANNEL_WITH_IO_URING)
     if (ch->read_req) {
         xpoll_cancel_request(ch->read_req);
-        ch->read_req = NULL;
     }
-    ch->read_pending = false;
     if (ch->write_req) {
         xpoll_cancel_request(ch->write_req);
         ch->write_req = NULL;
@@ -308,6 +346,23 @@ static int process_input(xChannel* ch) {
             emit_packet(ch, body_len > 0 ? body : "", body_len);
             if (ch->closed) return rc;
             xbuf_consume(&ch->in, (size_t)body_len + 4);
+            rc += 1;
+            continue;
+        } else if (ch->frame == XCHANNEL_FRAME_LEN16) {
+            size_t avail = xbuf_size(&ch->in);
+            if (avail < 2) return rc;
+
+            uint16_t body_len = read_u16be(ch->in.data + ch->in.off);
+            if ((size_t)body_len > ch->max_packet) {
+                xchannel_close(ch, "packet_too_large");
+                return rc;
+            }
+            if (avail < (size_t)body_len + 2) return rc;
+
+            const char* body = ch->in.data + ch->in.off + 2;
+            emit_packet(ch, body_len > 0 ? body : "", body_len);
+            if (ch->closed) return rc;
+            xbuf_consume(&ch->in, (size_t)body_len + 2);
             rc += 1;
             continue;
         } else if (ch->frame == XCHANNEL_FRAME_CRLF) {
@@ -434,11 +489,19 @@ static int xchannel_uring_arm_read(xChannel* ch) {
     if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max)
         return 0;
 
+    if (!xbuf_reserve(&ch->in, XCHANNEL_READ_CHUNK)) {
+        xchannel_close(ch, "out_of_memory");
+        return -1;
+    }
+
+    size_t space = ch->in.cap - ch->in.len;
+    if (space == 0) return 0;
+    size_t chunk = (space > INT_MAX) ? INT_MAX : space;
+
     xchannel_retain(ch);
     ch->read_pending = true;
-    ch->read_req = xpoll_submit_poll(ch->fd,
-                                     XPOLL_READABLE | XPOLL_ERROR | XPOLL_CLOSE,
-                                     xchannel_uring_read_done, ch);
+    ch->read_req = xpoll_submit_recv(ch->fd, ch->in.data + ch->in.len,
+                                     chunk, 0, xchannel_uring_read_done, ch);
     if (!ch->read_req) {
         ch->read_pending = false;
         xchannel_release(ch);
@@ -755,6 +818,7 @@ static void xchannel_error_event(SOCKET_T fd, int mask,
 static void xchannel_uring_read_done(SOCKET_T fd, int mask,
                                      void* clientData, xPollRequest* submit_arg) {
     (void)fd;
+    (void)mask;
     xChannel* ch = (xChannel*)clientData;
     if (!ch) return;
 
@@ -767,10 +831,22 @@ static void xchannel_uring_read_done(SOCKET_T fd, int mask,
     ch->read_req = NULL;
 
     if (!ch->closed && ch->attached) {
-        if (xpoll_req_res(submit_arg) < 0 || (mask & XPOLL_ERROR)) {
+        int nread = xpoll_req_res(submit_arg);
+        if (nread > 0) {
+            ch->in.len += (size_t)nread;
+            ch->bytes_recv += (size_t)nread;
+
+            bool over_before = ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max;
+            int n = process_input(ch);
+            if (n == 0 && over_before)
+                xchannel_close(ch, "over_consume_error");
+        } else if (nread == 0) {
+            xchannel_close(ch, "eof");
+        } else if (nread == -EAGAIN || nread == -EWOULDBLOCK ||
+                   nread == -EINTR || nread == -EINPROGRESS) {
+            /* Retry below. */
+        } else {
             xchannel_error_event(ch->fd, XPOLL_ERROR, ch, NULL);
-        } else if (mask & (XPOLL_READABLE | XPOLL_CLOSE)) {
-            xchannel_read_event(ch->fd, mask, ch, NULL);
         }
 
         if (!ch->closed && ch->attached &&
@@ -858,9 +934,7 @@ void xchannel_destroy(xChannel* ch) {
 #if defined(XCHANNEL_WITH_IO_URING)
         if (ch->read_req) {
             xpoll_cancel_request(ch->read_req);
-            ch->read_req = NULL;
         }
-        ch->read_pending = false;
         if (ch->write_req) {
             xpoll_cancel_request(ch->write_req);
             ch->write_req = NULL;
@@ -882,6 +956,21 @@ int xchannel_set_framing(xChannel* ch, const xChannelConfig* cfg) {
     if (cfg->max_packet > 0) ch->max_packet = cfg->max_packet;
     ch->frame = cfg->frame;
     return 0;
+}
+
+void xchannel_set_transform(xChannel* ch,
+                             xChannelRecvTransform recv,
+                             xChannelSendTransform send,
+                             void* transform_ud,
+                             xChannelTransformDtor transform_dtor) {
+    if (!ch) return;
+    if (ch->transform_ud && ch->transform_dtor) {
+        ch->transform_dtor(ch->transform_ud);
+    }
+    ch->recv_transform = recv;
+    ch->send_transform = send;
+    ch->transform_ud = transform_ud;
+    ch->transform_dtor = transform_dtor;
 }
 
 SOCKET_T xchannel_fd(xChannel* ch) {
@@ -964,9 +1053,7 @@ void xchannel_detach(xChannel* ch) {
     ch->attached = false;
     if (ch->read_req) {
         xpoll_cancel_request(ch->read_req);
-        ch->read_req = NULL;
     }
-    ch->read_pending = false;
     if (ch->write_req) {
         xpoll_cancel_request(ch->write_req);
         ch->write_req = NULL;
@@ -985,20 +1072,42 @@ int xchannel_send_raw(xChannel* ch, const char* data, size_t len) {
 int xchannel_send_packet(xChannel* ch, const char* data, size_t len) {
     if (!ch || ch->closed || (!data && len > 0)) return -1;
     if (has_pending_file(ch)) return -1;
-    
+
+    /* Apply send_transform first; framing wraps the transformed bytes. */
+    char* enc = NULL;
+    size_t enc_len = 0;
+    const char* body = data;
+    size_t body_len = len;
+    if (ch->send_transform) {
+        int rc = ch->send_transform(ch, data, len, &enc, &enc_len,
+                                     ch->transform_ud);
+        if (rc != 0) {
+            free(enc);
+            return -1;
+        }
+        body = enc_len > 0 ? enc : "";
+        body_len = enc_len;
+    }
+
+    int rc;
     if (ch->frame == XCHANNEL_FRAME_LEN32) {
-        if (len > UINT32_MAX) return -1;
+        if (body_len > UINT32_MAX) { free(enc); return -1; }
         char hdr[4];
-        write_u32be(hdr, (uint32_t)len);
-        return queue_or_send_iov(ch, hdr, 4, data, len);
-    }
-
-    if (ch->frame == XCHANNEL_FRAME_CRLF) {
+        write_u32be(hdr, (uint32_t)body_len);
+        rc = queue_or_send_iov(ch, hdr, 4, body, body_len);
+    } else if (ch->frame == XCHANNEL_FRAME_LEN16) {
+        if (body_len > UINT16_MAX) { free(enc); return -1; }
+        char hdr[2];
+        write_u16be(hdr, (uint16_t)body_len);
+        rc = queue_or_send_iov(ch, hdr, 2, body, body_len);
+    } else if (ch->frame == XCHANNEL_FRAME_CRLF) {
         static const char trailer[2] = {'\r', '\n'};
-        return queue_or_send_iov(ch, data, len, trailer, 2);
+        rc = queue_or_send_iov(ch, body, body_len, trailer, 2);
+    } else {
+        rc = queue_or_send_iov(ch, body, body_len, NULL, 0);
     }
-
-    return queue_or_send_iov(ch, data, len, NULL, 0);
+    free(enc);
+    return rc;
 }
 
 int xchannel_send_file_raw(xChannel* ch,
