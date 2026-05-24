@@ -82,7 +82,7 @@ static void xlog_copy(char* dst, size_t cap, const char* src, const char* fallba
     const char* s = (src && src[0]) ? src : fallback;
     if (!dst || cap == 0) return;
     if (!s) s = "";
-    snprintf(dst, cap, "%s", s);
+    snprintf(dst, cap, "%.*s", (int)(cap - 1), s);
 }
 
 static void xlog_sanitize(char* s) {
@@ -158,14 +158,17 @@ static void xlog_make_thread_tag(char* dst, size_t cap, int id, const char* name
     if (!dst || cap == 0) return;
 
     if (thread_label && thread_label[0]) {
-        snprintf(dst, cap, "[%s]", thread_label);
+        snprintf(dst, cap, "[%.*s]", (int)(cap - 3), thread_label);
         return;
     }
 
     if (id > 0) {
-        snprintf(dst, cap, "[T%d:%s]", id, safe_name);
+        int id_len = snprintf(NULL, 0, "%d", id);
+        int name_max = (int)cap - 5 - id_len;
+        if (name_max < 1) name_max = 1;
+        snprintf(dst, cap, "[T%d:%.*s]", id, name_max, safe_name);
     } else {
-        snprintf(dst, cap, "[T0:%s]", safe_name);
+        snprintf(dst, cap, "[T0:%.*s]", (int)(cap - 6), safe_name);
     }
 }
 

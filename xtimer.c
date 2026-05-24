@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 // 时间轮配置（Linux内核标准参数）
 #define TVN_BITS 6
@@ -400,7 +401,7 @@ xTimerNode* xtimer_create(xTimerSet* tm,
 // 优化一：增加毒化检查，彻底防止重复释放
 void xtimer_destroy(xTimerSet* tm, xTimerNode* timer) {
     // 三重防御：空指针、已释放、已取消、毒化标记
-    if (!timer || timer->in_free_list || timer->cancelled || timer->id == TIMER_POISON_ID) {
+    if (!timer || timer->in_free_list || timer->cancelled || (unsigned int)timer->id == TIMER_POISON_ID) {
         return;
     }
     

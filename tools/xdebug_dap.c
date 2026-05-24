@@ -1281,7 +1281,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
 #endif
     parse_args(&g.opts, argc, argv);
-    socket_init();
+    (void)socket_init();
     if (xpoll_init() != 0) {
         fprintf(stderr, "xnet-xdebug-dap error: xpoll init failed\n");
         return 1;
