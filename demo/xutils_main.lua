@@ -1,6 +1,7 @@
--- Regression test for xutils: load_config / get_config / scan_dir / json_*
--- Run: ./bin/xnet demo/xutils_main.lua
--- Exits with code 0 on full pass, 1 on any failure.
+-- Regression example for xutils: load_config / get_config / scan_dir / json_*.
+-- Run directly with: ./bin/xnet demo/xutils_main.lua
+-- Or through Makefile: make run-lua SCRIPT=demo/xutils_main.lua
+-- CI runs this via make test-lua-core.
 
 local xutils = require('xutils')
 

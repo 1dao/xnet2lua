@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  posix:
+    name: ${{ matrix.os }} / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            test_target: test
+            coverage: true
+          - os: ubuntu-latest
+            name: release-https-rpmalloc
+            cc: gcc
+            build_mode: release
+            with_https: 1
+            with_rpmalloc: 1
+            test_target: unit
+            coverage: false
+          - os: macos-latest
+            name: debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            test_target: test
+            coverage: false
+          - os: macos-latest
+            name: release-https-rpmalloc
+            cc: gcc
+            build_mode: release
+            with_https: 1
+            with_rpmalloc: 1
+            test_target: unit
+            coverage: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build
+        run: make all CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}
+
+      - name: Test
+        run: make -C tests ${{ matrix.test_target }} ROOT=.. CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}
+
+      - name: Coverage
+        if: matrix.coverage == true
+        run: make -C tests coverage-c ROOT=.. CC=${{ matrix.cc }} BUILD_MODE=debug WITH_HTTPS=0 WITH_RPMALLOC=0
+
+  windows:
+    name: windows-latest / ${{ matrix.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: debug-nohttps-norpmalloc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            test_target: test
+          - name: release-https-rpmalloc
+            build_mode: release
+            with_https: 1
+            with_rpmalloc: 1
+            test_target: unit
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            base-devel
+            mingw-w64-x86_64-gcc
+
+      - name: Build
+        run: make all CC=gcc BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}
+
+      - name: Test
+        run: make -C tests ${{ matrix.test_target }} ROOT=.. CC=gcc BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}

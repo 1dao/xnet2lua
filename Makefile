@@ -75,34 +75,14 @@ XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(EXE_EXT)
 
 # rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
-# directly. libxnet.a itself does NOT contain rpmalloc symbols, so both the
-# xnet target and the xthread_test target add it to their own source lists.
-# Empty when WITH_RPMALLOC=0 — xmacro.h then stubs the lifecycle API.
+# directly. libxnet.a itself does NOT contain rpmalloc symbols, so xnet adds
+# it here and tests/Makefile adds it for xthread_test.
+# Empty when WITH_RPMALLOC=0; xmacro.h then stubs the lifecycle API.
 ifeq ($(WITH_RPMALLOC),1)
     RPMALLOC_SRC := 3rd/rpmalloc/rpmalloc.c
 else
     RPMALLOC_SRC :=
 endif
-
-XTHREAD_TEST_SRCS := demo/xthread_test.c xthread.c xpoll.c xsock.c xdaemon.c xlog.c $(RPMALLOC_SRC)
-XTHREAD_TEST_BUILD := $(BIN_DIR)/xthread_test_build$(EXE_EXT)
-XTHREAD_TEST_TARGET := $(BIN_DIR)/xthread_test$(EXE_EXT)
-
-LUA_TEST_CORE_SCRIPTS := \
-	demo/xutils_main.lua \
-	demo/xtimer_main.lua \
-	demo/xtimerx_test.lua \
-	demo/xlua_main.lua \
-	demo/xnet_main.lua \
-	demo/xrouter_test.lua \
-	demo/xhttp_router_test.lua \
-	demo/xhttp_main.lua
-
-LUA_TEST_EXTERNAL_SCRIPTS := \
-	demo/xhttps_main.lua \
-	demo/xredis_main.lua \
-	demo/xmysql_main.lua \
-	demo/xnats_main.lua
 
 ifeq ($(LUA_BACKEND),minilua)
 	XNET_DEFS += -DLUA_EMBEDDED
@@ -142,19 +122,20 @@ endif
 XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(EXE_EXT)
 
+TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+
 xdebug_dap: $(XDEBUG_DAP_TARGET)
 
 $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 	$(RM) $(XDEBUG_DAP_TARGET)
 	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 -o $@ $(XDEBUG_DAP_SRCS) $(SYS_LDFLAGS)
 
-.PHONY: all xnet xthread_test xdebug_dap clean test test-c test-lua-core test-lua-external test-lua-all run-lua
+.PHONY: all xnet xdebug_dap clean $(TEST_TARGETS) run-lua
 
-all: $(TARGET_LIB) $(XNET_TARGET) $(XTHREAD_TEST_TARGET) $(XDEBUG_DAP_TARGET)
+all: $(TARGET_LIB) $(XNET_TARGET) $(XDEBUG_DAP_TARGET)
 
 xnet: $(XNET_TARGET)
-
-xthread_test: $(XTHREAD_TEST_TARGET)
 
 $(TARGET_LIB): $(CORE_OBJS)
 	$(AR) $(ARFLAGS) $@ $(CORE_OBJS)
@@ -167,37 +148,14 @@ $(XNET_TARGET): xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $
 	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
-$(XTHREAD_TEST_TARGET): $(XTHREAD_TEST_SRCS) | $(BIN_DIR)
-	$(RM) $(XTHREAD_TEST_BUILD)
-	$(CC) $(CFLAGS) -I. -o $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_SRCS) $(SYS_LDFLAGS)
-	$(MV) $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_TARGET)
-
 $(OBJ_DIR):
 	$(MKDIR) $(OBJ_DIR)
 
 $(BIN_DIR):
 	$(MKDIR) $(BIN_DIR)
 
-test: test-c test-lua-core
-
-test-c: $(XTHREAD_TEST_TARGET)
-	$(XTHREAD_TEST_TARGET)
-
-test-lua-core: $(XNET_TARGET)
-	@set -e; \
-	for script in $(LUA_TEST_CORE_SCRIPTS); do \
-		echo "==> $$script"; \
-		$(XNET_TARGET) $$script; \
-	done
-
-test-lua-external: $(XNET_TARGET)
-	@set -e; \
-	for script in $(LUA_TEST_EXTERNAL_SCRIPTS); do \
-		echo "==> $$script"; \
-		$(XNET_TARGET) $$script; \
-	done
-
-test-lua-all: test-lua-core test-lua-external
+$(TEST_TARGETS):
+	$(TEST_MAKE) $@
 
 run-lua: $(XNET_TARGET)
 	@if [ -z "$(SCRIPT)" ]; then \
@@ -207,6 +165,7 @@ run-lua: $(XNET_TARGET)
 	$(XNET_TARGET) $(SCRIPT)
 
 clean:
-	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
+	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
+	$(TEST_MAKE) clean
 
 -include $(CORE_DEPS)

@@ -1,5 +1,7 @@
--- demo/xrouter_test.lua - unit tests for xrouter.lua (singleton + unified register)
--- Run via:  ./demo/xnet demo/xrouter_test.lua
+-- demo/xrouter_test.lua - xrouter singleton + unified-register regression tests.
+-- Run directly with: ./bin/xnet demo/xrouter_test.lua
+-- Or through Makefile: make run-lua SCRIPT=demo/xrouter_test.lua
+-- CI runs this via make test-lua-core.
 
 local router = dofile('scripts/core/share/xrouter.lua')
 

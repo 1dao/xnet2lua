@@ -1,6 +1,7 @@
--- demo/xhttp_router_test.lua - unit tests for xhttp_router.lua path-param support.
--- Run via:  ./bin/xnet demo/xhttp_router_test.lua
--- Exits with non-zero code if any assertion fails.
+-- demo/xhttp_router_test.lua - route matching regression tests.
+-- Run directly with: ./bin/xnet demo/xhttp_router_test.lua
+-- Or through Makefile: make run-lua SCRIPT=demo/xhttp_router_test.lua
+-- CI runs this via make test-lua-core.
 
 local router = dofile('scripts/core/share/xhttp_router.lua')
 

@@ -1,4 +1,7 @@
 -- xtimer_test_main.lua - smoke-test the xtimer Lua binding.
+-- Run directly with: ./bin/xnet demo/xtimer_main.lua
+-- Or through Makefile: make run-lua SCRIPT=demo/xtimer_main.lua
+-- CI runs this via make test-lua-core.
 
 local count = 0
 local handles = {}
