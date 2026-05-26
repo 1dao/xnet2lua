@@ -44,7 +44,7 @@ OBJ_DIR := obj
 BIN_DIR := bin
 
 TARGET_LIB := lib$(LIB_NAME).a
-CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c
+CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c xframe_aead.c
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
 

@@ -22,6 +22,7 @@
 #include "xthread.h"
 #include "xtimer.h"
 #include "xlog.h"
+#include "xframe_aead.h"
 #include "lua_xnet_tls.h"
 
 #ifndef XNET_WITH_HTTPS
@@ -599,6 +600,8 @@ static int apply_framing(lua_State* L, LuaNetConn* c,
         cfg.frame = XCHANNEL_FRAME_RAW;
     } else if (strcmp(mode, "len32") == 0 || strcmp(mode, "len32be") == 0) {
         cfg.frame = XCHANNEL_FRAME_LEN32;
+    } else if (strcmp(mode, "len16") == 0 || strcmp(mode, "len16be") == 0) {
+        cfg.frame = XCHANNEL_FRAME_LEN16;
     } else if (strcmp(mode, "line") == 0 ||
                strcmp(mode, "crlf") == 0 ||
                strcmp(mode, "delimiter") == 0) {
@@ -672,6 +675,44 @@ static int l_conn_set_framing(lua_State* L) {
         }
     }
 
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+/* conn:enable_aead(send_key, recv_key)
+**   - send_key / recv_key: 32-byte Lua strings
+**   - replaces any prior transform on this channel
+** Returns the conn on success, raises on bad input or build without HTTPS. */
+static int l_conn_enable_aead(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    if (!c->ch || c->closed)
+        return luaL_error(L, "xnet.conn:enable_aead on closed connection");
+
+    size_t sk_len = 0, rk_len = 0;
+    const char* sk = luaL_checklstring(L, 2, &sk_len);
+    const char* rk = luaL_checklstring(L, 3, &rk_len);
+    if (sk_len != 32 || rk_len != 32)
+        return luaL_error(L, "enable_aead: keys must be 32 bytes (got send=%d recv=%d)",
+                           (int)sk_len, (int)rk_len);
+
+    xFrameAead* a = xframe_aead_create((const uint8_t*)sk, (const uint8_t*)rk);
+    if (!a)
+        return luaL_error(L, "enable_aead: xframe_aead_create failed (HTTPS build required)");
+
+    xchannel_set_transform(c->ch,
+                            xframe_aead_decrypt,
+                            xframe_aead_encrypt,
+                            a, xframe_aead_dtor);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+/* conn:disable_aead() — clear transforms; channel returns to plaintext. */
+static int l_conn_disable_aead(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    if (!c->ch || c->closed)
+        return luaL_error(L, "xnet.conn:disable_aead on closed connection");
+    xchannel_set_transform(c->ch, NULL, NULL, NULL, NULL);
     lua_pushvalue(L, 1);
     return 1;
 }
@@ -941,6 +982,8 @@ static const luaL_Reg conn_methods[] = {
     { "send_file_response", l_conn_send_file_response },
     { "set_handler", l_conn_set_handler },
     { "set_framing", l_conn_set_framing },
+    { "enable_aead", l_conn_enable_aead },
+    { "disable_aead", l_conn_disable_aead },
     { NULL, NULL }
 };
 
