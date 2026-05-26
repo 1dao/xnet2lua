@@ -64,10 +64,14 @@ else
 endif
 
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
-XNET_CFLAGS :=
+XNET_CFLAGS := -I3rd/libdeflate
 XNET_HTTPS_SRC :=
-XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c
-XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c
+XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) \
+                    3rd/libdeflate/lib/x86/cpu_features.c
+# Note: lib/arm/cpu_features.c shares a basename with x86's and would collide
+# under the flat $(OBJ_DIR)/%.o:%.c rule. Add a per-arch rule when ARM matters.
+XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
+XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c
 XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=

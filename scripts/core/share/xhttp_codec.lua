@@ -2,6 +2,7 @@
 
 local M = {}
 local xutils = require('xutils')
+local xcompress = require('xcompress')
 
 -- ============================================================================
 -- Status and Basic Helpers
@@ -242,6 +243,29 @@ function M.parse_request(data, start_pos, opts)
         return nil, nil, 'request too large'
     end
 
+    -- Optional: decompress the body in-place when Content-Encoding is one of
+    -- the formats we recognise. Capped by max_decompressed_size to guard
+    -- against zip-bomb-style payloads; default 16x the wire size when not set.
+    local content_encoding = nil
+    local raw_encoding = headers['content-encoding']
+    if opts.decompress and body ~= '' and raw_encoding then
+        local enc = M.lower(raw_encoding)
+        if enc == 'gzip' or enc == 'x-gzip' or enc == 'deflate' then
+            local max_dec = opts.max_decompressed_size
+                or (max_request_size > 0 and max_request_size)
+                or (16 * 1024 * 1024)
+            local plain, err = M.decompress_body(body, enc, max_dec)
+            if not plain then
+                return nil, nil, 'decompress: ' .. tostring(err)
+            end
+            content_encoding = enc
+            body = plain
+            -- Keep the original header value in the table so handlers can see
+            -- it, but null out content-length since the body length changed.
+            headers['content-length'] = tostring(#body)
+        end
+    end
+
     local path, query_string, query = M.parse_target(target)
     local connection = M.lower(headers['connection'])
     local keep_alive = version == 'HTTP/1.1'
@@ -261,6 +285,7 @@ function M.parse_request(data, start_pos, opts)
         headers = headers,
         header_list = header_list,
         body = body,
+        content_encoding = content_encoding,  -- nil unless we decompressed
         keep_alive = keep_alive,
         peer_ip = state and state.ip or nil,
         peer_port = state and state.port or nil,
@@ -433,6 +458,69 @@ local function read_file(path)
     return data
 end
 
+-- ============================================================================
+-- Content-Encoding (gzip / deflate)
+-- ============================================================================
+--
+-- HTTP semantics:
+--   Content-Encoding: gzip    -> gzip stream  (RFC 1952)
+--   Content-Encoding: deflate -> *zlib* stream (RFC 1950) per RFC 7230;
+--                                NOT raw deflate. This is the historical
+--                                browser/server gotcha. We treat HTTP
+--                                "deflate" as xcompress.zlib_*.
+
+-- Content-Type prefixes we won't re-compress (already compressed bytes).
+local DO_NOT_COMPRESS = {
+    'image/',
+    'video/',
+    'audio/',
+    'application/zip',
+    'application/gzip',
+    'application/x-gzip',
+    'application/x-7z-compressed',
+    'application/x-rar-compressed',
+    'application/octet-stream',
+}
+
+local function compressible_content_type(ct)
+    if not ct or ct == '' then return true end
+    local lc = M.lower(ct)
+    for i = 1, #DO_NOT_COMPRESS do
+        local p = DO_NOT_COMPRESS[i]
+        if lc:sub(1, #p) == p then return false end
+    end
+    return true
+end
+
+-- Pick the best response encoding from a client's Accept-Encoding header.
+-- Returns 'gzip' | 'deflate' | nil. Server preference: gzip > deflate.
+-- (q-values and 'identity;q=0' refusal aren't honoured -- if you need that,
+-- parse the header more carefully and pass an explicit choice in.)
+function M.select_encoding(accept_encoding)
+    if not accept_encoding or accept_encoding == '' then return nil end
+    local ae = M.lower(accept_encoding)
+    if ae:find('gzip', 1, true) then return 'gzip' end
+    if ae:find('deflate', 1, true) then return 'deflate' end
+    return nil
+end
+
+function M.compress_body(body, encoding, level)
+    if encoding == 'gzip' then return xcompress.gzip(body, level) end
+    if encoding == 'deflate' then return xcompress.zlib_compress(body, level) end
+    return nil, 'unknown encoding: ' .. tostring(encoding)
+end
+
+function M.decompress_body(body, encoding, max_size)
+    encoding = M.lower(encoding or '')
+    if encoding == 'gzip' or encoding == 'x-gzip' then
+        return xcompress.gunzip(body, max_size)
+    end
+    if encoding == 'deflate' then
+        return xcompress.zlib_decompress(body, max_size)
+    end
+    return nil, 'unsupported encoding: ' .. encoding
+end
+
 function M.normalize_response(req, resp, opts)
     opts = opts or {}
     if resp == nil then
@@ -476,10 +564,31 @@ function M.normalize_response(req, resp, opts)
     end
 
     if not file_path then
-        headers['Content-Length'] = tostring(#body)
         if body ~= '' and not headers['Content-Type'] then
             headers['Content-Type'] = 'text/plain; charset=utf-8'
         end
+
+        local compr = opts.compression
+        if compr and compr.enabled ~= false
+            and not headers['Content-Encoding']
+            and #body >= (compr.min_size or 256)
+            and compressible_content_type(headers['Content-Type']) then
+            local accept = req.headers and req.headers['accept-encoding']
+            local enc = M.select_encoding(accept)
+            if enc then
+                local cz = M.compress_body(body, enc, compr.level)
+                -- Only swap if compression actually shrinks the body. For very
+                -- small or random data, gzip headers + deflate framing can grow
+                -- it; in that case fall back to plain.
+                if cz and #cz < #body then
+                    body = cz
+                    headers['Content-Encoding'] = enc
+                    headers['Vary'] = headers['Vary'] or 'Accept-Encoding'
+                end
+            end
+        end
+
+        headers['Content-Length'] = tostring(#body)
     end
 
     return status, body, headers, file_path

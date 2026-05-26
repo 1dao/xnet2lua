@@ -50,6 +50,11 @@ end
 
 local function normalize_config(cfg)
     cfg = cfg or {}
+    local compr = cfg.compression or {}
+    local max_decompressed_size = tonumber(cfg.max_decompressed_size)
+    if max_decompressed_size and max_decompressed_size <= 0 then
+        max_decompressed_size = nil
+    end
     return {
         host = cfg.host or '127.0.0.1',
         port = tonumber(cfg.port) or 18080,
@@ -62,6 +67,11 @@ local function normalize_config(cfg)
         key_file = cfg.key_file or cfg.key or '',
         key_password = cfg.key_password or cfg.password or '',
         max_request_size = tonumber(cfg.max_request_size) or 16 * 1024 * 1024,
+        compress_enabled  = to_bool(compr.enabled, true),
+        compress_min_size = tonumber(compr.min_size) or 256,
+        compress_level    = tonumber(compr.level) or 6,
+        decompress_requests = to_bool(cfg.decompress_requests, true),
+        max_decompressed_size = max_decompressed_size,
         workers = build_workers(cfg),
     }
 end
@@ -123,7 +133,9 @@ function M.start(cfg)
 
         ok, err = xthread.post(id, 'xhttp_worker_start',
             conf.app_script, conf.max_request_size, conf.server_name,
-            conf.https, conf.cert_file, conf.key_file, conf.key_password)
+            conf.https, conf.cert_file, conf.key_file, conf.key_password,
+            conf.compress_enabled, conf.compress_min_size, conf.compress_level,
+            conf.decompress_requests, conf.max_decompressed_size)
         if not ok then
             shutdown_workers()
             return false, err

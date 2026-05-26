@@ -18,6 +18,7 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 8. HTTP Server  
 9. cmsgpack Module — MessagePack Serialization  
 10. xutils Module — Utility Functions  
+10A. xcompress Module — Compression and Checksums
 11. Configuration Files  
 12. Thread ID Constants  
 13. Complete Example: TCP Server  
@@ -53,7 +54,7 @@ xnet2lua is divided into four layers:
 - Each thread has an independent Lua State; threads are fully isolated
 - Inter-thread communication via POST (asynchronous) or RPC (synchronous; implemented with coroutines internally)
 - I/O multiplexing automatically selects epoll / kqueue / WSAPoll / poll depending on platform
-- Network framing protocols supported: raw, len32 (4-byte length prefix), CRLF
+- Network framing protocols supported: raw, len16 (2-byte length prefix, max 65535B), len32 (4-byte length prefix), CRLF
 - Third-party: mbedTLS / yyjson / minilua / libdeflate
 
 ---
@@ -448,7 +449,7 @@ router.register('add', function(a, b)
 end)
 
 router.register('do_lookup', function(key)
-    local ok, val = xthread.rpc(xthread.REDIS, 'xredis_call', 'GET', key)
+    local ok, val = xthread.rpc(xthread.REDIS, 'xredis_call', 1000, 'GET', key)
     return val                                    -- handler may yield freely
 end)
 
@@ -514,6 +515,74 @@ xthread.stop(0)
 xthread.stop(1)
 ```
 
+### 3.5 Timers: Prefer `xtimerx` in Application Modules
+
+`xtimer` is the low-level native per-thread timer binding. `scripts/core/share/xtimerx.lua` is its reload-safe application wrapper. A thread entry point still initializes its timer set once with `xtimer.init(capacity)`, but reloadable application modules should declare timers through `xtimerx`: it tracks declarations by module and timer name, resolves callbacks against the reloaded module, and lazily cleans stale timers on their next firing when they were not redeclared.
+
+Use `xtimer` directly for thread initialization, infrastructure code, test scripts, or code that intentionally manages timer handles.
+
+**Recommended for reloadable application modules: `xtimerx`:**
+
+```lua
+-- game/player_timer.lua; load this module with require("game.player_timer")
+local xtimerx = dofile("scripts/core/share/xtimerx.lua")
+local M = xtimerx("game.player_timer")
+
+function M:on_tick(timer)
+    print("tick")
+end
+
+M.timer_every("heartbeat", 1000, "on_tick")
+M.timer_once("flush_once", 5000, "on_tick")
+
+return M
+```
+
+On reload, clear cached callbacks before loading the new module version:
+
+```lua
+local xtimerx = dofile("scripts/core/share/xtimerx.lua")
+xtimerx.__reload()
+package.loaded["game.player_timer"] = nil
+require("game.player_timer")
+```
+
+If a module has ever declared timers through `xtimerx`, a later version that declares no timers must still execute `xtimerx("module.name")`, or explicitly call `xtimerx.cancel_module("module.name")`. Otherwise the wrapper does not advance that module's generation and cannot recognize removed declarations.
+
+| `xtimerx` API | Purpose |
+|---|---|
+| `M.timer_every(name, interval_ms, func_name, [repeat_num])` | Declare a periodic or finite timer; it repeats indefinitely by default |
+| `M.timer_once(name, interval_ms, func_name)` / `M.timer_delay(...)` | Declare a one-shot timer |
+| `M.timer_cancel(name)` | Cancel one timer declared by this module |
+| `xtimerx.__reload()` | Clear cached callback resolutions before reload |
+| `xtimerx.cancel(module_name, name)` / `xtimerx.cancel_module(module_name)` | Explicitly cancel a named timer or all timers for a module |
+| `xtimerx.__uninit()` / `xtimerx.dump()` | Clean up all wrapper timers or print diagnostic state |
+
+**Low-level API: direct `xtimer` use:**
+
+```lua
+local xtimer = require("xtimer")
+xtimer.init(64)
+
+local heartbeat = xtimer.add(1000, function(timer)
+    print("tick at", xtimer.now_ms())
+end, -1)                          -- -1 means repeat forever
+
+xtimer.delay(5000, function()
+    if heartbeat:active() then heartbeat:del() end
+end)
+```
+
+| `xtimer` API | Purpose |
+|---|---|
+| `xtimer.init([capacity])` / `xtimer.uninit()` | Initialize or release this thread's timer set |
+| `xtimer.add(interval_ms, callback, [repeat_num])` | Create a periodic or finite timer; `repeat_num=-1` repeats forever |
+| `xtimer.delay(interval_ms, callback)` | Create a one-shot timer |
+| `timer:active()` / `timer:del()` | Query or cancel a timer handle |
+| `xtimer.now_ms()` / `xtimer.now_us()` | Monotonic time suitable for deadlines and duration measurement |
+| `xtimer.day_ms()` / `xtimer.day_us()` / `xtimer.format([ms])` | Calendar time and formatted output |
+| `xtimer.update()` / `xtimer.last()` / `xtimer.show()` | Manual-driving/diagnostic APIs; ordinary thread scripts do not normally call `update()` |
+
 ---
 
 ## 4. xthread Module — Multithreading and Message Passing
@@ -575,7 +644,8 @@ end)
 
 ```
 -- Caller (must be in a coroutine)
-local ok, result1, result2 = xthread.rpc(target_id, pt, arg1, arg2, ...)
+-- timeout_ms: 0 disables a deadline; a positive value caps caller wait time.
+local ok, result1, result2 = xthread.rpc(target_id, pt, timeout_ms, arg1, arg2, ...)
 
 if ok then
     print("RPC succeeded, results:", result1, result2)
@@ -601,7 +671,7 @@ end)
 local function __init()
     -- Note: RPC must be invoked within a coroutine
     _test_co = coroutine.create(function()
-        local ok, sum = xthread.rpc(COMPUTE_ID, "add", 100, 200)
+        local ok, sum = xthread.rpc(COMPUTE_ID, "add", 1000, 100, 200)
         if ok then
             print("100 + 200 =", sum)  -- Output: 100 + 200 = 300
         end
@@ -719,6 +789,29 @@ logs.
   errors that cannot be attributed to a request can be posted to the main thread
   for centralized logging.
 
+### 4.9 Queue Backpressure and Thread Stats
+
+Thread message queues can be bounded and inspected, which allows a service to detect congestion or reject work deliberately:
+
+```lua
+-- Bound pending work for the target worker; post/rpc fail once it is full.
+assert(xthread.set_queue_max(WORKER_ID, 4096))
+
+local worker, err = xthread.stats(WORKER_ID)
+if worker then
+    print(worker.id, worker.name, worker.queue_depth, worker.queue_max)
+end
+
+for _, st in ipairs(xthread.all_stats()) do
+    if st.queue_depth > st.queue_max * 0.8 then
+        xthread.log_warn("queue near limit: %s %d/%d",
+            st.name, st.queue_depth, st.queue_max)
+    end
+end
+```
+
+`xthread.stats(id)` returns `{ id, name, queue_depth, queue_max }` for one thread, or `nil, err` when it is unavailable. `xthread.all_stats()` returns an array for every registered thread; `/api/stats` in `scripts/xadmin/xadmin_app.lua` builds its queue summary from this API.
+
 ---
 
 ## 5. xnet Module — Asynchronous Networking
@@ -738,6 +831,9 @@ xnet.uninit()
 
 -- Get the I/O backend name in use ("epoll" / "kqueue" / "wsapoll" / "poll")
 local backend = xnet.name()
+
+-- Only embedding/custom event loops poll manually; bin/xnet drives this automatically.
+local ready_count = xnet.poll(10) -- wait at most 10 ms
 ```
 
 ### 5.2 Create a TCP Listener
@@ -762,6 +858,8 @@ local listener, err = xnet.listen_fd(host, port, {
     end,
 })
 ```
+
+When accepted connections do not need to move to another thread, use `xnet.listen(host, port, handlers)` instead: it accepts in the current thread and invokes the same `on_connect` / `on_packet` / `on_close` handler set for each connection. Use `listen_fd` for the worker-handoff model.
 
 **Listener object methods:**
 ```
@@ -832,7 +930,12 @@ local ok = conn:send(data)          -- send data (frames according to framing)
 local ok = conn:send_raw(data)      -- raw send (no framing)
 local ok = conn:send_packet(data)   -- alias for send
 local ok = conn:send_file_response(header, path, offset, length)
-conn:set_framing(opts)
+conn:set_framing({
+    type = "len32",
+    max_packet = 16 * 1024 * 1024,
+    max_send = 8 * 1024 * 1024,
+    max_recv = 8 * 1024 * 1024,
+})
 local ip, port = conn:peer()
 local fd = conn:fd()
 local closed = conn:is_closed()
@@ -840,7 +943,49 @@ conn:close("reason")
 conn:set_handler(handlers)
 ```
 
-### 5.6 Directory Scanning (Static File Service)
+### 5.6 Runtime Stats
+
+`xnet.get_stats()` returns a lightweight snapshot for the current Lua/network thread:
+
+```lua
+local st = xnet.get_stats()
+print("fds", st.fd_count, "connections", st.conn_count)
+print("closed-connection bytes", st.bytes_sent, st.bytes_recv)
+print("timers", st.timer_count, "queue", st.queue_depth, st.queue_max)
+```
+
+| Field | Meaning |
+|---|---|
+| `fd_count` | File descriptors registered in the current poll loop |
+| `conn_count` | Active plain `xnet.connection` instances owned by this thread (excluding TLS wrappers) |
+| `bytes_sent` / `bytes_recv` | Accumulated bytes for closed plain `xnet.connection` instances in this thread |
+| `timer_count` | Active timers in this thread |
+| `queue_depth` / `queue_max` | Current message queue depth and configured limit |
+
+This is intended for lightweight diagnostics. Collect application-level metrics separately when you need active-connection bytes, HTTP latency, or status-code distributions.
+
+### 5.7 Random Bytes and Frame AEAD
+
+`xnet.random_bytes(n)` returns a binary string of `1..4096` bytes from the operating system RNG. Builds compiled with `WITH_HTTPS=1` can also install an AEAD transform on ordinary framed connections:
+
+```lua
+-- Each direction uses its own 32-byte key; assume these keys are configured securely.
+local send_key = configured_send_key
+local recv_key = configured_recv_key
+local my_salt = xnet.random_bytes(4)
+
+-- Exchange my_salt in the protocol handshake; peer_salt is the peer's 4-byte value.
+conn:set_framing({ type = "len32", max_packet = 1024 * 1024 })
+conn:enable_aead(send_key, recv_key, my_salt, peer_salt)
+conn:send("encrypted application packet")
+
+-- Use only when the protocol explicitly returns to plaintext.
+conn:disable_aead()
+```
+
+`conn:enable_aead(send_key, recv_key, send_salt, recv_salt)` requires two 32-byte keys and two 4-byte salts; a salt must never repeat for the same key and direction. It protects `xnet` frame payloads, but is not a replacement for TLS certificate verification or its standardized handshake.
+
+### 5.8 Directory Scanning (Static File Service)
 
 ```lua
 local files, err = xutils.scan_dir("static/")
@@ -855,7 +1000,7 @@ end
 
 ## 6. Frame Protocols (Packetization Strategy)
 
-TCP is a byte stream; you must define how to packetize at the application layer. xnet2lua provides three built-in framing modes, switchable after a connection is stablished.
+TCP is a byte stream; you must define how to packetize at the application layer. xnet2lua provides raw, len16, len32, and CRLF framing modes, switchable after a connection is established.
 
 ### 6.1 Raw Mode (Unframed)
 
@@ -901,7 +1046,30 @@ on_packet = function(conn, data)
 end
 ```
 
-### 6.3 CRLF Mode (Text Line Protocol)
+### 6.3 len16 Mode (Compact Binary Protocols)
+
+Identical to len32 but with a 2-byte big-endian length prefix. Each payload is therefore capped at 65 535 bytes, which fits typical game-server packet sizes while saving 2 bytes per frame on the wire. Suited to MMO scene packets, AOI broadcasts, and any custom protocol where small frames dominate.
+
+```lua
+conn:set_framing({
+    type = "len16",
+    max_packet = 65535,          -- absolute ceiling; smaller values still honored
+    max_send = 8 * 1024 * 1024, -- send fails once queued output reaches this cap
+    max_recv = 8 * 1024 * 1024, -- reads pause while buffered input exceeds this cap
+})
+
+-- Sender prepends the 2-byte BE length automatically
+conn:send(packet_bytes)
+
+-- on_packet receives a complete payload without the length header
+on_packet = function(conn, data)
+    -- data is plain payload bytes; protocol headers (opcode etc.) live inside
+end
+```
+
+If a transform pair is installed via `conn:enable_aead`, the AEAD seq/tag overhead (24 bytes) is included in the 65 535-byte ceiling — keep plaintext payloads at most `65535 - 24 - opcode_size` bytes when both LEN16 and AEAD are in use.
+
+### 6.4 CRLF Mode (Text Line Protocol)
 
 Use CRLF as line terminators for fragmentation; suitable for Redis-like and SMTP-style text protocols.
 
@@ -912,7 +1080,7 @@ conn:set_framing({
 })
 ```
 
-### 6.4 Custom Delimiter (CRLF Extension)
+### 6.5 Custom Delimiter (CRLF Extension)
 
 ```lua
 conn:set_framing({
@@ -922,7 +1090,7 @@ conn:set_framing({
 })
 ```
 
-### 6.5 len32 + MessagePack Combination (Best Practice)
+### 6.6 len32 + MessagePack Combination (Best Practice)
 
 This is the most common communication pattern in xnet2lua, combining high performance with structured data transfer:
 
@@ -1055,6 +1223,11 @@ local ok, err = xhttp.start({
 | worker_script | string | "scripts/core/server/xhttp_worker.lua" | Worker script path |
 | app_script | string | (required) | Application routing script path (for example "demo/xhttp_app.lua") |
 | max_request_size | number | 16MB | Maximum request body size (bytes) |
+| compression.enabled | bool | true | Compress suitable response bodies as gzip/deflate when accepted by the client |
+| compression.min_size | number | 256 | Do not compress responses smaller than this many bytes |
+| compression.level | number | 6 | `xcompress` level in the range `0..12` |
+| decompress_requests | bool | true | Decode `Content-Encoding: gzip/deflate` request bodies before dispatch |
+| max_decompressed_size | number | `max_request_size` | Maximum request size after decoding |
 
 ### 8.2 Writing the Application Router (app_script)
 
@@ -1127,7 +1300,8 @@ The req object for on_packet / handler contains:
 | req.path | string | Request path (excluding query string) |
 | req.query | table | URL query parameters (e.g., ?name=foo yields req.query.name) |
 | req.headers | table | Request headers (keys lowercased) |
-| req.body | string | Raw request body data |
+| req.body | string | Request body; decoded data when request decoding is enabled and a supported `Content-Encoding` was present |
+| req.content_encoding | string/nil | Encoding actually decoded by the framework (`gzip` / `deflate`), or nil |
 | req.version | string | HTTP version ("1.1" / "1.0") |
 
 ### 8.4 response Object Fields
@@ -1213,6 +1387,23 @@ local response = router.handle(req)
 -- Get Content-Type for a file
 local ct = router.content_type_for("index.html")  -- "text/html; charset=utf-8"
 ```
+
+### 8.6 HTTP Compression and Request Decoding
+
+By default, `xhttp` compresses suitable responses of at least 256 bytes when the client accepts `gzip` or `deflate`. A response with an existing `Content-Encoding`, a static-file response, or an already compressed media/archive content type is not automatically compressed again.
+
+```lua
+assert(xhttp.start({
+    port = 8080,
+    worker_name = "api-worker",
+    app_script = "my_app.lua",
+    compression = { enabled = true, min_size = 1024, level = 6 },
+    decompress_requests = true,
+    max_decompressed_size = 4 * 1024 * 1024,
+}))
+```
+
+When a client sends `Content-Encoding: gzip` or `deflate`, the handler reads the decoded bytes through `req.body` by default and can inspect `req.content_encoding` to see whether the framework decoded it. Use the `xcompress` module below when application code needs direct compressed-byte handling or checksums.
 
 ---
 
@@ -1303,6 +1494,51 @@ Encoding rules:
 - A table with contiguous positive integer keys `1..N` is encoded as a JSON array; sparse tables, mixed keys, and string-keyed tables are encoded as JSON objects.
 - There is no separate empty-array sentinel today; if an empty array is meaningful, make that part of your protocol contract.
 - `json_pack` and `json_unpack` reserve Lua C stack space for the maximum JSON nesting depth. Inputs that are too deep or unsupported should return `nil, err` instead of corrupting the Lua heap. JSON `null` round-trips through `xutils.json_null`.
+
+---
+
+## 10A. xcompress Module — Compression and Checksums
+
+`xcompress` is implemented with `libdeflate` and provides gzip, raw deflate, zlib-wrapped streams, and CRC-32 / Adler-32. HTTP `Content-Encoding: deflate` uses the zlib-wrapped form, i.e. `zlib_compress` / `zlib_decompress`.
+
+```lua
+local xcompress = require("xcompress")
+local text = string.rep("hello xnet\n", 100)
+
+local gzip = xcompress.gzip(text, 6)
+local plain, err = xcompress.gunzip(gzip, #text * 2)
+assert(plain == text, err)
+
+local zlib = xcompress.zlib_compress(text)
+assert(xcompress.zlib_decompress(zlib, #text * 2) == text)
+
+print(string.format("crc32=%08x adler32=%08x",
+    xcompress.crc32(text), xcompress.adler32(text)))
+```
+
+Reuse handles for repeated processing to avoid repeated allocations:
+
+```lua
+local c = xcompress.new_compressor(6)
+local d = xcompress.new_decompressor()
+local blob = c:gzip("payload")
+local value = assert(d:gzip(blob, 1024))
+c:set_level(9)
+c:close()
+d:close()
+```
+
+| API | Purpose |
+|---|---|
+| `xcompress.gzip(data, [level])` / `gunzip(data, max_out)` | One-shot gzip compression/decompression |
+| `xcompress.deflate(data, [level])` / `inflate(data, max_out)` | One-shot raw deflate compression/decompression |
+| `xcompress.zlib_compress(data, [level])` / `zlib_decompress(data, max_out)` | One-shot zlib-wrapped compression/decompression |
+| `xcompress.new_compressor([level])` | Reusable compressor with `gzip`, `deflate`, `zlib`, `level`, `set_level`, and `close` |
+| `xcompress.new_decompressor()` | Reusable decompressor with `gzip`, `deflate`, `zlib`, and `close` |
+| `xcompress.crc32(...)` / `crc32_update(current, ...)` | Compute or incrementally update CRC-32 |
+| `xcompress.adler32(...)` / `adler32_update(current, ...)` | Compute or incrementally update Adler-32 |
+
+The `max_out` argument on decompression APIs is a mandatory output bound. Use an explicit cap for external input to avoid unbounded memory growth from compressed data. Complete smoke examples live in `demo/xcompress_main.lua` and `demo/xhttp_compress_main.lua`.
 
 ---
 
@@ -1723,17 +1959,17 @@ local function run_tests()
     print("=== Start RPC tests ===")
  
     -- Test 1: Simple RPC call
-    local ok, result = xthread.rpc(COMPUTE_ID, "add", 100, 200)
+    local ok, result = xthread.rpc(COMPUTE_ID, "add", 1000, 100, 200)
     assert(ok and result == 300, "add test failed: " .. tostring(result))
     print("[TEST1 PASS] 100 + 200 =", result)
  
     -- Test 2: RPC with multiple returns
-    local ok, a, b = xthread.rpc(COMPUTE_ID, "divmod", 17, 5)
+    local ok, a, b = xthread.rpc(COMPUTE_ID, "divmod", 1000, 17, 5)
     assert(ok and a == 3 and b == 2, "divmod test failed")
     print("[TEST2 PASS] 17 ÷ 5 = quotient", a, "remainder", b)
  
     -- Test 3: RPC calling back to main thread
-    local ok, reversed = xthread.rpc(COMPUTE_ID, "process_and_callback", "hello")
+    local ok, reversed = xthread.rpc(COMPUTE_ID, "process_and_callback", 1000, "hello")
     assert(ok and reversed == "olleh", "callback test failed")
     print("[TEST3 PASS] process_and_callback returned:", reversed)
  
@@ -1807,7 +2043,7 @@ end)
 -- Provide process_and_callback service (RPC back to main thread)
 xthread.register("process_and_callback", function(s)
     -- RPC back to main thread's reverse_string
-    local ok, reversed = xthread.rpc(MAIN_ID, "reverse_string", s)
+    local ok, reversed = xthread.rpc(MAIN_ID, "reverse_string", 1000, s)
     if not ok then error("callback RPC failed: " .. tostring(reversed)) end
     return reversed
 end)
@@ -1857,7 +2093,7 @@ if not ok then
 end
 
 -- RPC error handling
-local ok, result = xthread.rpc(TARGET_ID, "compute", arg)
+local ok, result = xthread.rpc(TARGET_ID, "compute", 1000, arg)
 if not ok then
     io.stderr:write("RPC failed: " .. tostring(result) .. "\n")
 end

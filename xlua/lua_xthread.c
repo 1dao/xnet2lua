@@ -96,6 +96,7 @@ LUALIB_API int luaopen_xthread(lua_State* L);
 LUALIB_API int luaopen_xnet(lua_State* L);
 LUALIB_API int luaopen_xutils(lua_State* L);
 LUALIB_API int luaopen_xtimer(lua_State* L);
+LUALIB_API int luaopen_xcompress(lua_State* L);
 
 /* ============================================================================
 ** Registry keys (per lua_State)
@@ -1221,6 +1222,10 @@ static void lua_thread_on_init(xThread* thr) {
 
     /* Open per-thread timer module. */
     luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
+    lua_pop(L, 1);
+
+    /* Open compression module so HTTP / app code can require('xcompress'). */
+    luaL_requiref(L, "xcompress", luaopen_xcompress, 1);
     lua_pop(L, 1);
 
     xdebug_attach_state(L, xthread_get_id(thr), td->script_path);

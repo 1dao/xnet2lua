@@ -1,227 +1,176 @@
--- scripts/gate/main.lua -- gate skeleton
+-- scripts/gate/main.lua -- gate orchestrator (main thread).
 --
--- Two listeners:
---   - client port: clients (LEN16 framed, AEAD after salt handshake)
---                   wire body: [opcode:2BE][payload:N]
---   - internal port: game services (LEN16 framed, plaintext)
---                   wire body: [session_id:4BE][opcode:2BE][payload:N]
+-- Threading topology (mirrors the xhttp.lua / xadmin_main.lua model):
+--   main thread        : owns the two listen_fd's; forwards accepted sockets
+--                        to the workers via xthread.post(fd, ip, port).
+--                        Also hosts the NATS client (xthread.NATS) so that
+--                        xadmin can reach this process for hot-reload, etc.
+--   gate-client worker : owns ALL client connections (LEN16 + AEAD), the
+--                        session_id table, and the salt handshake.
+--   gate-game worker   : owns the single game connection (LEN16, plaintext).
 --
--- Gate is stateless about gameplay. It owns session_id <-> client_conn,
--- and forwards bytes in both directions. payload is opaque.
+-- Cross-thread message protocol (xthread.post payloads):
+--   main          -> client_worker : client_accept(fd, ip, port)
+--   main          -> game_worker   : game_accept(fd, ip, port)
+--   client_worker -> game_worker   : forward_to_game(sid, body)
+--                                    session_gone(sid)
+--   game_worker   -> client_worker : forward_to_client(sid, body)
+--                                    game_status(up)         -- backend up/down
 --
--- Client handshake (before AEAD turns on):
---   1. client -> gate : [send_salt:4]            (plain LEN16)
---   2. gate   -> client : [send_salt:4]          (plain LEN16)
---   Both then enable_aead with the swapped salts. With pre-shared static
---   keys this is what prevents nonce reuse across connections; once ECDH
---   lands these salts become redundant (derived keys are unique already).
+-- NATS responsibilities (handled in __init below):
+--   * Publish heartbeat 'xadmin_announce' so the admin console sees this
+--     process under its SERVER_NAME.
+--   * Publish 'gate_announce' so game services can discover and connect.
+--   * Reply gate address RPCs for game side when announce payload has no port.
+--   * Reachable for built-in @reload / @reload_thread RPCs via xrouter,
+--     which is wired up on main + both workers (__thread_handle = router.handle).
 --
--- v0 routing: a single game connection handles every non-zero opcode.
---
--- Run with:  ./bin/xnet scripts/gate/main.lua
+-- Run with:  ./bin/xnet scripts/gate/main.lua [SERVER_NAME=gate1]
 
-local CLIENT_HOST   = '127.0.0.1'
-local CLIENT_PORT   = 19180
-local INTERNAL_HOST = '127.0.0.1'
-local INTERNAL_PORT = 19181
+local xnats  = dofile('scripts/core/server/xnats.lua')
+local xutils = require('xutils')
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('GATE-MAIN')
 
--- Pre-shared AEAD keys for client<->gate. v0 placeholder until ECDH
--- handshake lands; replace with derived keys per session at that point.
-local K_C2S = string.rep('\1', 32)  -- client -> gate (gate's recv key)
-local K_S2C = string.rep('\2', 32)  -- gate   -> client (gate's send key)
+local CONFIG_FILE = 'xnet.cfg'
+local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
+if not ok_cfg then
+    xthread.log_info('[GATE-MAIN] config not loaded: %s (using defaults)', tostring(cfg_err))
+end
 
--- Client-facing LEN16 body includes AEAD seq/tag overhead after handshake.
-local CLIENT_MAX_BODY = 65535 - 24
+local SERVER_NAME  = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'gate1')
+local CLIENT_HOST  = xutils.get_config('GATE_CLIENT_HOST', '127.0.0.1')
+local CLIENT_PORT  = tonumber(xutils.get_config('GATE_CLIENT_PORT', '19180')) or 19180
+local INTERNAL_HOST = xutils.get_config('GATE_INTERNAL_HOST', '127.0.0.1')
+local INTERNAL_PORT = tonumber(xutils.get_config('GATE_INTERNAL_PORT', '19181')) or 19181
+local NATS_HOST    = xutils.get_config('NATS_HOST', '127.0.0.1')
+local NATS_PORT    = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
+local NATS_PREFIX  = xutils.get_config('NATS_PREFIX', 'xnet.test')
+local HEARTBEAT_MS = tonumber(xutils.get_config('GATE_HEARTBEAT_MS', '5000')) or 5000
+
+local MAIN_ID          = xthread.MAIN
+local CLIENT_WORKER_ID = xthread.WORKER_GRP1
+local GAME_WORKER_ID   = xthread.WORKER_GRP1 + 1
+
+local CLIENT_WORKER_SCRIPT = 'scripts/gate/client_worker.lua'
+local GAME_WORKER_SCRIPT   = 'scripts/gate/game_worker.lua'
+
+function xthread.register(pt, h) return router.register(pt, h) end
+
+xthread.register('gate_get_internal_addr', function()
+    return true, INTERNAL_HOST, INTERNAL_PORT
+end)
+
+-- Compatibility alias for callers using a shorter RPC point.
+xthread.register('gate_get_addr', function()
+    return true, INTERNAL_HOST, INTERNAL_PORT
+end)
+
+-- The broker rebroadcasts our own heartbeats back; register no-ops so they
+-- land somewhere on the main thread instead of logging "no handler".
+xthread.register('xadmin_announce', function(_name) end)
+xthread.register('gate_announce',   function(_name, _host, _port) end)
 
 local client_listener
 local game_listener
+local nats_running = false
 
--- session_id -> client_conn
-local sessions = {}
--- client_conn -> session_id (reverse for cleanup)
-local conn_to_sid = {}
--- client_conn -> { ready = bool, gate_salt = string } (handshake state)
-local conn_state = {}
-local next_sid = 1
-
--- single game conn for v0
-local game_conn = nil
-
-local function u16be(n)
-    return string.char(math.floor(n / 256) % 256, n % 256)
-end
-
-local function u32be(n)
-    return string.char(
-        math.floor(n / 16777216) % 256,
-        math.floor(n / 65536) % 256,
-        math.floor(n / 256) % 256,
-        n % 256)
-end
-
-local function r32be(s, i)
-    local b1, b2, b3, b4 = string.byte(s, i, i + 3)
-    return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
-end
-
--- =========================================================================
--- Client side: gate <- client
--- =========================================================================
-local client_handler = {}
-
-function client_handler.on_connect(conn, ip, port)
-    local sid = next_sid
-    next_sid = next_sid + 1
-    sessions[sid] = conn
-    conn_to_sid[conn] = sid
-    conn_state[conn] = { ready = false, gate_salt = xnet.random_bytes(4) }
-    conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
-    print(string.format('[GATE] client sid=%d connected from %s:%s (awaiting salt)',
-        sid, tostring(ip), tostring(port)))
-end
-
-function client_handler.on_packet(conn, body)
-    local sid = conn_to_sid[conn]
-    if not sid then return end
-    local st = conn_state[conn]
-    if not st then return end
-
-    if not st.ready then
-        -- Expect exactly 4 bytes: the client's send_salt.
-        if #body ~= 4 then
-            print(string.format('[GATE] sid=%d bad handshake length=%d, closing', sid, #body))
-            conn:close('bad_handshake')
-            return
-        end
-        local client_salt = body
-        -- Send our salt BEFORE turning AEAD on, so it goes out plain.
-        local ok, err = conn:send(st.gate_salt)
-        if not ok then
-            print(string.format('[GATE] sid=%d handshake reply failed: %s',
-                sid, tostring(err)))
-            conn:close('handshake_send_failed')
-            return
-        end
-        conn:enable_aead(K_S2C, K_C2S, st.gate_salt, client_salt)
-        st.ready = true
-        print(string.format('[GATE] sid=%d handshake done, AEAD on', sid))
-        return
-    end
-
-    if not game_conn then
-        -- No backend, so the request has nowhere to go. Closing here makes
-        -- the client's on_close handler fire immediately rather than
-        -- letting it sit on a doomed request.
-        print(string.format('[GATE] sid=%d closing: no game connected', sid))
-        conn:close('no_backend')
-        return
-    end
-    if #body < 2 then
-        print(string.format('[GATE] sid=%d short packet (%d bytes), dropping', sid, #body))
-        return
-    end
-    local out = u32be(sid) .. body
-    local ok, err = game_conn:send(out)
+local function start_nats()
+    -- Only the main thread joins as a NATS worker -- the gate workers don't
+    -- subscribe to broadcasts and don't issue cross-process RPCs, so fanning
+    -- announces to them just generates "no handler" log noise. Hot-reload
+    -- still reaches the workers because xrouter's @reload walks
+    -- xthread.all_stats() and posts @reload_thread to every live thread.
+    local ok, err = xnats.start({
+        host           = NATS_HOST,
+        port           = NATS_PORT,
+        name           = SERVER_NAME,
+        prefix         = NATS_PREFIX,
+        workers        = { MAIN_ID },
+        reconnect_ms   = 1000,
+        rpc_timeout_ms = 10000,
+    })
     if not ok then
-        print(string.format('[GATE] sid=%d forward to game failed: %s',
-            sid, tostring(err)))
-        conn:close('game_send_failed')
+        xthread.log_error('[GATE-MAIN] xnats.start failed: %s (hot-reload disabled)',
+            tostring(err))
+        return false
     end
+    nats_running = true
+
+    local function heartbeat()
+        xnats.publish('xadmin_announce', SERVER_NAME)
+        xnats.publish('gate_announce', SERVER_NAME, INTERNAL_HOST, INTERNAL_PORT)
+    end
+    heartbeat()
+    xtimer.add(HEARTBEAT_MS, heartbeat, -1)
+
+    xthread.log_system('[GATE-MAIN] nats=%s:%d prefix=%s name=%s heartbeat=%dms',
+        NATS_HOST, NATS_PORT, NATS_PREFIX, SERVER_NAME, HEARTBEAT_MS)
+    return true
 end
 
-function client_handler.on_close(conn, reason)
-    local sid = conn_to_sid[conn]
-    if not sid then return end
-    sessions[sid] = nil
-    conn_to_sid[conn] = nil
-    conn_state[conn] = nil
-    print(string.format('[GATE] client sid=%d closed: %s', sid, tostring(reason)))
-    -- Notify game so it can drop player state. session_gone opcode = 0xFFFE.
-    if game_conn then
-        local SESSION_GONE = 0xFFFE
-        local ok, err = game_conn:send(u32be(sid) .. u16be(SESSION_GONE))
-        if not ok then
-            print(string.format('[GATE] sid=%d session-gone notify failed: %s',
-                sid, tostring(err)))
-        end
-    end
-end
-
--- =========================================================================
--- Game side: gate <- game
--- =========================================================================
-local game_handler = {}
-
-function game_handler.on_connect(conn, ip, port)
-    if game_conn then
-        print(string.format('[GATE] already have a game; dropping new conn from %s:%s',
-            tostring(ip), tostring(port)))
-        conn:close('duplicate_game')
-        return
-    end
-    conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
-    game_conn = conn
-    print(string.format('[GATE] game connected from %s:%s', tostring(ip), tostring(port)))
-end
-
-function game_handler.on_packet(conn, body)
-    if conn ~= game_conn then return end
-    if #body < 6 then
-        print('[GATE] game packet too short, dropping')
-        return
-    end
-    local sid = r32be(body, 1)
-    local client = sessions[sid]
-    if not client then
-        -- client gone; silently drop (this is normal during disconnects)
-        return
-    end
-    -- strip the session_id prefix, forward [opcode:2B][payload] to client
-    local client_body = string.sub(body, 5)
-    if #client_body > CLIENT_MAX_BODY then
-        print(string.format('[GATE] sid=%d reply too large for encrypted client (%d > %d)',
-            sid, #client_body, CLIENT_MAX_BODY))
-        client:close('reply_too_large')
-        return
-    end
-    local ok, err = client:send(client_body)
-    if not ok then
-        print(string.format('[GATE] sid=%d forward to client failed: %s',
-            sid, tostring(err)))
-        client:close('client_send_failed')
-    end
-end
-
-function game_handler.on_close(conn, reason)
-    if conn == game_conn then
-        game_conn = nil
-        print('[GATE] game disconnected: ' .. tostring(reason))
-    end
-end
-
--- =========================================================================
--- lifecycle
--- =========================================================================
 local function __init()
-    print('[GATE] init')
+    xthread.log_system('[GATE-MAIN] init server=%s', SERVER_NAME)
     assert(xnet.init())
+    xtimer.init(32)
 
-    client_listener = assert(xnet.listen(CLIENT_HOST, CLIENT_PORT, client_handler))
-    print(string.format('[GATE] client listener %s:%d', CLIENT_HOST, CLIENT_PORT))
+    assert(xthread.create_thread(CLIENT_WORKER_ID, 'gate-client', CLIENT_WORKER_SCRIPT))
+    assert(xthread.create_thread(GAME_WORKER_ID,   'gate-game',   GAME_WORKER_SCRIPT))
 
-    game_listener = assert(xnet.listen(INTERNAL_HOST, INTERNAL_PORT, game_handler))
-    print(string.format('[GATE] internal listener %s:%d', INTERNAL_HOST, INTERNAL_PORT))
+    -- Tell each worker the other's thread id. Posted before listen_fd starts
+    -- so the first accepted fd never reaches a worker without a registered peer.
+    assert(xthread.post(CLIENT_WORKER_ID, 'gate_set_peer', GAME_WORKER_ID))
+    assert(xthread.post(GAME_WORKER_ID,   'gate_set_peer', CLIENT_WORKER_ID))
+
+    -- NATS is best-effort: if the broker is unreachable, gate still serves
+    -- traffic without hot-reload / admin RPC.
+    start_nats()
+
+    client_listener = assert(xnet.listen_fd(CLIENT_HOST, CLIENT_PORT, {
+        on_accept = function(_, fd, ip, port)
+            local ok, err = xthread.post(CLIENT_WORKER_ID, 'client_accept', fd, ip, port)
+            if not ok then
+                xthread.log_error('[GATE-MAIN] client post failed: %s', tostring(err))
+                return false
+            end
+            return true
+        end,
+        on_close = function(_, reason)
+            xthread.log_info('[GATE-MAIN] client listener closed: %s', tostring(reason))
+        end,
+    }))
+    xthread.log_system('[GATE-MAIN] client listener %s:%d -> thread %d',
+        CLIENT_HOST, CLIENT_PORT, CLIENT_WORKER_ID)
+
+    game_listener = assert(xnet.listen_fd(INTERNAL_HOST, INTERNAL_PORT, {
+        on_accept = function(_, fd, ip, port)
+            local ok, err = xthread.post(GAME_WORKER_ID, 'game_accept', fd, ip, port)
+            if not ok then
+                xthread.log_error('[GATE-MAIN] game post failed: %s', tostring(err))
+                return false
+            end
+            return true
+        end,
+        on_close = function(_, reason)
+            xthread.log_info('[GATE-MAIN] game listener closed: %s', tostring(reason))
+        end,
+    }))
+    xthread.log_system('[GATE-MAIN] internal listener %s:%d -> thread %d',
+        INTERNAL_HOST, INTERNAL_PORT, GAME_WORKER_ID)
 end
 
 local function __uninit()
     if client_listener then client_listener:close('uninit'); client_listener = nil end
     if game_listener   then game_listener:close('uninit');   game_listener   = nil end
-    for _, c in pairs(sessions) do c:close('uninit') end
-    sessions    = {}
-    conn_to_sid = {}
-    if game_conn then game_conn:close('uninit'); game_conn = nil end
+    if nats_running then xnats.stop(true); nats_running = false end
+    xthread.shutdown_thread(CLIENT_WORKER_ID)
+    xthread.shutdown_thread(GAME_WORKER_ID)
     xnet.uninit()
-    print('[GATE] uninit')
+    xthread.log_system('[GATE-MAIN] uninit')
 end
 
-return { __init = __init, __uninit = __uninit }
+return {
+    __init = __init,
+    __uninit = __uninit,
+    __thread_handle = router.handle,
+}

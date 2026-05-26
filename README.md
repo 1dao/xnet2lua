@@ -8,7 +8,7 @@ A small C networking runtime with an embedded Lua scripting layer. The C core ha
 - Per-thread Lua state with framework-managed worker threads (`xthread`).
 - Asynchronous messages (`xthread.post`) and synchronous RPC over coroutines (`xthread.rpc`).
 - Embedded Lua via `minilua` by default; LuaJIT optional via `LUA_BACKEND=luajit`.
-- Lua bindings: `xnet` (sockets / TLS), `xthread` (threads / RPC / logging), `xtimer` (timer wheel), `xutils` (JSON via yyjson, config, filesystem), `cmsgpack` (MessagePack), `xdebug` (optional VSCode debug adapter).
+- Lua bindings: `xnet` (sockets / TLS / runtime stats), `xthread` (threads / RPC / queue stats), `xtimer` (timer wheel), `xutils` (JSON via yyjson, config, filesystem), `xcompress` (gzip/deflate/checksums), `cmsgpack` (MessagePack), `xdebug` (optional VSCode debug adapter).
 - Lua share modules: `xhttp` (HTTP/1.x server with router), `xrouter` (unified POST/RPC dispatch), `xredis` / `xmysql` / `xnats` worker stacks, `xsession` (HTTP session helper).
 - Hot reload protocol, cross-process RPC over NATS, and an `xadmin` console for remote exec/reload.
 - In-tree regression tests with a CI matrix that covers both stripped and full-featured build flags.
@@ -71,7 +71,7 @@ Each is activated by a build flag and lives under `3rd/` as a submodule (or in-t
 | mbedTLS     | `WITH_HTTPS=1` (default on)   | TLS for `xnet.attach_tls` / HTTPS     | `3rd/mbedtls3/`    |
 | rpmalloc    | `WITH_RPMALLOC=1` (default on)| Per-thread allocator routed via `xmacro.h` | `3rd/rpmalloc/` |
 | yyjson      | always                        | JSON in `xutils.json_*`                | `3rd/yyjson.c`     |
-| libdeflate  | always                        | `Content-Encoding: gzip/deflate` in xhttp | `3rd/libdeflate/` |
+| libdeflate  | always                        | `xcompress` and `Content-Encoding: gzip/deflate` in xhttp | `3rd/libdeflate/` |
 | lpegrex     | optional, embed yourself      | PEG parser library                    | `3rd/lpegrex/`     |
 
 Fetch all submodules:
@@ -226,7 +226,9 @@ curl http://127.0.0.1:8080/hello?name=xnet2lua
 More entry points:
 
 - `demo/xhttp_main.lua` — HTTP server + client smoke test
+- `demo/xhttp_compress_main.lua` — HTTP response compression and request decompression smoke test
 - `demo/xnet_main.lua`  — raw TCP + `xsession` RPC
+- `demo/xcompress_main.lua` — `xcompress` gzip/deflate/zlib/checksum smoke test
 - `demo/xrouter_test.lua` / `demo/xhttp_router_test.lua` — router unit checks
 - `demo/xnats_main.lua` — cross-process RPC over NATS (needs a NATS server)
 
@@ -236,10 +238,11 @@ C-registered (auto-loaded via `luaL_requiref` in `xnet_main.c`; `require()` work
 
 | Module      | Purpose                                                            | Reference            |
 | ----------- | ------------------------------------------------------------------ | -------------------- |
-| `xthread`   | thread lifecycle, POST / RPC, log levels, optional debugger control | docs §4              |
-| `xnet`      | TCP listen / connect / attach, frame protocols, TLS                | docs §5–§7           |
-| `xtimer`    | hashed timer-wheel bindings                                        | docs §3 (overview)   |
-| `xutils`    | JSON (yyjson), config files, directory scan, base64/hex            | docs §10             |
+| `xthread`   | thread lifecycle, POST / RPC, queue stats, log levels, optional debugger control | docs §4              |
+| `xnet`      | TCP listen / connect / attach, frame protocols, TLS, stats, AEAD   | docs §5–§7           |
+| `xtimer`    | low-level hashed timer-wheel bindings                              | docs §3.5            |
+| `xutils`    | JSON (yyjson), config files, directory scan                        | docs §10             |
+| `xcompress` | gzip / deflate / zlib compression and checksums                    | docs §10A            |
 | `cmsgpack`  | MessagePack encode / decode                                        | docs §9              |
 
 Pure-Lua, loaded via `dofile`:
@@ -250,7 +253,7 @@ Pure-Lua, loaded via `dofile`:
 | `scripts/core/share/xhttp_router.lua`             | HTTP path/method router with path params      | docs §8.5   |
 | `scripts/core/share/xhttp_codec.lua`              | HTTP request/response parsing                 | docs §8     |
 | `scripts/core/share/xsession.lua`                 | request/reply session helper over raw `xnet`  | docs §5     |
-| `scripts/core/share/xtimerx.lua`                  | higher-level timer scheduling on top of xtimer | docs §3    |
+| `scripts/core/share/xtimerx.lua`                  | reload-safe application timers on top of xtimer | docs §3.5  |
 | `scripts/core/server/xhttp.lua` + `xhttp_worker.lua` | HTTP/HTTPS server boot + worker pool       | docs §8     |
 | `scripts/core/server/xredis*.lua`                 | Redis client thread                            | docs (examples) |
 | `scripts/core/server/xmysql*.lua`                 | MySQL client thread                            | docs (examples) |
@@ -281,7 +284,10 @@ Task-oriented index:
 | Write a TCP server with framing                      | docs §5, §6 + complete example §13     |
 | Add TLS to a listener                                | docs §7                                |
 | Build an HTTP/HTTPS API service                      | docs §8 + complete example §14         |
-| Do cross-thread RPC                                  | docs §4.5 + complete example §15       |
+| Configure HTTP compression or use `xcompress`        | docs §8.6, §10A                        |
+| Schedule reload-safe application timers              | docs §3.5                              |
+| Do cross-thread RPC and inspect queue pressure       | docs §4.5, §4.9 + complete example §15 |
+| Inspect per-thread network runtime statistics        | docs §5.6                              |
 | Do cross-process RPC over NATS                       | docs §18                               |
 | Make a module hot-reload safe                        | docs §19                               |
 | Debug Lua from VSCode                                | docs §20                               |

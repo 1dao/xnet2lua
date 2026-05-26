@@ -407,6 +407,7 @@ static void listener_accept_cb(SOCKET_T fd, int mask,
         }
 
         LuaNetConn* c = push_conn(L, ch, s->handler_ref, ip, port);
+        g_conn_count++;
         lua_conn_connect_cb(ch, c);
         if (!c->closed && c->ch && xchannel_attach(c->ch) != 0) {
             xchannel_close(c->ch, "poll_error");

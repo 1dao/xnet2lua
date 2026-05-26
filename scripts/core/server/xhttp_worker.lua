@@ -21,6 +21,17 @@ local use_https = false
 local tls_config = nil
 local connections = {}
 
+-- Compression knobs. Response compression is on by default with a 256-byte
+-- floor (smaller bodies aren't worth the headers). Request decompression is
+-- also on so handlers see plain bytes regardless of Content-Encoding.
+local compression_opts = {
+    enabled  = true,
+    min_size = 256,
+    level    = 6,
+}
+local decompress_requests = true
+local max_decompressed_size = nil   -- nil -> codec uses max_request_size
+
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local function load_app(path)
@@ -87,15 +98,20 @@ local app_router = {
 local server_handler = xsession.make({
     parse_packet = function(data, pos, _, cstate)
         return codec.parse_request(data, pos, {
-            max_request_size = max_request_size,
-            state = cstate,
+            max_request_size      = max_request_size,
+            state                 = cstate,
+            decompress            = decompress_requests,
+            max_decompressed_size = max_decompressed_size,
         })
     end,
 
     classify = function(_) return 'rpc' end,
 
     send_response = function(conn, req, resp)
-        codec.send_response(conn, req, resp, { server_name = server_name })
+        codec.send_response(conn, req, resp, {
+            server_name = server_name,
+            compression = compression_opts,
+        })
     end,
 
     on_parse_error = function(conn, err)
@@ -127,7 +143,9 @@ local server_handler = xsession.make({
 })
 
 xthread.register('xhttp_worker_start', function(script_path, max_size, name,
-                                               https, cert_file, key_file, key_password)
+                                               https, cert_file, key_file, key_password,
+                                               compr_enabled, compr_min_size, compr_level,
+                                               req_decompress, max_decompressed)
     max_request_size = tonumber(max_size) or max_request_size
     server_name = name or server_name
     use_https = https and true or false
@@ -141,9 +159,18 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
     else
         tls_config = nil
     end
+
+    if compr_enabled ~= nil then compression_opts.enabled = compr_enabled and true or false end
+    if compr_min_size then compression_opts.min_size = tonumber(compr_min_size) or compression_opts.min_size end
+    if compr_level then compression_opts.level = tonumber(compr_level) or compression_opts.level end
+    if req_decompress ~= nil then decompress_requests = req_decompress and true or false end
+    if max_decompressed then max_decompressed_size = tonumber(max_decompressed) end
+
     load_app(script_path)
-    print(string.format('[XHTTP-WORKER] start scheme=%s app=%s max_request=%d',
-        use_https and 'https' or 'http', tostring(script_path), max_request_size))
+    print(string.format('[XHTTP-WORKER] start scheme=%s app=%s max_request=%d compress=%s/%d/L%d',
+        use_https and 'https' or 'http', tostring(script_path), max_request_size,
+        compression_opts.enabled and 'on' or 'off',
+        compression_opts.min_size, compression_opts.level))
 end)
 
 xthread.register('xhttp_accept', function(fd, ip, port)

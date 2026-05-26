@@ -122,7 +122,7 @@ set "UNIT_EXE=%BIN_DIR%\test_core.exe"
 
 set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
-set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c 3rd\yyjson.c xframe_aead.c"
+set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c 3rd\yyjson.c xframe_aead.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
@@ -139,7 +139,7 @@ if "%WITH_RPMALLOC%"=="1" (
 ) else (
     set "DEFS=%DEFS% /DXMACRO_USE_RPMALLOC=0"
 )
-set "INCS=/I."
+set "INCS=/I. /I3rd\libdeflate"
 if "%WITH_HTTPS%"=="1" (
     set "INCS=%INCS% /I3rd\mbedtls3\include"
 )
@@ -218,6 +218,12 @@ if "%WITH_HTTPS%"=="1" (
     )
 )
 
+set "DEFLATE_OBJECTS="
+for %%F in ("3rd\libdeflate\lib\*.c") do (
+    set "DEFLATE_OBJECTS=!DEFLATE_OBJECTS! %OBJDIR%\libdeflate\%%~nF.obj"
+)
+set "DEFLATE_OBJECTS=!DEFLATE_OBJECTS! %OBJDIR%\libdeflate\cpu_features_x86.obj"
+
 if /I "%TARGET%"=="clean" (
     if exist "%OBJDIR%" (
         echo %GREEN%[INFO]%RESET% Cleaning %OBJDIR%...
@@ -294,6 +300,7 @@ if /I "%TARGET%"=="run-lua" (
 if exist "%OBJDIR%" rmdir /S /Q "%OBJDIR%"
 mkdir "%OBJDIR%"
 if "%WITH_HTTPS%"=="1" mkdir "%OBJDIR%\mbedtls"
+mkdir "%OBJDIR%\libdeflate"
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
 if "%NEED_BUILD_XNET%"=="1" (
@@ -329,12 +336,28 @@ if "%NEED_BUILD_XNET%"=="1" (
         )
     )
 
+    echo %GREEN%[INFO]%RESET% Compiling libdeflate sources...
+    for %%F in ("3rd\libdeflate\lib\*.c") do (
+        echo %GREEN%[INFO]%RESET% cl %%~nxF
+        cl %CFLAGS% /c "%%~F" /Fo"%OBJDIR%\libdeflate\%%~nF.obj"
+        if errorlevel 1 (
+            echo %RED%[ERROR]%RESET% Failed to compile %%F
+            exit /b 1
+        )
+    )
+    echo %GREEN%[INFO]%RESET% cl libdeflate\lib\x86\cpu_features.c
+    cl %CFLAGS% /c "3rd\libdeflate\lib\x86\cpu_features.c" /Fo"%OBJDIR%\libdeflate\cpu_features_x86.obj"
+    if errorlevel 1 (
+        echo %RED%[ERROR]%RESET% Failed to compile libdeflate cpu_features x86
+        exit /b 1
+    )
+
     set "XNET_LIBS=ws2_32.lib bcrypt.lib"
     if "%WITH_RPMALLOC%"=="1" set "XNET_LIBS=!XNET_LIBS! Advapi32.lib"
     if defined XNET_LUA_LIB set "XNET_LIBS=!XNET_LIBS! !XNET_LUA_LIB!"
 
     echo %GREEN%[INFO]%RESET% Linking %XNET_EXE%...
-    link /nologo %LDFLAGS% /OUT:%XNET_EXE% %COMMON_OBJECTS% %XNET_OBJECTS% %MBEDTLS_OBJECTS% !XNET_LIBS!
+    link /nologo %LDFLAGS% /OUT:%XNET_EXE% %COMMON_OBJECTS% %XNET_OBJECTS% %MBEDTLS_OBJECTS% !DEFLATE_OBJECTS! !XNET_LIBS!
     if errorlevel 1 (
         echo %RED%[ERROR]%RESET% Link failed for %XNET_EXE%
         exit /b 1

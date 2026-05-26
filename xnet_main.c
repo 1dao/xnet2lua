@@ -79,6 +79,7 @@ LUA_API int luaopen_xthread(lua_State *L);
 LUA_API int luaopen_xnet(lua_State *L);
 LUA_API int luaopen_xutils(lua_State *L);
 LUA_API int luaopen_xtimer(lua_State *L);
+LUA_API int luaopen_xcompress(lua_State *L);
 
 typedef struct {
     lua_State* L;
@@ -198,6 +199,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xcompress", luaopen_xcompress, 1);
     lua_pop(L, 1);
 }
 
