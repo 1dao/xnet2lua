@@ -44,7 +44,7 @@ OBJ_DIR := obj
 BIN_DIR := bin
 
 TARGET_LIB := lib$(LIB_NAME).a
-CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c xframe_aead.c
+CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
 
@@ -56,7 +56,7 @@ MV := mv -f
 
 ifeq ($(OS),Windows_NT)
 	EXE_EXT := .exe
-	SYS_LDFLAGS += -lws2_32 -ladvapi32
+	SYS_LDFLAGS += -lws2_32 -ladvapi32 -lbcrypt
 	RM := /usr/bin/rm -rf
 	MV := /usr/bin/mv -f
 else
@@ -66,7 +66,7 @@ endif
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
 XNET_CFLAGS :=
 XNET_HTTPS_SRC :=
-XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c
+XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c
 XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c
 XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
@@ -114,9 +114,6 @@ endif
 ifeq ($(WITH_HTTPS),1)
 	XNET_CFLAGS += -I3rd/mbedtls3/include
 	XNET_HTTPS_SRC := $(wildcard 3rd/mbedtls3/library/*.c)
-ifeq ($(OS),Windows_NT)
-	SYS_LDFLAGS += -lbcrypt
-endif
 endif
 
 XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c

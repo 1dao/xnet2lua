@@ -13,6 +13,7 @@ local GATE_HOST = '127.0.0.1'
 local GATE_PORT = 19181
 
 local RECONNECT_MS = 2000
+local INTERNAL_MAX_PAYLOAD = 65535 - 4 - 2
 
 local gate_conn
 local reconnect_timer
@@ -44,7 +45,12 @@ end
 
 local function send_to_client(sid, opcode, payload)
     if not gate_conn then return false end
-    return gate_conn:send(u32be(sid) .. u16be(opcode) .. (payload or ''))
+    payload = payload or ''
+    if #payload > INTERNAL_MAX_PAYLOAD then
+        return false, string.format('payload too large (%d > %d)',
+            #payload, INTERNAL_MAX_PAYLOAD)
+    end
+    return gate_conn:send(u32be(sid) .. u16be(opcode) .. payload)
 end
 
 -- =========================================================================
@@ -96,7 +102,13 @@ function gate_handler.on_packet(_, body)
         return
     end
     local rop, rpl = h(sid, payload)
-    if rop then send_to_client(sid, rop, rpl) end
+    if rop then
+        local ok, err = send_to_client(sid, rop, rpl)
+        if not ok then
+            print(string.format('[GAME] sid=%d send reply failed: %s',
+                sid, tostring(err)))
+        end
+    end
 end
 
 local function start_reconnect_timer()

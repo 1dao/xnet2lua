@@ -25,6 +25,15 @@
 #include "xframe_aead.h"
 #include "lua_xnet_tls.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <bcrypt.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#endif
+
 #ifndef XNET_WITH_HTTPS
 #define XNET_WITH_HTTPS 0
 #endif
@@ -679,23 +688,69 @@ static int l_conn_set_framing(lua_State* L) {
     return 1;
 }
 
-/* conn:enable_aead(send_key, recv_key)
-**   - send_key / recv_key: 32-byte Lua strings
-**   - replaces any prior transform on this channel
-** Returns the conn on success, raises on bad input or build without HTTPS. */
+/* Fill `out` with `n` cryptographically random bytes from the OS RNG.
+** Returns 0 on success, negative on failure. */
+static int xnet_os_random(unsigned char* out, size_t n) {
+    if (n == 0) return 0;
+#ifdef _WIN32
+    NTSTATUS rc = BCryptGenRandom(NULL, (PUCHAR)out, (ULONG)n,
+                                   BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    return rc == 0 ? 0 : -1;
+#else
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    size_t off = 0;
+    while (off < n) {
+        ssize_t r = read(fd, out + off, n - off);
+        if (r > 0) { off += (size_t)r; continue; }
+        if (r < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+#endif
+}
+
+/* xnet.random_bytes(n) -> n-byte Lua string of OS random bytes. */
+static int l_xnet_random_bytes(lua_State* L) {
+    lua_Integer n = luaL_checkinteger(L, 1);
+    if (n <= 0 || n > 4096)
+        return luaL_error(L, "random_bytes: n must be 1..4096 (got %d)", (int)n);
+    unsigned char buf[4096];
+    if (xnet_os_random(buf, (size_t)n) != 0)
+        return luaL_error(L, "random_bytes: OS RNG failed");
+    lua_pushlstring(L, (const char*)buf, (size_t)n);
+    return 1;
+}
+
+/* conn:enable_aead(send_key, recv_key, send_salt, recv_salt)
+**   - send_key / recv_key: 32-byte Lua strings (one per direction)
+**   - send_salt / recv_salt: 4-byte Lua strings (nonce prefixes)
+** send_salt becomes the nonce prefix on every packet this side encrypts;
+** recv_salt is the peer's send_salt, used to rebuild nonces on decrypt.
+** Salts must be unique per (key, direction) across the program lifetime --
+** with static keys, generate them via xnet.random_bytes(4) and swap with
+** the peer in the clear before this call. */
 static int l_conn_enable_aead(lua_State* L) {
     LuaNetConn* c = check_conn(L, 1);
     if (!c->ch || c->closed)
         return luaL_error(L, "xnet.conn:enable_aead on closed connection");
 
-    size_t sk_len = 0, rk_len = 0;
+    size_t sk_len = 0, rk_len = 0, ss_len = 0, rs_len = 0;
     const char* sk = luaL_checklstring(L, 2, &sk_len);
     const char* rk = luaL_checklstring(L, 3, &rk_len);
+    const char* ss = luaL_checklstring(L, 4, &ss_len);
+    const char* rs = luaL_checklstring(L, 5, &rs_len);
     if (sk_len != 32 || rk_len != 32)
         return luaL_error(L, "enable_aead: keys must be 32 bytes (got send=%d recv=%d)",
                            (int)sk_len, (int)rk_len);
+    if (ss_len != 4 || rs_len != 4)
+        return luaL_error(L, "enable_aead: salts must be 4 bytes (got send=%d recv=%d)",
+                           (int)ss_len, (int)rs_len);
 
-    xFrameAead* a = xframe_aead_create((const uint8_t*)sk, (const uint8_t*)rk);
+    xFrameAead* a = xframe_aead_create((const uint8_t*)sk, (const uint8_t*)rk,
+                                        (const uint8_t*)ss, (const uint8_t*)rs);
     if (!a)
         return luaL_error(L, "enable_aead: xframe_aead_create failed (HTTPS build required)");
 
@@ -1004,6 +1059,7 @@ static const luaL_Reg xnet_funcs[] = {
     { "connect", l_xnet_connect },
     { "attach",  l_xnet_attach },
     { "connect_fd", l_xnet_attach },
+    { "random_bytes", l_xnet_random_bytes },
 #if XNET_WITH_HTTPS
     { "attach_tls", l_xnet_attach_tls },
 #endif

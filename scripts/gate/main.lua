@@ -1,16 +1,22 @@
--- scripts/gate/main.lua -- gate skeleton (no crypto)
+-- scripts/gate/main.lua -- gate skeleton
 --
 -- Two listeners:
---   - client port: accepts game clients (LEN16 framed)
+--   - client port: clients (LEN16 framed, AEAD after salt handshake)
 --                   wire body: [opcode:2BE][payload:N]
---   - internal port: accepts game services (LEN16 framed)
+--   - internal port: game services (LEN16 framed, plaintext)
 --                   wire body: [session_id:4BE][opcode:2BE][payload:N]
 --
 -- Gate is stateless about gameplay. It owns session_id <-> client_conn,
 -- and forwards bytes in both directions. payload is opaque.
 --
+-- Client handshake (before AEAD turns on):
+--   1. client -> gate : [send_salt:4]            (plain LEN16)
+--   2. gate   -> client : [send_salt:4]          (plain LEN16)
+--   Both then enable_aead with the swapped salts. With pre-shared static
+--   keys this is what prevents nonce reuse across connections; once ECDH
+--   lands these salts become redundant (derived keys are unique already).
+--
 -- v0 routing: a single game connection handles every non-zero opcode.
--- Adds multi-game routing later by reading opcode-range tables.
 --
 -- Run with:  ./bin/xnet scripts/gate/main.lua
 
@@ -24,6 +30,9 @@ local INTERNAL_PORT = 19181
 local K_C2S = string.rep('\1', 32)  -- client -> gate (gate's recv key)
 local K_S2C = string.rep('\2', 32)  -- gate   -> client (gate's send key)
 
+-- Client-facing LEN16 body includes AEAD seq/tag overhead after handshake.
+local CLIENT_MAX_BODY = 65535 - 24
+
 local client_listener
 local game_listener
 
@@ -31,6 +40,8 @@ local game_listener
 local sessions = {}
 -- client_conn -> session_id (reverse for cleanup)
 local conn_to_sid = {}
+-- client_conn -> { ready = bool, gate_salt = string } (handshake state)
+local conn_state = {}
 local next_sid = 1
 
 -- single game conn for v0
@@ -63,27 +74,59 @@ function client_handler.on_connect(conn, ip, port)
     next_sid = next_sid + 1
     sessions[sid] = conn
     conn_to_sid[conn] = sid
+    conn_state[conn] = { ready = false, gate_salt = xnet.random_bytes(4) }
     conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
-    conn:enable_aead(K_S2C, K_C2S)  -- send=S2C, recv=C2S
-    print(string.format('[GATE] client sid=%d connected from %s:%s (AEAD on)',
+    print(string.format('[GATE] client sid=%d connected from %s:%s (awaiting salt)',
         sid, tostring(ip), tostring(port)))
 end
 
 function client_handler.on_packet(conn, body)
     local sid = conn_to_sid[conn]
-    if not sid then return end  -- not registered yet
+    if not sid then return end
+    local st = conn_state[conn]
+    if not st then return end
+
+    if not st.ready then
+        -- Expect exactly 4 bytes: the client's send_salt.
+        if #body ~= 4 then
+            print(string.format('[GATE] sid=%d bad handshake length=%d, closing', sid, #body))
+            conn:close('bad_handshake')
+            return
+        end
+        local client_salt = body
+        -- Send our salt BEFORE turning AEAD on, so it goes out plain.
+        local ok, err = conn:send(st.gate_salt)
+        if not ok then
+            print(string.format('[GATE] sid=%d handshake reply failed: %s',
+                sid, tostring(err)))
+            conn:close('handshake_send_failed')
+            return
+        end
+        conn:enable_aead(K_S2C, K_C2S, st.gate_salt, client_salt)
+        st.ready = true
+        print(string.format('[GATE] sid=%d handshake done, AEAD on', sid))
+        return
+    end
+
     if not game_conn then
-        -- no backend, drop and log
-        print(string.format('[GATE] sid=%d packet dropped: no game connected', sid))
+        -- No backend, so the request has nowhere to go. Closing here makes
+        -- the client's on_close handler fire immediately rather than
+        -- letting it sit on a doomed request.
+        print(string.format('[GATE] sid=%d closing: no game connected', sid))
+        conn:close('no_backend')
         return
     end
     if #body < 2 then
         print(string.format('[GATE] sid=%d short packet (%d bytes), dropping', sid, #body))
         return
     end
-    -- prepend session_id (4B) to the [opcode:2B][payload] frame
     local out = u32be(sid) .. body
-    game_conn:send(out)
+    local ok, err = game_conn:send(out)
+    if not ok then
+        print(string.format('[GATE] sid=%d forward to game failed: %s',
+            sid, tostring(err)))
+        conn:close('game_send_failed')
+    end
 end
 
 function client_handler.on_close(conn, reason)
@@ -91,11 +134,16 @@ function client_handler.on_close(conn, reason)
     if not sid then return end
     sessions[sid] = nil
     conn_to_sid[conn] = nil
+    conn_state[conn] = nil
     print(string.format('[GATE] client sid=%d closed: %s', sid, tostring(reason)))
     -- Notify game so it can drop player state. session_gone opcode = 0xFFFE.
     if game_conn then
         local SESSION_GONE = 0xFFFE
-        game_conn:send(u32be(sid) .. u16be(SESSION_GONE))
+        local ok, err = game_conn:send(u32be(sid) .. u16be(SESSION_GONE))
+        if not ok then
+            print(string.format('[GATE] sid=%d session-gone notify failed: %s',
+                sid, tostring(err)))
+        end
     end
 end
 
@@ -129,7 +177,19 @@ function game_handler.on_packet(conn, body)
         return
     end
     -- strip the session_id prefix, forward [opcode:2B][payload] to client
-    client:send(string.sub(body, 5))
+    local client_body = string.sub(body, 5)
+    if #client_body > CLIENT_MAX_BODY then
+        print(string.format('[GATE] sid=%d reply too large for encrypted client (%d > %d)',
+            sid, #client_body, CLIENT_MAX_BODY))
+        client:close('reply_too_large')
+        return
+    end
+    local ok, err = client:send(client_body)
+    if not ok then
+        print(string.format('[GATE] sid=%d forward to client failed: %s',
+            sid, tostring(err)))
+        client:close('client_send_failed')
+    end
 end
 
 function game_handler.on_close(conn, reason)

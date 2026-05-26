@@ -120,9 +120,9 @@ set "XNET_EXE=%BIN_DIR%\xnet.exe"
 set "THREAD_EXE=%BIN_DIR%\xthread_test.exe"
 set "UNIT_EXE=%BIN_DIR%\test_core.exe"
 
-set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c xframe_aead.c"
+set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
-set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c 3rd\yyjson.c"
+set "XNET_SOURCES=xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c 3rd\yyjson.c xframe_aead.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
@@ -329,9 +329,8 @@ if "%NEED_BUILD_XNET%"=="1" (
         )
     )
 
-    set "XNET_LIBS=ws2_32.lib"
+    set "XNET_LIBS=ws2_32.lib bcrypt.lib"
     if "%WITH_RPMALLOC%"=="1" set "XNET_LIBS=!XNET_LIBS! Advapi32.lib"
-    if "%WITH_HTTPS%"=="1" set "XNET_LIBS=!XNET_LIBS! bcrypt.lib"
     if defined XNET_LUA_LIB set "XNET_LIBS=!XNET_LIBS! !XNET_LUA_LIB!"
 
     echo %GREEN%[INFO]%RESET% Linking %XNET_EXE%...
