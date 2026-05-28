@@ -1,353 +1,224 @@
--- scripts/game/main.lua -- game service skeleton (no crypto)
+-- scripts/game/main.lua -- affinity game orchestrator.
 --
--- Connect strategy:
---   1) Prefer NATS-discovered gate nodes (gate_announce).
---   2) If announce lacks host/port, query the gate over NATS RPC.
---   3) Fallback to static GAME_GATE_HOST/GAME_GATE_PORT.
+-- Battle lanes match gate lanes one-for-one. Battle traffic remains on that
+-- lane; non-battle traffic is posted to the owning work worker. NATS is used
+-- for process discovery and game-to-game messages, not the hot data path.
 --
--- All packets to/from gate carry a session_id prefix:
---   [session_id:4BE][opcode:2BE][payload:N]
---
--- Run with:  ./bin/xnet scripts/game/main.lua
-
-local router = dofile('scripts/core/share/xrouter.lua')
-router.set_log_prefix('GAME-MAIN')
+-- Run with: ./bin/xnet scripts/game/main.lua SERVER_NAME=game1
 
 local xnats = dofile('scripts/core/server/xnats.lua')
 local xutils = require('xutils')
+local router = dofile('scripts/core/share/xrouter.lua')
+router.set_log_prefix('GAME-MAIN')
 
-local CONFIG_FILE = 'xnet.cfg'
-local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config('xnet.cfg')
 if not ok_cfg then
-    io.stderr:write('[GAME] config not loaded: ' .. tostring(cfg_err) .. '\n')
+    xthread.log_info('[GAME-MAIN] config not loaded: %s (using defaults)', tostring(cfg_err))
 end
 
 local PROCESS_NAME = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'game1')
 local GATE_TARGET = xutils.get_config('GAME_GATE_TARGET', '')
 local GATE_HOST = xutils.get_config('GAME_GATE_HOST', '127.0.0.1')
 local GATE_PORT = tonumber(xutils.get_config('GAME_GATE_PORT', '19181')) or 19181
-local GATE_PEER_TTL_MS = tonumber(xutils.get_config('GAME_GATE_PEER_TTL_MS', '15000')) or 15000
-
+local BATTLE_COUNT = tonumber(xutils.get_config('GAME_BATTLE_WORKERS', '6')) or 6
+local WORK_COUNT = tonumber(xutils.get_config('GAME_WORK_WORKERS', '2')) or 2
 local NATS_HOST = xutils.get_config('NATS_HOST', '127.0.0.1')
 local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
-local NATS_RPC_TIMEOUT_MS = tonumber(xutils.get_config('GAME_GATE_NATS_RPC_TIMEOUT_MS', '1500')) or 1500
+local NATS_RPC_TIMEOUT_MS = tonumber(xutils.get_config('GAME_NATS_RPC_TIMEOUT_MS', '3000')) or 3000
 
-local RECONNECT_MS = 2000
-local INTERNAL_MAX_PAYLOAD = 65535 - 4 - 2
+local MAIN_ID = xthread.MAIN
+local BATTLE_BASE = xthread.WORKER_GRP1
+local WORK_BASE = xthread.WORKER_GRP2
+local BATTLE_SCRIPT = 'scripts/game/battle_worker.lua'
+local WORK_SCRIPT = 'scripts/game/work_worker.lua'
 
-local gate_conn
-local reconnect_timer
-local nats_started = false
-local discovered_gates = {} -- name -> { name, host, port, last_seen_ms }
-local gate_handler = {}
-
--- opcode -> handler(sid, payload) -> (reply_opcode, reply_payload) or nil
-local handlers = {}
+assert(BATTLE_COUNT >= 1 and BATTLE_COUNT <= 20, 'GAME_BATTLE_WORKERS must be in [1,20]')
+assert(WORK_COUNT >= 1 and WORK_COUNT <= 20, 'GAME_WORK_WORKERS must be in [1,20]')
+assert(BATTLE_COUNT % WORK_COUNT == 0, 'battle/work worker counts must divide evenly')
+local BATTLES_PER_WORK = BATTLE_COUNT / WORK_COUNT
+assert(BATTLES_PER_WORK == 3 or BATTLES_PER_WORK == 4,
+    'game work:battle ratio must be 1:3 or 1:4')
 
 function xthread.register(pt, h) return router.register(pt, h) end
 
-local function now_ms()
-    if xtimer and xtimer.now_ms then
-        return xtimer.now_ms()
-    end
-    return math.floor(os.time() * 1000)
-end
+local battle_ids = {}
+local work_ids = {}
+local nats_running = false
+local selected_gate
 
 local function sanitize_host(v)
-    local s = tostring(v or '')
-    if s == '' then return nil end
-    return s
+    local value = tostring(v or '')
+    return value ~= '' and value or nil
 end
 
 local function sanitize_port(v)
-    local p = tonumber(v)
-    if not p then return nil end
-    if p < 1 or p > 65535 then return nil end
-    return p
+    local value = tonumber(v)
+    if not value or value < 1 or value > 65535 then return nil end
+    return value
 end
 
-local function note_gate(name, host, port)
-    name = tostring(name or '')
-    if name == '' then return nil end
-    local peer = discovered_gates[name]
-    if not peer then
-        peer = { name = name }
-        discovered_gates[name] = peer
-    end
-    local h = sanitize_host(host)
-    local p = sanitize_port(port)
-    if h then peer.host = h end
-    if p then peer.port = p end
-    peer.last_seen_ms = now_ms()
-    return peer
+local function sanitize_count(v)
+    local value = tonumber(v)
+    if not value or value < 1 or value > 20 then return nil end
+    return value
 end
 
-local function pick_gate_peer()
-    local cutoff = now_ms() - GATE_PEER_TTL_MS
-    if GATE_TARGET ~= '' then
-        local target = discovered_gates[GATE_TARGET]
-        if target and target.last_seen_ms and target.last_seen_ms >= cutoff then
-            return target
-        end
-        return nil
-    end
-
-    local best
-    for _, peer in pairs(discovered_gates) do
-        if peer.last_seen_ms and peer.last_seen_ms >= cutoff then
-            if not best or peer.last_seen_ms > best.last_seen_ms then
-                best = peer
-            end
-        end
-    end
-    return best
-end
-
-local function parse_rpc_addr(app_ok, v2, v3)
-    local host, port
-    if app_ok == true then
-        host, port = v2, v3
-    elseif type(app_ok) == 'string' then
-        host, port = app_ok, v2
-    elseif type(app_ok) == 'table' then
-        host = app_ok.host or app_ok.ip
-        port = app_ok.port or app_ok.internal_port
-    end
+local function send_topology_to_battles(gate_name, host, base_port, gate_count)
     host = sanitize_host(host)
-    port = sanitize_port(port)
-    if not host or not port then
-        return nil, nil
-    end
-    return host, port
-end
-
-local function query_gate_addr(target)
-    if not nats_started then
-        return nil, nil, 'nats not started'
+    base_port = sanitize_port(base_port)
+    if not host or not base_port then
+        xthread.log_error('[GAME-MAIN] invalid gate topology gate=%s host=%s port=%s',
+            tostring(gate_name), tostring(host), tostring(base_port))
+        return false
     end
 
-    local rpc_pts = { 'gate_get_internal_addr', 'gate_get_addr' }
-    local last_err = 'address query failed'
-    for _, pt in ipairs(rpc_pts) do
-        local ch_ok, app_ok, a, b = xnats.rpc(target, pt)
-        if not ch_ok then
-            last_err = tostring(app_ok)
-        else
-            local host, port = parse_rpc_addr(app_ok, a, b)
-            if host and port then
-                return host, port
-            end
-            if app_ok == false then
-                last_err = tostring(a or 'remote address handler failed')
-            else
-                last_err = 'bad address reply'
-            end
+    if gate_count ~= BATTLE_COUNT then
+        xthread.log_error('[GAME-MAIN] gate=%s lanes=%s but battle lanes=%d',
+            tostring(gate_name), tostring(gate_count), BATTLE_COUNT)
+        return false
+    end
+    selected_gate = gate_name
+    -- Single-port admission: every battle dials the same port and identifies
+    -- its lane in the HELLO payload.
+    for lane = 1, BATTLE_COUNT do
+        local ok, err = xthread.post(battle_ids[lane], 'battle_set_gate',
+            gate_name, host, base_port, gate_count)
+        if not ok then
+            xthread.log_error('[GAME-MAIN] lane=%d set gate failed: %s',
+                lane, tostring(err))
+            return false
         end
     end
-    return nil, nil, last_err
-end
-
-local function resolve_gate_endpoint()
-    local peer = pick_gate_peer()
-    if peer then
-        local host = sanitize_host(peer.host)
-        local port = sanitize_port(peer.port)
-        if host and port then
-            return host, port, 'nats-announce:' .. peer.name
-        end
-
-        local qhost, qport, qerr = query_gate_addr(peer.name)
-        if qhost and qport then
-            host, port = qhost, qport
-            peer.host, peer.port = host, port
-            return host, port, 'nats-rpc:' .. peer.name
-        end
-        return nil, nil, string.format('peer=%s address unresolved: %s',
-            tostring(peer.name), tostring(qerr))
-    end
-
-    local fallback_host = sanitize_host(GATE_HOST)
-    local fallback_port = sanitize_port(GATE_PORT)
-    if fallback_host and fallback_port then
-        return fallback_host, fallback_port, 'static-config'
-    end
-    return nil, nil, 'no gate discovered'
-end
-
-local function u16be(n)
-    return string.char(math.floor(n / 256) % 256, n % 256)
-end
-
-local function r16be(s, i)
-    local b1, b2 = string.byte(s, i, i + 1)
-    return b1 * 256 + b2
-end
-
-local function u32be(n)
-    return string.char(
-        math.floor(n / 16777216) % 256,
-        math.floor(n / 65536) % 256,
-        math.floor(n / 256) % 256,
-        n % 256)
-end
-
-local function r32be(s, i)
-    local b1, b2, b3, b4 = string.byte(s, i, i + 3)
-    return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
-end
-
-local function send_to_client(sid, opcode, payload)
-    if not gate_conn then return false end
-    payload = payload or ''
-    if #payload > INTERNAL_MAX_PAYLOAD then
-        return false, string.format('payload too large (%d > %d)',
-            #payload, INTERNAL_MAX_PAYLOAD)
-    end
-    return gate_conn:send(u32be(sid) .. u16be(opcode) .. payload)
-end
-
--- =========================================================================
--- handlers
--- =========================================================================
-local OP_ECHO         = 0x0001
-local OP_PING         = 0x0002
-local OP_SESSION_GONE = 0xFFFE
-
-handlers[OP_ECHO] = function(sid, payload)
-    print(string.format('[GAME] sid=%d ECHO %q', sid, payload or ''))
-    return OP_ECHO, payload
-end
-
-handlers[OP_PING] = function(sid, payload)
-    print(string.format('[GAME] sid=%d PING', sid))
-    return OP_PING, 'pong'
-end
-
-handlers[OP_SESSION_GONE] = function(sid, _)
-    print(string.format('[GAME] sid=%d session gone, cleaning up state', sid))
-    -- in real code, drop the player object, save state, etc.
-    return nil
-end
-
--- =========================================================================
--- gate conn wiring
--- =========================================================================
-local function try_connect_gate(trigger)
-    if gate_conn then return true end
-    local host, port, source_or_err = resolve_gate_endpoint()
-    if not host then
-        return false, source_or_err
-    end
-    print(string.format('[GAME] connect(%s) -> %s:%d (%s)',
-        tostring(trigger), host, port, tostring(source_or_err)))
-    local conn, err = xnet.connect(host, port, gate_handler)
-    if not conn then
-        return false, err
-    end
+    xthread.log_system('[GAME-MAIN] gate=%s endpoint=%s:%d lanes=%d',
+        tostring(gate_name), host, base_port, gate_count)
     return true
 end
 
-local function start_reconnect_timer()
-    if reconnect_timer then return end
-    reconnect_timer = xtimer.delay(RECONNECT_MS, function()
-        reconnect_timer = nil
-        if gate_conn then return end
-        local ok, err = try_connect_gate('retry')
-        if not ok then
-            print('[GAME] reconnect failed: ' .. tostring(err))
-            start_reconnect_timer()
-        end
-    end)
+local function query_gate_topology(name)
+    if not nats_running then return nil, nil, nil, 'nats not started' end
+    local ok, app_ok, host, port, count = xnats.rpc(name, 'gate_get_topology')
+    if ok and app_ok == true then
+        return sanitize_host(host), sanitize_port(port), sanitize_count(count)
+    end
+    ok, app_ok, host, port, count = xnats.rpc(name, 'gate_get_internal_addr')
+    if ok and app_ok == true then
+        return sanitize_host(host), sanitize_port(port),
+            sanitize_count(count) or BATTLE_COUNT
+    end
+    return nil, nil, nil, tostring(host or app_ok or 'gate topology query failed')
 end
 
-xthread.register('gate_announce', function(name, host, port)
-    local peer = note_gate(name, host, port)
-    if not peer then return end
+xthread.register('gate_announce', function(name, host, base_port, worker_count)
+    name = tostring(name or '')
+    if name == '' then return end
+    if GATE_TARGET ~= '' and name ~= GATE_TARGET then return end
+    if selected_gate and selected_gate ~= 'static'
+        and selected_gate ~= name and GATE_TARGET == '' then return end
 
-    print(string.format('[GAME] gate discovered name=%s host=%s port=%s',
-        peer.name, tostring(peer.host), tostring(peer.port)))
-
-    if gate_conn then return end
-    local ok, err = try_connect_gate('announce')
-    if not ok then
-        print('[GAME] connect on announce failed: ' .. tostring(err))
-        start_reconnect_timer()
+    host = sanitize_host(host)
+    base_port = sanitize_port(base_port)
+    worker_count = sanitize_count(worker_count)
+    if not host or not base_port or not worker_count then
+        local qhost, qport, qcount, err = query_gate_topology(name)
+        if not qhost then
+            xthread.log_error('[GAME-MAIN] gate=%s topology query failed: %s',
+                name, tostring(err))
+            return
+        end
+        host, base_port, worker_count = qhost, qport, qcount
     end
+    send_topology_to_battles(name, host, base_port, worker_count)
 end)
 
-function gate_handler.on_connect(conn, ip, port)
-    conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
-    gate_conn = conn
-    print(string.format('[GAME] connected to gate %s:%s', tostring(ip), tostring(port)))
+xthread.register('xadmin_announce', function(_name) end)
+
+local next_remote_work = 0
+xthread.register('game_message', function(from, topic, payload)
+    if #work_ids == 0 then
+        return false, 'game work workers are not ready'
+    end
+    next_remote_work = (next_remote_work % #work_ids) + 1
+    local ok, handled = xthread.rpc(work_ids[next_remote_work],
+        'game_message', NATS_RPC_TIMEOUT_MS, from, topic, payload)
+    if not ok then return false, handled end
+    return handled
+end)
+
+local function start_workers()
+    for i = 1, WORK_COUNT do
+        local tid = WORK_BASE + i - 1
+        local ok, err = xthread.create_thread(tid,
+            string.format('game-work-%02d', i), WORK_SCRIPT)
+        assert(ok, err)
+        work_ids[i] = tid
+        ok, err = xthread.post(tid, 'game_work_start', i, PROCESS_NAME)
+        assert(ok, err)
+    end
+
+    for lane = 1, BATTLE_COUNT do
+        local tid = BATTLE_BASE + lane - 1
+        local work_index = math.floor((lane - 1) / BATTLES_PER_WORK) + 1
+        local ok, err = xthread.create_thread(tid,
+            string.format('game-battle-%02d', lane), BATTLE_SCRIPT)
+        assert(ok, err)
+        battle_ids[lane] = tid
+        ok, err = xthread.post(tid, 'battle_start',
+            lane, BATTLE_COUNT, work_ids[work_index], work_index)
+        assert(ok, err)
+    end
 end
 
-function gate_handler.on_packet(_, body)
-    if #body < 6 then
-        print('[GAME] short packet, dropping')
-        return
+local function stop_workers()
+    for lane = #battle_ids, 1, -1 do
+        xthread.shutdown_thread(battle_ids[lane])
+        battle_ids[lane] = nil
     end
-    local sid    = r32be(body, 1)
-    local opcode = r16be(body, 5)
-    local payload = #body > 6 and string.sub(body, 7) or ''
-
-    local h = handlers[opcode]
-    if not h then
-        print(string.format('[GAME] sid=%d unknown opcode 0x%04X', sid, opcode))
-        return
-    end
-    local rop, rpl = h(sid, payload)
-    if rop then
-        local ok, err = send_to_client(sid, rop, rpl)
-        if not ok then
-            print(string.format('[GAME] sid=%d send reply failed: %s',
-                sid, tostring(err)))
-        end
+    for i = #work_ids, 1, -1 do
+        xthread.shutdown_thread(work_ids[i])
+        work_ids[i] = nil
     end
 end
 
-function gate_handler.on_close(_, reason)
-    gate_conn = nil
-    print('[GAME] gate closed: ' .. tostring(reason) .. ', will reconnect')
-    start_reconnect_timer()
-end
-
--- =========================================================================
--- lifecycle
--- =========================================================================
-local function __init()
-    print('[GAME] init')
-    assert(xnet.init())
-    xtimer.init(32)
-
+local function start_nats()
+    local routed_workers = { MAIN_ID }
+    for i = 1, #work_ids do routed_workers[#routed_workers + 1] = work_ids[i] end
     local ok, err = xnats.start({
         host = NATS_HOST,
         port = NATS_PORT,
         name = PROCESS_NAME,
         prefix = NATS_PREFIX,
-        workers = { xthread.MAIN },
+        workers = routed_workers,
         reconnect_ms = 1000,
         rpc_timeout_ms = NATS_RPC_TIMEOUT_MS,
     })
     if not ok then
-        io.stderr:write('[GAME] xnats start failed: ' .. tostring(err) .. '\n')
-    else
-        nats_started = true
+        xthread.log_error('[GAME-MAIN] xnats.start failed: %s', tostring(err))
+        return
     end
+    nats_running = true
+    xnats.bind_workers(work_ids)
+    xnats.publish('xadmin_announce', PROCESS_NAME)
+end
 
-    local connected, conn_err = try_connect_gate('init')
-    if not connected then
-        print('[GAME] initial connect failed: ' .. tostring(conn_err) .. ', will retry')
-        start_reconnect_timer()
-    end
+local function __init()
+    xthread.log_system('[GAME-MAIN] init server=%s battles=%d works=%d ratio=1:%d',
+        PROCESS_NAME, BATTLE_COUNT, WORK_COUNT, BATTLES_PER_WORK)
+    assert(xnet.init())
+    xtimer.init(32)
+    start_workers()
+    start_nats()
+
+    -- Static endpoint lets a local deployment run even without a broker.
+    send_topology_to_battles(GATE_TARGET ~= '' and GATE_TARGET or 'static',
+        GATE_HOST, GATE_PORT, BATTLE_COUNT)
 end
 
 local function __uninit()
-    if reconnect_timer then reconnect_timer:del(); reconnect_timer = nil end
-    if gate_conn       then gate_conn:close('uninit'); gate_conn = nil end
-    if nats_started    then xnats.stop(true); nats_started = false end
+    if nats_running then xnats.stop(true); nats_running = false end
+    stop_workers()
     xnet.uninit()
-    print('[GAME] uninit')
+    xthread.log_system('[GAME-MAIN] uninit')
 end
 
 return {

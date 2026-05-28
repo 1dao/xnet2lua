@@ -1,136 +1,134 @@
--- scripts/gate/main.lua -- gate orchestrator (main thread).
+-- scripts/gate/main.lua -- affinity gate orchestrator.
 --
--- Threading topology (mirrors the xhttp.lua / xadmin_main.lua model):
---   main thread        : owns the two listen_fd's; forwards accepted sockets
---                        to the workers via xthread.post(fd, ip, port).
---                        Also hosts the NATS client (xthread.NATS) so that
---                        xadmin can reach this process for hot-reload, etc.
---   gate-client worker : owns ALL client connections (LEN16 + AEAD), the
---                        session_id table, and the salt handshake.
---   gate-game worker   : owns the single game connection (LEN16, plaintext).
+-- The main thread owns accept, admission for battle connections, and NATS
+-- discovery. Each gate worker owns both its client sessions and the same-lane
+-- battle connection, so gameplay packets are forwarded without a cross-thread
+-- hop inside gate.
 --
--- Cross-thread message protocol (xthread.post payloads):
---   main          -> client_worker : client_accept(fd, ip, port)
---   main          -> game_worker   : game_accept(fd, ip, port)
---   client_worker -> game_worker   : forward_to_game(sid, body)
---                                    session_gone(sid)
---   game_worker   -> client_worker : forward_to_client(sid, body)
---                                    game_status(up)         -- backend up/down
+-- Internal admission protocol (battle -> gate, single port):
+--   1. battle connects to GATE_INTERNAL_PORT
+--   2. battle sends HELLO frame [lane_idx:1B] (LEN16-framed), then waits
+--   3. main attaches conn briefly, validates lane_idx, detaches the fd,
+--      and posts it to worker_ids[lane_idx]
+--   4. target worker re-attaches, sends ACK byte 0x01 back
+--   5. battle receives ACK, starts forwarding real traffic
+-- All subsequent business packets bypass main entirely.
 --
--- NATS responsibilities (handled in __init below):
---   * Publish heartbeat 'xadmin_announce' so the admin console sees this
---     process under its SERVER_NAME.
---   * Publish 'gate_announce' so game services can discover and connect.
---   * Reply gate address RPCs for game side when announce payload has no port.
---   * Reachable for built-in @reload / @reload_thread RPCs via xrouter,
---     which is wired up on main + both workers (__thread_handle = router.handle).
---
--- Run with:  ./bin/xnet scripts/gate/main.lua [SERVER_NAME=gate1]
+-- Run with: ./bin/xnet scripts/gate/main.lua SERVER_NAME=gate1
 
 local xnats  = dofile('scripts/core/server/xnats.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('GATE-MAIN')
 
-local CONFIG_FILE = 'xnet.cfg'
-local ok_cfg, cfg_err = xutils.load_config(CONFIG_FILE)
+local ok_cfg, cfg_err = xutils.load_config('xnet.cfg')
 if not ok_cfg then
     xthread.log_info('[GATE-MAIN] config not loaded: %s (using defaults)', tostring(cfg_err))
 end
 
-local SERVER_NAME  = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'gate1')
-local CLIENT_HOST  = xutils.get_config('GATE_CLIENT_HOST', '127.0.0.1')
-local CLIENT_PORT  = tonumber(xutils.get_config('GATE_CLIENT_PORT', '19180')) or 19180
+local SERVER_NAME = XNET_PROCESS_NAME or xutils.get_config('SERVER_NAME', 'gate1')
+local CLIENT_HOST = xutils.get_config('GATE_CLIENT_HOST', '127.0.0.1')
+local CLIENT_PORT = tonumber(xutils.get_config('GATE_CLIENT_PORT', '19180')) or 19180
 local INTERNAL_HOST = xutils.get_config('GATE_INTERNAL_HOST', '127.0.0.1')
 local INTERNAL_PORT = tonumber(xutils.get_config('GATE_INTERNAL_PORT', '19181')) or 19181
-local NATS_HOST    = xutils.get_config('NATS_HOST', '127.0.0.1')
-local NATS_PORT    = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
-local NATS_PREFIX  = xutils.get_config('NATS_PREFIX', 'xnet.test')
+local WORKER_COUNT = tonumber(xutils.get_config('GATE_WORKERS', '6')) or 6
+local NATS_HOST = xutils.get_config('NATS_HOST', '127.0.0.1')
+local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
+local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local HEARTBEAT_MS = tonumber(xutils.get_config('GATE_HEARTBEAT_MS', '5000')) or 5000
 
-local MAIN_ID          = xthread.MAIN
-local CLIENT_WORKER_ID = xthread.WORKER_GRP1
-local GAME_WORKER_ID   = xthread.WORKER_GRP1 + 1
+local MAIN_ID = xthread.MAIN
+local WORKER_BASE = xthread.WORKER_GRP1
+local WORKER_SCRIPT = 'scripts/gate/worker.lua'
 
-local CLIENT_WORKER_SCRIPT = 'scripts/gate/client_worker.lua'
-local GAME_WORKER_SCRIPT   = 'scripts/gate/game_worker.lua'
+assert(WORKER_COUNT >= 1 and WORKER_COUNT <= 20, 'GATE_WORKERS must be in [1,20]')
+assert(CLIENT_PORT >= 1 and CLIENT_PORT <= 65535, 'GATE_CLIENT_PORT must be in [1,65535]')
+assert(INTERNAL_PORT >= 1 and INTERNAL_PORT <= 65535,
+    'GATE_INTERNAL_PORT must be in [1,65535]')
 
 function xthread.register(pt, h) return router.register(pt, h) end
 
-xthread.register('gate_get_internal_addr', function()
-    return true, INTERNAL_HOST, INTERNAL_PORT
-end)
-
--- Compatibility alias for callers using a shorter RPC point.
-xthread.register('gate_get_addr', function()
-    return true, INTERNAL_HOST, INTERNAL_PORT
-end)
-
--- The broker rebroadcasts our own heartbeats back; register no-ops so they
--- land somewhere on the main thread instead of logging "no handler".
-xthread.register('xadmin_announce', function(_name) end)
-xthread.register('gate_announce',   function(_name, _host, _port) end)
-
+local worker_ids = {}
+local internal_listener
+local admission_pending = {}     -- conn -> { ip, port }
 local client_listener
-local game_listener
+local heartbeat_timer
 local nats_running = false
+local next_client_lane = 0
+
+xthread.register('gate_get_internal_addr', function()
+    return true, INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT
+end)
+
+xthread.register('gate_get_addr', function()
+    return true, INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT
+end)
+
+xthread.register('gate_get_topology', function()
+    return true, INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT
+end)
+
+-- NATS broadcasts are looped to the publishing process too.
+xthread.register('xadmin_announce', function(_name) end)
+xthread.register('gate_announce', function(_name, _host, _port, _workers) end)
+
+local function pick_client_worker()
+    next_client_lane = (next_client_lane % WORKER_COUNT) + 1
+    return worker_ids[next_client_lane], next_client_lane
+end
+
+local function start_workers()
+    for lane = 1, WORKER_COUNT do
+        local tid = WORKER_BASE + lane - 1
+        local ok, err = xthread.create_thread(tid,
+            string.format('gate-worker-%02d', lane), WORKER_SCRIPT)
+        assert(ok, err)
+        worker_ids[lane] = tid
+        ok, err = xthread.post(tid, 'gate_worker_start', lane, WORKER_COUNT)
+        assert(ok, err)
+    end
+end
+
+local function stop_workers()
+    for lane = #worker_ids, 1, -1 do
+        xthread.shutdown_thread(worker_ids[lane])
+        worker_ids[lane] = nil
+    end
+end
+
+local function publish_heartbeat()
+    if not nats_running then return end
+    xnats.publish('xadmin_announce', SERVER_NAME)
+    xnats.publish('gate_announce', SERVER_NAME, INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT)
+end
 
 local function start_nats()
-    -- Only the main thread joins as a NATS worker -- the gate workers don't
-    -- subscribe to broadcasts and don't issue cross-process RPCs, so fanning
-    -- announces to them just generates "no handler" log noise. Hot-reload
-    -- still reaches the workers because xrouter's @reload walks
-    -- xthread.all_stats() and posts @reload_thread to every live thread.
     local ok, err = xnats.start({
-        host           = NATS_HOST,
-        port           = NATS_PORT,
-        name           = SERVER_NAME,
-        prefix         = NATS_PREFIX,
-        workers        = { MAIN_ID },
-        reconnect_ms   = 1000,
+        host = NATS_HOST,
+        port = NATS_PORT,
+        name = SERVER_NAME,
+        prefix = NATS_PREFIX,
+        workers = { MAIN_ID },
+        reconnect_ms = 1000,
         rpc_timeout_ms = 10000,
     })
     if not ok then
-        xthread.log_error('[GATE-MAIN] xnats.start failed: %s (hot-reload disabled)',
-            tostring(err))
-        return false
+        xthread.log_error('[GATE-MAIN] xnats.start failed: %s', tostring(err))
+        return
     end
     nats_running = true
-
-    local function heartbeat()
-        xnats.publish('xadmin_announce', SERVER_NAME)
-        xnats.publish('gate_announce', SERVER_NAME, INTERNAL_HOST, INTERNAL_PORT)
-    end
-    heartbeat()
-    xtimer.add(HEARTBEAT_MS, heartbeat, -1)
-
-    xthread.log_system('[GATE-MAIN] nats=%s:%d prefix=%s name=%s heartbeat=%dms',
-        NATS_HOST, NATS_PORT, NATS_PREFIX, SERVER_NAME, HEARTBEAT_MS)
-    return true
+    publish_heartbeat()
+    heartbeat_timer = xtimer.add(HEARTBEAT_MS, publish_heartbeat, -1)
 end
 
-local function __init()
-    xthread.log_system('[GATE-MAIN] init server=%s', SERVER_NAME)
-    assert(xnet.init())
-    xtimer.init(32)
-
-    assert(xthread.create_thread(CLIENT_WORKER_ID, 'gate-client', CLIENT_WORKER_SCRIPT))
-    assert(xthread.create_thread(GAME_WORKER_ID,   'gate-game',   GAME_WORKER_SCRIPT))
-
-    -- Tell each worker the other's thread id. Posted before listen_fd starts
-    -- so the first accepted fd never reaches a worker without a registered peer.
-    assert(xthread.post(CLIENT_WORKER_ID, 'gate_set_peer', GAME_WORKER_ID))
-    assert(xthread.post(GAME_WORKER_ID,   'gate_set_peer', CLIENT_WORKER_ID))
-
-    -- NATS is best-effort: if the broker is unreachable, gate still serves
-    -- traffic without hot-reload / admin RPC.
-    start_nats()
-
+local function listen_clients()
     client_listener = assert(xnet.listen_fd(CLIENT_HOST, CLIENT_PORT, {
         on_accept = function(_, fd, ip, port)
-            local ok, err = xthread.post(CLIENT_WORKER_ID, 'client_accept', fd, ip, port)
+            local tid, lane = pick_client_worker()
+            local ok, err = xthread.post(tid, 'client_accept', fd, ip, port)
             if not ok then
-                xthread.log_error('[GATE-MAIN] client post failed: %s', tostring(err))
+                xthread.log_error('[GATE-MAIN] client accept lane=%d failed: %s',
+                    lane, tostring(err))
                 return false
             end
             return true
@@ -139,32 +137,93 @@ local function __init()
             xthread.log_info('[GATE-MAIN] client listener closed: %s', tostring(reason))
         end,
     }))
-    xthread.log_system('[GATE-MAIN] client listener %s:%d -> thread %d',
-        CLIENT_HOST, CLIENT_PORT, CLIENT_WORKER_ID)
+    xthread.log_system('[GATE-MAIN] clients %s:%d workers=%d',
+        CLIENT_HOST, CLIENT_PORT, WORKER_COUNT)
+end
 
-    game_listener = assert(xnet.listen_fd(INTERNAL_HOST, INTERNAL_PORT, {
-        on_accept = function(_, fd, ip, port)
-            local ok, err = xthread.post(GAME_WORKER_ID, 'game_accept', fd, ip, port)
-            if not ok then
-                xthread.log_error('[GATE-MAIN] game post failed: %s', tostring(err))
-                return false
-            end
-            return true
-        end,
-        on_close = function(_, reason)
-            xthread.log_info('[GATE-MAIN] game listener closed: %s', tostring(reason))
-        end,
-    }))
-    xthread.log_system('[GATE-MAIN] internal listener %s:%d -> thread %d',
-        INTERNAL_HOST, INTERNAL_PORT, GAME_WORKER_ID)
+local admission_handler = {}
+
+function admission_handler.on_connect(conn, ip, port)
+    -- HELLO is a single byte; cap the recv buffer so a misbehaving peer
+    -- can't flood us pre-handshake.
+    conn:set_framing({ type = 'len16', max_packet = 64 })
+    admission_pending[conn] = { ip = ip, port = port }
+end
+
+function admission_handler.on_packet(conn, body)
+    local st = admission_pending[conn]
+    if not st then
+        -- packet arrived after HELLO was already processed -- shouldn't
+        -- happen because we detach immediately on success, but defensively
+        -- close to surface protocol bugs.
+        conn:close('admission_extra_packet')
+        return
+    end
+    if #body < 1 then
+        admission_pending[conn] = nil
+        conn:close('hello_too_short')
+        return
+    end
+    local lane_idx = string.byte(body, 1)
+    if lane_idx < 1 or lane_idx > WORKER_COUNT then
+        xthread.log_error(
+            '[GATE-MAIN] admission: bad lane=%d from %s:%s (workers=%d)',
+            lane_idx, tostring(st.ip), tostring(st.port), WORKER_COUNT)
+        admission_pending[conn] = nil
+        conn:close('hello_lane_out_of_range')
+        return
+    end
+
+    local target_tid = worker_ids[lane_idx]
+    admission_pending[conn] = nil
+
+    -- Surrender the fd: conn becomes unusable, fd remains open.
+    local fd = conn:detach()
+    local ok, err = xthread.post(target_tid, 'battle_accept', fd, st.ip, st.port)
+    if not ok then
+        xthread.log_error(
+            '[GATE-MAIN] admission: post lane=%d tid=%d failed: %s; closing fd',
+            lane_idx, target_tid, tostring(err))
+        xnet.close_fd(fd)
+        return
+    end
+    xthread.log_info('[GATE-MAIN] admission: lane=%d from %s:%s -> tid=%d',
+        lane_idx, tostring(st.ip), tostring(st.port), target_tid)
+end
+
+function admission_handler.on_close(conn, reason)
+    if admission_pending[conn] then
+        admission_pending[conn] = nil
+        xthread.log_info('[GATE-MAIN] admission closed pre-hello: %s',
+            tostring(reason))
+    end
+end
+
+local function listen_battles()
+    internal_listener = assert(xnet.listen(INTERNAL_HOST, INTERNAL_PORT,
+        admission_handler))
+    xthread.log_system('[GATE-MAIN] internal admission %s:%d workers=%d',
+        INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT)
+end
+
+local function __init()
+    xthread.log_system('[GATE-MAIN] init server=%s workers=%d', SERVER_NAME, WORKER_COUNT)
+    assert(xnet.init())
+    xtimer.init(32)
+    start_workers()
+    start_nats()
+    listen_clients()
+    listen_battles()
 end
 
 local function __uninit()
+    if heartbeat_timer then heartbeat_timer:del(); heartbeat_timer = nil end
     if client_listener then client_listener:close('uninit'); client_listener = nil end
-    if game_listener   then game_listener:close('uninit');   game_listener   = nil end
+    if internal_listener then internal_listener:close('uninit'); internal_listener = nil end
+    for conn in pairs(admission_pending) do conn:close('uninit') end
+    admission_pending = {}
     if nats_running then xnats.stop(true); nats_running = false end
-    xthread.shutdown_thread(CLIENT_WORKER_ID)
-    xthread.shutdown_thread(GAME_WORKER_ID)
+    stop_workers()
     xnet.uninit()
     xthread.log_system('[GATE-MAIN] uninit')
 end

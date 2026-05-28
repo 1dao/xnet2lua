@@ -109,6 +109,17 @@ int       xchannel_attach(xChannel* ch);
 int       xchannel_attach_connect(xChannel* ch);
 void      xchannel_detach(xChannel* ch);
 
+/* Detach from xpoll and surrender ownership of the underlying fd to the
+** caller. Returns the original fd, or INVALID_SOCKET_VAL if the channel is
+** already closed. After this call:
+**   - ch->fd is set to INVALID_SOCKET_VAL
+**   - the channel is marked closed (further sends fail)
+**   - xchannel_destroy will NOT close the fd
+** Typical use: an admission thread reads a handshake, decides routing, and
+** then hands the raw fd to another thread for re-attach via xchannel_create
+** + xchannel_attach. */
+SOCKET_T  xchannel_release_fd(xChannel* ch);
+
 int       xchannel_send_raw(xChannel* ch, const char* data, size_t len);
 int       xchannel_send_packet(xChannel* ch, const char* data, size_t len);
 int       xchannel_send_file_raw(xChannel* ch,

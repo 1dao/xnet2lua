@@ -1065,6 +1065,21 @@ void xchannel_detach(xChannel* ch) {
 #endif
 }
 
+SOCKET_T xchannel_release_fd(xChannel* ch) {
+    if (!ch || ch->closed || ch->fd == INVALID_SOCKET_VAL) {
+        return INVALID_SOCKET_VAL;
+    }
+    SOCKET_T fd = ch->fd;
+    xchannel_detach(ch);
+    /* Surrender ownership: set fd to INVALID so close_internal / destroy
+    ** won't xsock_close the fd. */
+    ch->fd = INVALID_SOCKET_VAL;
+    ch->closed = true;
+    ch->connected = false;
+    ch->connect_pending = false;
+    return fd;
+}
+
 int xchannel_send_raw(xChannel* ch, const char* data, size_t len) {
     return queue_or_send_iov(ch, data, len, NULL, 0);
 }

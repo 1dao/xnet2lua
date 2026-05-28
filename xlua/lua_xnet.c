@@ -773,6 +773,29 @@ static int l_conn_disable_aead(lua_State* L) {
     return 1;
 }
 
+/* conn:detach() -> integer fd
+** Removes the connection from xpoll and returns the raw fd. The Lua conn
+** object is closed afterwards (further sends/etc raise); the fd is NOT
+** closed. Hand the fd to another thread via xthread.post + xnet.attach,
+** or close it yourself with xnet.close_fd if you can't follow through. */
+static int l_conn_detach(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    if (!c->ch || c->closed)
+        return luaL_error(L, "xnet.conn:detach on closed connection");
+
+    SOCKET_T fd = xchannel_release_fd(c->ch);
+    if (fd == INVALID_SOCKET_VAL)
+        return luaL_error(L, "xnet.conn:detach failed (channel already closed)");
+
+    /* Mark the Lua side closed and free the now-empty xchannel struct.
+    ** xchannel_destroy is safe here because the channel's fd has been
+    ** invalidated, so it won't try to xsock_close the surrendered fd. */
+    c->closed = true;
+    conn_destroy_channel(c);
+    lua_pushinteger(L, (lua_Integer)fd);
+    return 1;
+}
+
 static int l_conn_gc(lua_State* L) {
     LuaNetConn* c = (LuaNetConn*)luaL_checkudata(L, 1, LUA_XNET_CONN_META);
     if (c) {
@@ -1027,6 +1050,17 @@ static int l_xnet_connect(lua_State* L) {
     return 1;
 }
 
+/* xnet.close_fd(fd)
+** Closes a raw OS socket fd. Use after a detach + post sequence when the
+** post fails and the caller must clean up the orphaned fd. */
+static int l_xnet_close_fd(lua_State* L) {
+    lua_Integer fd = luaL_checkinteger(L, 1);
+    if (fd < 0)
+        return luaL_error(L, "xnet.close_fd: bad fd %d", (int)fd);
+    xsock_close((SOCKET_T)fd);
+    return 0;
+}
+
 static const luaL_Reg conn_methods[] = {
     { "fd",          l_conn_fd },
     { "peer",        l_conn_peer },
@@ -1040,6 +1074,7 @@ static const luaL_Reg conn_methods[] = {
     { "set_framing", l_conn_set_framing },
     { "enable_aead", l_conn_enable_aead },
     { "disable_aead", l_conn_disable_aead },
+    { "detach",       l_conn_detach },
     { NULL, NULL }
 };
 
@@ -1060,6 +1095,7 @@ static const luaL_Reg xnet_funcs[] = {
     { "connect", l_xnet_connect },
     { "attach",  l_xnet_attach },
     { "connect_fd", l_xnet_attach },
+    { "close_fd", l_xnet_close_fd },
     { "random_bytes", l_xnet_random_bytes },
 #if XNET_WITH_HTTPS
     { "attach_tls", l_xnet_attach_tls },
