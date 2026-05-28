@@ -66,10 +66,23 @@ endif
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
 XNET_CFLAGS := -I3rd/libdeflate
 XNET_HTTPS_SRC :=
-XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) \
-                    3rd/libdeflate/lib/x86/cpu_features.c
-# Note: lib/arm/cpu_features.c shares a basename with x86's and would collide
-# under the flat $(OBJ_DIR)/%.o:%.c rule. Add a per-arch rule when ARM matters.
+
+# Pick libdeflate's per-arch cpu_features.c based on the host machine.
+# crc32.c et al. resolve libdeflate_{arm,x86}_cpu_features at link time,
+# so the wrong file leaves undefined symbols (seen on macOS arm64 CI).
+# The xnet target compiles sources straight into the binary (no flat
+# $(OBJ_DIR)/%.o rule), so x86/arm basename collision doesn't apply here.
+ifeq ($(OS),Windows_NT)
+    XNET_HOST_ARCH := x86_64
+else
+    XNET_HOST_ARCH := $(shell uname -m)
+endif
+ifneq (,$(filter $(XNET_HOST_ARCH),arm64 aarch64))
+    XNET_CPU_FEATURES_SRC := 3rd/libdeflate/lib/arm/cpu_features.c
+else
+    XNET_CPU_FEATURES_SRC := 3rd/libdeflate/lib/x86/cpu_features.c
+endif
+XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) $(XNET_CPU_FEATURES_SRC)
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
 XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c
 XNET_DEBUG_SRC :=
