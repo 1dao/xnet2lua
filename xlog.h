@@ -77,54 +77,18 @@ void xlog_write_raw(const char* msg, size_t len);
 
 extern void native_log_to_java(int level, const char* tag, const char* msg);
 
-#define xlogv(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_VERBOSE)) { \
-        __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_VERBOSE, LOG_TAG, _buf); \
-    } \
-} while(0)
+/* Single-format helper: vsnprintf once, then dispatch to logcat + JNI bridge.
+** Replaces the prior macros, which expanded __VA_ARGS__ twice (double-evaluating
+** any argument with side effects, e.g. `xlogi("%d", counter++)`). */
+void xlog_android_emit(int level, int android_prio, const char* fmt, ...);
 
-#define xlogd(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_DEBUG)) { \
-        __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_DEBUG, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogi(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_INFO)) { \
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_INFO, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogs(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_SYSM)) { \
-        __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_SYSM, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogw(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_WARN)) { \
-        __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_WARN, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xloge(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_ERROR)) { \
-        __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_ERROR, LOG_TAG, _buf); \
-    } \
-} while(0)
-
-#define xlogf(...) do { \
-    if (xlog_is_enabled(XLOG_LEVEL_FATAL)) { \
-        __android_log_print(ANDROID_LOG_FATAL, LOG_TAG, __VA_ARGS__); \
-        char _buf[1024]; snprintf(_buf, sizeof(_buf), __VA_ARGS__); native_log_to_java(XLOG_LEVEL_FATAL, LOG_TAG, _buf); \
-    } \
-} while(0)
+#define xlogv(...) do { if (xlog_is_enabled(XLOG_LEVEL_VERBOSE)) xlog_android_emit(XLOG_LEVEL_VERBOSE, ANDROID_LOG_VERBOSE, __VA_ARGS__); } while(0)
+#define xlogd(...) do { if (xlog_is_enabled(XLOG_LEVEL_DEBUG))   xlog_android_emit(XLOG_LEVEL_DEBUG,   ANDROID_LOG_DEBUG,   __VA_ARGS__); } while(0)
+#define xlogi(...) do { if (xlog_is_enabled(XLOG_LEVEL_INFO))    xlog_android_emit(XLOG_LEVEL_INFO,    ANDROID_LOG_INFO,    __VA_ARGS__); } while(0)
+#define xlogs(...) do { if (xlog_is_enabled(XLOG_LEVEL_SYSM))    xlog_android_emit(XLOG_LEVEL_SYSM,    ANDROID_LOG_INFO,    __VA_ARGS__); } while(0)
+#define xlogw(...) do { if (xlog_is_enabled(XLOG_LEVEL_WARN))    xlog_android_emit(XLOG_LEVEL_WARN,    ANDROID_LOG_WARN,    __VA_ARGS__); } while(0)
+#define xloge(...) do { if (xlog_is_enabled(XLOG_LEVEL_ERROR))   xlog_android_emit(XLOG_LEVEL_ERROR,   ANDROID_LOG_ERROR,   __VA_ARGS__); } while(0)
+#define xlogf(...) do { if (xlog_is_enabled(XLOG_LEVEL_FATAL))   xlog_android_emit(XLOG_LEVEL_FATAL,   ANDROID_LOG_FATAL,   __VA_ARGS__); } while(0)
 
 #else
 
