@@ -18,7 +18,12 @@
 
 #if defined(LUA_EMBEDDED)
 #define LUA_IMPL
+/* macOS <unistd.h> exposes BSD getmode(3); rename minilua.h's internal
+   symbol to avoid a redeclaration clash. Safe because LUA_IMPL is only
+   defined here, so this is the only TU that compiles the function body. */
+#define getmode lua_getmode
 #include "3rd/minilua.h"
+#undef getmode
 #else
 #include "lua.h"
 #include "lauxlib.h"
