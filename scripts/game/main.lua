@@ -22,6 +22,8 @@ local GATE_HOST = xutils.get_config('GAME_GATE_HOST', '127.0.0.1')
 local GATE_PORT = tonumber(xutils.get_config('GAME_GATE_PORT', '19181')) or 19181
 local BATTLE_COUNT = tonumber(xutils.get_config('GAME_BATTLE_WORKERS', '6')) or 6
 local WORK_COUNT = tonumber(xutils.get_config('GAME_WORK_WORKERS', '2')) or 2
+local GAME_INDEX = tonumber(xutils.get_config('GAME_INDEX', '1')) or 1
+local GAME_COUNT = tonumber(xutils.get_config('GAME_COUNT', '1')) or 1
 local NATS_HOST = xutils.get_config('NATS_HOST', '127.0.0.1')
 local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
@@ -165,6 +167,14 @@ local function start_workers()
         battle_ids[lane] = tid
         ok, err = xthread.post(tid, 'battle_start',
             lane, BATTLE_COUNT, work_ids[work_index], work_index)
+        assert(ok, err)
+    end
+
+    -- Now that every battle tid exists, hand each lane the full directory so it
+    -- can xthread.post to any sibling lane (zone owner <-> player home routing).
+    for lane = 1, BATTLE_COUNT do
+        local ok, err = xthread.post(battle_ids[lane], 'battle_peers',
+            GAME_INDEX, battle_ids, GAME_COUNT)
         assert(ok, err)
     end
 end

@@ -4,13 +4,19 @@
 -- Battle opcodes execute here; everything else is handed to a work worker.
 
 local router = dofile('scripts/core/share/xrouter.lua')
+local zone_host = dofile('scripts/game/zone_host.lua')
 router.set_log_prefix('GAME-BATTLE')
 
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local RECONNECT_MS = 2000
 local INTERNAL_MAX_PAYLOAD = 65535 - 4 - 2
+local FRAME_MS = 50                       -- AOI flush cadence (~20 Hz)
 local OP_ECHO = 0x0001
+local OP_ENTER_WORLD = 0x0002             -- client -> server: x(u32) y(u32)
+local OP_MOVE = 0x0003                     -- client -> server: x(u32) y(u32)
+local OP_AOI_SNAPSHOT = 0x0004             -- server -> client: full view
+local OP_AOI_DELTA = 0x0005               -- server -> client: incremental view
 local OP_SESSION_GONE = 0xFFFE
 local GATE_ACK_BYTE = 0x01
 
@@ -25,6 +31,14 @@ local gate_conn               -- ready for business (set when ACK received)
 local gate_pending            -- channel mid-handshake (HELLO sent, no ACK)
 local reconnect_timer
 local gate_handler = {}
+
+-- AOI: this lane is also a zone_host -- it owns home players whose home_lane is
+-- this lane, plus any zones hashed to this lane (design §7/§8). The host is
+-- transport-agnostic; the closures below wire it to xthread.post / the gate.
+local my_game = 1
+local battle_tids = {}        -- lane_idx -> tid (filled by 'battle_peers')
+local host
+local frame_timer
 
 local function u16be(n)
     return string.char(math.floor(n / 256) % 256, n % 256)
@@ -55,6 +69,51 @@ local function send_to_client(sid, opcode, payload)
         return false, 'payload too large'
     end
     return gate_conn:send(u32be(sid) .. u16be(opcode) .. payload)
+end
+
+-- ----- AOI wire codecs (server -> client) -----
+-- snapshot: zone(u32) seq(u32) count(u16) then count*[id(u32) x(u32) y(u32)]
+local function encode_snapshot(zone_id, seq, list)
+    local parts = { u32be(zone_id), u32be(seq), u16be(#list) }
+    for i = 1, #list do
+        local e = list[i]
+        parts[#parts + 1] = u32be(e.id) .. u32be(e.x) .. u32be(e.y)
+    end
+    return table.concat(parts)
+end
+
+-- delta: zone(u32) seq(u32) count(u16) then count*[type(u8) id(u32) x(u32) y(u32)]
+local function encode_delta(zone_id, seq, events)
+    local parts = { u32be(zone_id), u32be(seq), u16be(#events) }
+    for i = 1, #events do
+        local e = events[i]
+        parts[#parts + 1] = string.char(e.t) .. u32be(e.id)
+            .. u32be(e.x or 0) .. u32be(e.y or 0)
+    end
+    return table.concat(parts)
+end
+
+-- zone_host deps: final delivery to a home client on this lane.
+local function host_to_client(sid, kind, zone_id, seq, payload)
+    if kind == 'snapshot' then
+        send_to_client(sid, OP_AOI_SNAPSHOT, encode_snapshot(zone_id, seq, payload))
+    else
+        send_to_client(sid, OP_AOI_DELTA, encode_delta(zone_id, seq, payload))
+    end
+end
+
+-- zone_host deps: route a message to host (game, lane_idx). Only ever called for
+-- a REMOTE target (the host short-circuits same-lane work locally). Same-game
+-- cross-lane rides xthread.post (MessagePack-encodes the table args). Cross-game
+-- needs the peer mesh, which is a later stage (design §6 / P4).
+local function host_post(game, lane_idx, msg, ...)
+    if game == my_game then
+        local tid = battle_tids[lane_idx]
+        if tid then xthread.post(tid, msg, ...) end
+    else
+        print(string.format('[GAME-BATTLE:%d] drop cross-game msg=%s game=%s (no peer mesh)',
+            lane, tostring(msg), tostring(game)))
+    end
 end
 
 local function start_reconnect_timer()
@@ -130,7 +189,21 @@ function gate_handler.on_packet(conn, body)
         send_to_client(sid, OP_ECHO, payload)
         return
     end
+    if opcode == OP_ENTER_WORLD then
+        -- sid doubles as the entity id in v1 (one connection == one player).
+        if host and #payload >= 8 then
+            host:spawn_player(sid, sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
+        end
+        return
+    end
+    if opcode == OP_MOVE then
+        if host and #payload >= 8 then
+            host:client_move(sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
+        end
+        return
+    end
     if opcode == OP_SESSION_GONE then
+        if host then host:despawn_player(sid) end
         if work_tid then
             xthread.post(work_tid, 'battle_session_gone', lane, sid)
         end
@@ -185,12 +258,46 @@ xthread.register('work_reply', function(sid, opcode, payload)
     end
 end)
 
+-- Sibling lane directory + game index, sent once after 'battle_start'. With it
+-- in hand the lane can reach any same-game lane and is ready to host AOI.
+xthread.register('battle_peers', function(game_index, tids, game_count)
+    my_game = tonumber(game_index) or 1
+    battle_tids = tids or {}
+    zone_host.configure({ lane_count = lane_count, game_count = tonumber(game_count) or 1 })
+    host = zone_host.new({
+        game = my_game,
+        lane = lane,
+        post = host_post,
+        to_client = host_to_client,
+    })
+    if not frame_timer then
+        frame_timer = xtimer.add(FRAME_MS, function()
+            if host then host:tick() end
+        end, -1)
+    end
+    print(string.format('[GAME-BATTLE:%d] peers set game=%d lanes=%d',
+        lane, my_game, #battle_tids))
+end)
+
+-- Cross-lane AOI inbox (owner role + home role). Each just forwards into the
+-- zone_host, which knows whether it is the zone owner or the player's home.
+local function host_dispatch(msg)
+    return function(...)
+        if host then host:recv(msg, ...) end
+    end
+end
+xthread.register('enter_zone', host_dispatch('enter_zone'))
+xthread.register('leave_zone', host_dispatch('leave_zone'))
+xthread.register('player_move', host_dispatch('player_move'))
+xthread.register('aoi_in', host_dispatch('aoi_in'))
+
 local function __init()
     assert(xnet.init())
     xtimer.init(32)
 end
 
 local function __uninit()
+    if frame_timer then frame_timer:del(); frame_timer = nil end
     if reconnect_timer then reconnect_timer:del(); reconnect_timer = nil end
     if gate_conn    then gate_conn:close('uninit');    gate_conn = nil end
     if gate_pending then gate_pending:close('uninit'); gate_pending = nil end

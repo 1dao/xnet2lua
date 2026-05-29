@@ -22,6 +22,14 @@ local Zone = dofile('scripts/game/zone.lua')
 local M = {}
 M.__index = M
 
+-- Set the deployment topology (T lanes, M games) that drives zone->owner
+-- hashing. Each thread dofile's its own module copy, so battle_worker must call
+-- this once at startup rather than relying on the file defaults.
+function M.configure(opts)
+    if opts.lane_count then zone_def.LANE_COUNT = opts.lane_count end
+    if opts.game_count then zone_def.GAME_COUNT = opts.game_count end
+end
+
 -- deps = { game, lane, post, to_client }
 function M.new(deps)
     return setmetatable({
