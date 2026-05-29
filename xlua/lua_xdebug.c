@@ -1016,20 +1016,22 @@ void xdebug_shutdown(void) {
     g_dbg.enabled = 0;
 }
 
+/* Return the first unused debug-state slot, or NULL if all are taken.
+** Caller must hold g_dbg.lock. */
+static XDbgState* xdbg_alloc_slot_locked(void) {
+    for (int i = 0; i < XDBG_MAX_STATES; i++) {
+        if (!g_dbg.states[i].active) return &g_dbg.states[i];
+    }
+    return NULL;
+}
+
 void xdebug_attach_state(lua_State* L, int thread_id, const char* script_path) {
-    int i;
     XDbgState* slot = NULL;
     if (!L) return;
     xdbg_init_sync();
     xdbg_mutex_lock(&g_dbg.lock);
     slot = xdbg_find_state_locked(L, 0);
-    for (i = 0; i < XDBG_MAX_STATES; i++) {
-        if (slot) break;
-        if (!g_dbg.states[i].active) {
-            slot = &g_dbg.states[i];
-            break;
-        }
-    }
+    if (!slot) slot = xdbg_alloc_slot_locked();
     if (slot) {
         memset(slot, 0, sizeof(*slot));
         slot->L = L;
@@ -1092,19 +1094,15 @@ int xdebug_start_current(lua_State* L, const char* port, const char* wait,
     xdbg_mutex_lock(&g_dbg.lock);
     if (!st || !st->active) st = xdbg_find_state_locked(L, 0);
     if (!st) {
-        int i;
-        for (i = 0; i < XDBG_MAX_STATES; i++) {
-            if (!g_dbg.states[i].active) {
-                st = &g_dbg.states[i];
-                memset(st, 0, sizeof(*st));
-                st->L = L;
-                st->active = 1;
-                tid = xthread_current_id();
-                st->thread_id = tid > 0 ? tid : 0;
-                snprintf(st->script, sizeof(st->script), "thread:%d", st->thread_id);
-                xdbg_set_state(L, st);
-                break;
-            }
+        st = xdbg_alloc_slot_locked();
+        if (st) {
+            memset(st, 0, sizeof(*st));
+            st->L = L;
+            st->active = 1;
+            tid = xthread_current_id();
+            st->thread_id = tid > 0 ? tid : 0;
+            snprintf(st->script, sizeof(st->script), "thread:%d", st->thread_id);
+            xdbg_set_state(L, st);
         }
     }
     if (!st) {

@@ -350,12 +350,7 @@ static int l_comp_close(lua_State* L) {
 }
 
 static int l_comp_gc(lua_State* L) {
-    LuaCompressor* lc = (LuaCompressor*)luaL_checkudata(L, 1, LUA_XCOMPRESS_COMPRESSOR_META);
-    if (lc && !lc->closed) {
-        if (lc->c) { libdeflate_free_compressor(lc->c); lc->c = NULL; }
-        lc->closed = 1;
-    }
-    return 0;
+    return l_comp_close(L);
 }
 
 static int l_new_decompressor(lua_State* L) {
@@ -376,64 +371,45 @@ static int l_dec_close(lua_State* L) {
 }
 
 static int l_dec_gc(lua_State* L) {
-    LuaDecompressor* ld = (LuaDecompressor*)luaL_checkudata(L, 1, LUA_XCOMPRESS_DECOMPRESSOR_META);
-    if (ld && !ld->closed) {
-        if (ld->d) { libdeflate_free_decompressor(ld->d); ld->d = NULL; }
-        ld->closed = 1;
-    }
-    return 0;
+    return l_dec_close(L);
 }
 
 /* -------------------------------------------------------------------------
 ** Checksums (CRC-32 / Adler-32) -- variadic, state-free
 ** ------------------------------------------------------------------------- */
 
-static int l_crc32(lua_State* L) {
+typedef uint32_t (*checksum_fn)(uint32_t, const void*, size_t);
+
+/* Fold a libdeflate checksum over every string argument from `start` to the
+** top of the stack, seeded with `init`, and push the result. The plain
+** variants start at arg 1 with the algorithm's standard seed; the _update
+** variants take a running value at arg 1 and start folding at arg 2. */
+static int checksum_fold(lua_State* L, checksum_fn fn, uint32_t init, int start) {
+    uint32_t sum = init;
     int top = lua_gettop(L);
-    uint32_t crc = 0;
-    for (int i = 1; i <= top; i++) {
+    for (int i = start; i <= top; i++) {
         size_t len = 0;
         const char* p = luaL_checklstring(L, i, &len);
-        crc = libdeflate_crc32(crc, p, len);
+        sum = fn(sum, p, len);
     }
-    lua_pushinteger(L, (lua_Integer)crc);
+    lua_pushinteger(L, (lua_Integer)sum);
     return 1;
+}
+
+static int l_crc32(lua_State* L) {
+    return checksum_fold(L, libdeflate_crc32, 0, 1);
 }
 
 static int l_crc32_update(lua_State* L) {
-    uint32_t crc = (uint32_t)luaL_checkinteger(L, 1);
-    int top = lua_gettop(L);
-    for (int i = 2; i <= top; i++) {
-        size_t len = 0;
-        const char* p = luaL_checklstring(L, i, &len);
-        crc = libdeflate_crc32(crc, p, len);
-    }
-    lua_pushinteger(L, (lua_Integer)crc);
-    return 1;
+    return checksum_fold(L, libdeflate_crc32, (uint32_t)luaL_checkinteger(L, 1), 2);
 }
 
 static int l_adler32(lua_State* L) {
-    int top = lua_gettop(L);
-    uint32_t adler = 1;
-    for (int i = 1; i <= top; i++) {
-        size_t len = 0;
-        const char* p = luaL_checklstring(L, i, &len);
-        adler = libdeflate_adler32(adler, p, len);
-    }
-    lua_pushinteger(L, (lua_Integer)adler);
-    return 1;
+    return checksum_fold(L, libdeflate_adler32, 1, 1);
 }
 
 static int l_adler32_update(lua_State* L) {
-    uint32_t adler = (uint32_t)luaL_checkinteger(L, 1);
-    int top = lua_gettop(L);
-    for (int i = 2; i <= top; i++) {
-        size_t len = 0;
-        const char* p = luaL_checklstring(L, i, &len);
-        adler = libdeflate_adler32(adler, p, len);
-    }
-    lua_pushinteger(L, (lua_Integer)adler);
-    return 1;
+    return checksum_fold(L, libdeflate_adler32, (uint32_t)luaL_checkinteger(L, 1), 2);
 }
 
 /* -------------------------------------------------------------------------

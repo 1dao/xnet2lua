@@ -4,8 +4,6 @@
 
 #if XNET_WITH_HTTPS
 
-#include "lua_xnet_tls.h"
-
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
@@ -29,6 +27,8 @@
 #include "xsock.h"
 #include "xlog.h"
 
+#include "lua_xnet.h"
+
 #include "mbedtls/ctr_drbg.h"
 #include "mbedtls/entropy.h"
 #include "mbedtls/error.h"
@@ -38,66 +38,7 @@
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
 
-#ifndef lua_absindex
-#define lua_absindex(L, i) \
-    (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
-#endif
-
 #define LUA_XNET_TLS_META "xnet.tls_connection"
-
-static void ref_unref(lua_State* L, int* ref) {
-    if (*ref != LUA_NOREF && *ref != LUA_REFNIL) {
-        luaL_unref(L, LUA_REGISTRYINDEX, *ref);
-    }
-    *ref = LUA_NOREF;
-}
-
-static void ref_from_stack(lua_State* L, int idx, int* ref) {
-    idx = lua_absindex(L, idx);
-    ref_unref(L, ref);
-    lua_pushvalue(L, idx);
-    *ref = luaL_ref(L, LUA_REGISTRYINDEX);
-}
-
-static bool push_handler(lua_State* L, int handler_ref,
-                         const char* name1,
-                         const char* name2,
-                         const char* name3) {
-    if (handler_ref == LUA_NOREF || handler_ref == LUA_REFNIL) return false;
-
-    int base = lua_gettop(L);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, handler_ref);
-    if (!lua_istable(L, -1)) {
-        lua_settop(L, base);
-        return false;
-    }
-
-    lua_getfield(L, -1, name1);
-    if (!lua_isfunction(L, -1) && name2) {
-        lua_pop(L, 1);
-        lua_getfield(L, -1, name2);
-    }
-    if (!lua_isfunction(L, -1) && name3) {
-        lua_pop(L, 1);
-        lua_getfield(L, -1, name3);
-    }
-    if (!lua_isfunction(L, -1)) {
-        lua_settop(L, base);
-        return false;
-    }
-
-    lua_remove(L, -2);
-    return true;
-}
-
-
-static size_t packet_consumed_return(lua_State* L, int idx, size_t max_len) {
-    if (lua_type(L, idx) != LUA_TNUMBER) return 0;
-    lua_Number n = lua_tonumber(L, idx);
-    if (n <= 0) return 0;
-    if (n > (lua_Number)max_len) return max_len == SIZE_MAX ? SIZE_MAX : max_len + 1;
-    return (size_t)n;
-}
 
 typedef struct LuaTlsConn {
     lua_State* L;
@@ -154,17 +95,6 @@ static void tls_error_event(SOCKET_T fd, int mask,
 
 static LuaTlsConn* check_tls_conn(lua_State* L, int idx) {
     return (LuaTlsConn*)luaL_checkudata(L, idx, LUA_XNET_TLS_META);
-}
-
-static lua_State* main_lua_state(lua_State* L) {
-#ifdef LUA_RIDX_MAINTHREAD
-    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
-    lua_State* mainL = lua_tothread(L, -1);
-    lua_pop(L, 1);
-    return mainL ? mainL : L;
-#else
-    return L;
-#endif
 }
 
 static void push_tls_self(lua_State* L, LuaTlsConn* c) {

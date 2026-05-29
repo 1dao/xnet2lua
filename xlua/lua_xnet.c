@@ -23,7 +23,7 @@
 #include "xtimer.h"
 #include "xlog.h"
 #include "xframe_aead.h"
-#include "lua_xnet_tls.h"
+#include "lua_xnet.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -34,14 +34,7 @@
 #include <errno.h>
 #endif
 
-#ifndef XNET_WITH_HTTPS
-#define XNET_WITH_HTTPS 0
-#endif
-
-#ifndef lua_absindex
-#define lua_absindex(L, i) \
-    (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
-#endif
+/* XNET_WITH_HTTPS fallback + lua_absindex live in lua_xnet.h. */
 
 #define LUA_XNET_CONN_META     "xnet.connection"
 #define LUA_XNET_LISTENER_META "xnet.listener"
@@ -92,31 +85,6 @@ static LuaNetListener* check_listener(lua_State* L, int idx) {
     return (LuaNetListener*)luaL_checkudata(L, idx, LUA_XNET_LISTENER_META);
 }
 
-static lua_State* main_lua_state(lua_State* L) {
-#ifdef LUA_RIDX_MAINTHREAD
-    lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
-    lua_State* mainL = lua_tothread(L, -1);
-    lua_pop(L, 1);
-    return mainL ? mainL : L;
-#else
-    return L;
-#endif
-}
-
-static void ref_unref(lua_State* L, int* ref) {
-    if (*ref != LUA_NOREF && *ref != LUA_REFNIL) {
-        luaL_unref(L, LUA_REGISTRYINDEX, *ref);
-    }
-    *ref = LUA_NOREF;
-}
-
-static void ref_from_stack(lua_State* L, int idx, int* ref) {
-    idx = lua_absindex(L, idx);
-    ref_unref(L, ref);
-    lua_pushvalue(L, idx);
-    *ref = luaL_ref(L, LUA_REGISTRYINDEX);
-}
-
 static void push_conn_self(lua_State* L, LuaNetConn* c) {
     if (!c || c->self_ref == LUA_NOREF || c->self_ref == LUA_REFNIL)
         lua_pushnil(L);
@@ -130,38 +98,6 @@ static void push_listener_self(lua_State* L, LuaNetListener* s) {
     else
         lua_rawgeti(L, LUA_REGISTRYINDEX, s->self_ref);
 }
-
-static bool push_handler(lua_State* L, int handler_ref,
-                         const char* name1,
-                         const char* name2,
-                         const char* name3) {
-    if (handler_ref == LUA_NOREF || handler_ref == LUA_REFNIL) return false;
-
-    int base = lua_gettop(L);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, handler_ref);
-    if (!lua_istable(L, -1)) {
-        lua_settop(L, base);
-        return false;
-    }
-
-    lua_getfield(L, -1, name1);
-    if (!lua_isfunction(L, -1) && name2) {
-        lua_pop(L, 1);
-        lua_getfield(L, -1, name2);
-    }
-    if (!lua_isfunction(L, -1) && name3) {
-        lua_pop(L, 1);
-        lua_getfield(L, -1, name3);
-    }
-    if (!lua_isfunction(L, -1)) {
-        lua_settop(L, base);
-        return false;
-    }
-
-    lua_remove(L, -2);
-    return true;
-}
-
 
 static void conn_unref_lua(LuaNetConn* c) {
     if (!c || !c->L) return;
@@ -196,14 +132,6 @@ static int push_send_result(lua_State* L, LuaNetConn* c, int rc) {
         lua_pushstring(L, "write_error");
     }
     return 2;
-}
-
-static size_t packet_consumed_return(lua_State* L, int idx, size_t max_len) {
-    if (lua_type(L, idx) != LUA_TNUMBER) return 0;
-    lua_Number n = lua_tonumber(L, idx);
-    if (n <= 0) return 0;
-    if (n > (lua_Number)max_len) return max_len == SIZE_MAX ? SIZE_MAX : max_len + 1;
-    return (size_t)n;
 }
 
 static void handle_packet_returns(LuaNetConn* c, int first, int last) {
@@ -372,6 +300,29 @@ static void listener_close_internal(LuaNetListener* s, const char* reason) {
     lua_settop(L, base);
 }
 
+/* Accept one pending connection on the listener. Returns the accepted fd
+** (already set non-blocking), or INVALID_SOCKET_VAL when the accept loop
+** should stop — either a would-block (drained) or a fatal error that has
+** already closed the listener. On a per-fd setup failure the fd is closed
+** and *retry is set true so the caller continues the loop. */
+static SOCKET_T listener_accept_one(LuaNetListener* s, char* ip, int* port,
+                                    bool* retry) {
+    *retry = false;
+    char err[XSOCK_ERR_LEN] = {0};
+    SOCKET_T cfd = xsock_accept(err, s->fd, ip, port);
+    if (cfd == INVALID_SOCKET_VAL) {
+        if (!socket_check_eagain())
+            listener_close_internal(s, err[0] ? err : "accept_error");
+        return INVALID_SOCKET_VAL;
+    }
+    if (xsock_set_nonblock(err, cfd) != XSOCK_OK) {
+        xsock_close(cfd);
+        *retry = true;
+        return INVALID_SOCKET_VAL;
+    }
+    return cfd;
+}
+
 static void listener_accept_cb(SOCKET_T fd, int mask,
                                void* clientData, xPollRequest* submit_arg) {
     (void)fd;
@@ -385,19 +336,13 @@ static void listener_accept_cb(SOCKET_T fd, int mask,
     push_listener_self(L, s);
 
     while (!s->closed) {
-        char err[XSOCK_ERR_LEN] = {0};
         char ip[64] = {0};
         int port = 0;
-        SOCKET_T cfd = xsock_accept(err, s->fd, ip, &port);
+        bool retry = false;
+        SOCKET_T cfd = listener_accept_one(s, ip, &port, &retry);
         if (cfd == INVALID_SOCKET_VAL) {
-            if (socket_check_eagain()) break;
-            listener_close_internal(s, err[0] ? err : "accept_error");
+            if (retry) continue;
             break;
-        }
-
-        if (xsock_set_nonblock(err, cfd) != XSOCK_OK) {
-            xsock_close(cfd);
-            continue;
         }
 
         xChannel* ch = xchannel_create(cfd, &s_lua_conn_cfg);
@@ -431,19 +376,13 @@ static void listener_accept_fd_cb(SOCKET_T fd, int mask,
     push_listener_self(L, s);
 
     while (!s->closed) {
-        char err[XSOCK_ERR_LEN] = {0};
         char ip[64] = {0};
         int port = 0;
-        SOCKET_T cfd = xsock_accept(err, s->fd, ip, &port);
+        bool retry = false;
+        SOCKET_T cfd = listener_accept_one(s, ip, &port, &retry);
         if (cfd == INVALID_SOCKET_VAL) {
-            if (socket_check_eagain()) break;
-            listener_close_internal(s, err[0] ? err : "accept_error");
+            if (retry) continue;
             break;
-        }
-
-        if (xsock_set_nonblock(err, cfd) != XSOCK_OK) {
-            xsock_close(cfd);
-            continue;
         }
 
         bool transfer = false;
@@ -907,7 +846,10 @@ static int l_xnet_name(lua_State* L) {
     return 1;
 }
 
-static int l_xnet_listen(lua_State* L) {
+/* Shared body for xnet.listen and xnet.listen_fd. The two differ only in the
+** xpoll read callback: listener_accept_cb wraps each accepted fd in a Lua
+** connection, listener_accept_fd_cb hands the raw fd to an on_accept handler. */
+static int xnet_listen_common(lua_State* L, xFileProc accept_cb) {
     const char* host = NULL;
     int port = 0;
     int handler_idx = 0;
@@ -952,7 +894,7 @@ static int l_xnet_listen(lua_State* L) {
     s->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     if (xpoll_add_event(fd, XPOLL_READABLE,
-                        listener_accept_cb, NULL, listener_error_cb, s) != 0) {
+                        accept_cb, NULL, listener_error_cb, s) != 0) {
         listener_close_internal(s, "poll_error");
         lua_pushnil(L);
         lua_pushstring(L, "xpoll_add_event failed");
@@ -961,58 +903,12 @@ static int l_xnet_listen(lua_State* L) {
     return 1;
 }
 
+static int l_xnet_listen(lua_State* L) {
+    return xnet_listen_common(L, listener_accept_cb);
+}
+
 static int l_xnet_listen_fd(lua_State* L) {
-    const char* host = NULL;
-    int port = 0;
-    int handler_idx = 0;
-
-    if (lua_isnumber(L, 1) && !lua_isstring(L, 1)) {
-        port = (int)lua_tointeger(L, 1);
-        handler_idx = 2;
-    } else {
-        if (!lua_isnil(L, 1)) host = luaL_checkstring(L, 1);
-        port = (int)luaL_checkinteger(L, 2);
-        handler_idx = 3;
-    }
-    luaL_checktype(L, handler_idx, LUA_TTABLE);
-
-    char err[XSOCK_ERR_LEN] = {0};
-    SOCKET_T fd = xsock_listen(err, host, port);
-    if (fd == INVALID_SOCKET_VAL) {
-        lua_pushnil(L);
-        lua_pushstring(L, err[0] ? err : "listen failed");
-        return 2;
-    }
-    if (xsock_set_nonblock(err, fd) != XSOCK_OK) {
-        xsock_close(fd);
-        lua_pushnil(L);
-        lua_pushstring(L, err[0] ? err : "set nonblock failed");
-        return 2;
-    }
-
-    LuaNetListener* s = (LuaNetListener*)lua_newuserdata(L, sizeof(*s));
-    memset(s, 0, sizeof(*s));
-    s->L = main_lua_state(L);
-    s->fd = fd;
-    s->self_ref = LUA_NOREF;
-    s->handler_ref = LUA_NOREF;
-    s->closed = false;
-
-    luaL_getmetatable(L, LUA_XNET_LISTENER_META);
-    lua_setmetatable(L, -2);
-
-    ref_from_stack(L, handler_idx, &s->handler_ref);
-    lua_pushvalue(L, -1);
-    s->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-
-    if (xpoll_add_event(fd, XPOLL_READABLE,
-                        listener_accept_fd_cb, NULL, listener_error_cb, s) != 0) {
-        listener_close_internal(s, "poll_error");
-        lua_pushnil(L);
-        lua_pushstring(L, "xpoll_add_event failed");
-        return 2;
-    }
-    return 1;
+    return xnet_listen_common(L, listener_accept_fd_cb);
 }
 
 static int l_xnet_connect(lua_State* L) {

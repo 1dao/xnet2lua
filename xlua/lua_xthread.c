@@ -159,6 +159,35 @@ static int lua_traceback_handler(lua_State* L) {
 /* ThreadData metatable name */
 static const char* THREAD_DATA_META = "xthread.ThreadData";
 
+/* Push the shared ThreadData metatable, creating it (with its __gc) on first
+** use, and leave it on top of the stack. */
+static void thread_data_push_meta(lua_State* L) {
+    if (luaL_newmetatable(L, THREAD_DATA_META)) {
+        lua_pushcfunction(L, thread_data_gc);
+        lua_setfield(L, -2, "__gc");
+    }
+}
+
+/* Allocate and field-initialise a ThreadData userdata, attach the shared
+** metatable, and leave the userdata on the Lua stack. bound_L is the state the
+** data is tied to: the creating state (xthread.init) or NULL for a thread that
+** has not yet created its own Lua state (xthread.create_thread). */
+static ThreadData* thread_data_alloc(lua_State* L, lua_State* bound_L) {
+    ThreadData* td = (ThreadData*)lua_newuserdata(L, sizeof(ThreadData));
+    td->L = bound_L;
+    td->owner_L = L;
+    td->script_path = NULL;
+    td->sync_handler_ref = LUA_NOREF;
+    td->init_ref = LUA_NOREF;
+    td->update_ref = LUA_NOREF;
+    td->uninit_ref = LUA_NOREF;
+    td->sentinel_ref = LUA_NOREF;
+    td->auto_xpoll = 0;
+    thread_data_push_meta(L);
+    lua_setmetatable(L, -2);
+    return td;
+}
+
 /* ============================================================================
 ** pack_to_lua_stack
 ** Pack Lua stack values with cmsgpack, leaving the result string on stack.
@@ -560,7 +589,7 @@ static void thread_message_handler(xThread* thr, void* arg, int arg_len) {
         }
 
         if (k1 && strcmp(k1, "@async_resume") == 0) {
-            xlogi("C INTERCEPT: @async_resume on thread %d will resume coroutine", xthread_current_id());
+            xlogv("C INTERCEPT: @async_resume on thread %d will resume coroutine", xthread_current_id());
             /* Got it - intercept this in C, do NOT pass to Lua handler */
             /* Layout: nil (reply_router), "@async_resume", co_id, sk, req_pt, ok, r, ...
             **   base+1 = nil               (reply_router = nil for REPLY)
@@ -658,26 +687,7 @@ static int l_xthread_init(lua_State* L) {
     ThreadData* td = (ThreadData*)xthread_get_userdata(thr);
     if (!td) {
         /* Create new ThreadData userdata */
-        td = (ThreadData*)lua_newuserdata(L, sizeof(ThreadData));
-        td->L = L;
-        td->owner_L = L;
-        td->script_path = NULL;
-        td->sync_handler_ref = LUA_NOREF;
-        td->init_ref = LUA_NOREF;
-        td->update_ref = LUA_NOREF;
-        td->uninit_ref = LUA_NOREF;
-        td->sentinel_ref = LUA_NOREF;
-
-        /* Get or create metatable */
-        luaL_getmetatable(L, THREAD_DATA_META);
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-            luaL_newmetatable(L, THREAD_DATA_META);
-            lua_pushcfunction(L, thread_data_gc);
-            lua_setfield(L, -2, "__gc");
-            /* Set metatable */
-        }
-        lua_setmetatable(L, -2);
+        td = thread_data_alloc(L, L);
         /* Store reference to self in registry to prevent GC */
         td->sentinel_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
@@ -1181,6 +1191,18 @@ static int l_xthread_all_stats(lua_State* L) {
 ** New API - Dynamic thread creation from Lua
 ** ============================================================================ */
 
+/* C extension modules exposed to every dynamic thread script. cmsgpack is
+** statically linked; the rest are this project's own modules. */
+static const luaL_Reg k_thread_modules[] = {
+    { "cmsgpack",  luaopen_cmsgpack },
+    { "xthread",   luaopen_xthread },
+    { "xnet",      luaopen_xnet },
+    { "xutils",    luaopen_xutils },
+    { "xtimer",    luaopen_xtimer },
+    { "xcompress", luaopen_xcompress },
+    { NULL, NULL }
+};
+
 /* Lifecycle callbacks that bridge from C xthread to Lua
 ** This runs in the new thread's context after the OS thread has started
 */
@@ -1203,30 +1225,11 @@ static void lua_thread_on_init(xThread* thr) {
     luaL_openlibs(L);
     lua_thread_runtime_post_init(L);
 
-    /* Preload cmsgpack (statically linked) */
-    luaL_requiref(L, "cmsgpack", luaopen_cmsgpack, 1);
-    lua_pop(L, 1);
-
-    /* Open xthread module */
-    luaL_requiref(L, "xthread", luaopen_xthread, 1);
-    lua_pop(L, 1);
-
-    /* Open xnet module so dynamic Lua threads can use network polling too. */
-    luaL_requiref(L, "xnet", luaopen_xnet, 1);
-    lua_pop(L, 1);
+    for (const luaL_Reg* m = k_thread_modules; m->name; m++) {
+        luaL_requiref(L, m->name, m->func, 1);
+        lua_pop(L, 1);
+    }
     install_xnet_thread_reload(L);
-
-    /* Open shared utility module for small helpers such as JSON. */
-    luaL_requiref(L, "xutils", luaopen_xutils, 1);
-    lua_pop(L, 1);
-
-    /* Open per-thread timer module. */
-    luaL_requiref(L, "xtimer", luaopen_xtimer, 1);
-    lua_pop(L, 1);
-
-    /* Open compression module so HTTP / app code can require('xcompress'). */
-    luaL_requiref(L, "xcompress", luaopen_xcompress, 1);
-    lua_pop(L, 1);
 
     xdebug_attach_state(L, xthread_get_id(thr), td->script_path);
 
@@ -1252,38 +1255,12 @@ static void lua_thread_on_init(xThread* thr) {
     }
 
     /* Extract callbacks from returned table and store as references */
-    lua_getfield(L, -1, "__thread_handle");
-    if (lua_isfunction(L, -1)) {
-        td->sync_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    } else {
-        lua_pop(L, 1);
+    td->sync_handler_ref = ref_field_if_function(L, -1, "__thread_handle");
+    if (td->sync_handler_ref == LUA_NOREF)
         xlogw("lua_thread_on_init: no __thread_handle in script '%s'", td->script_path);
-        td->sync_handler_ref = LUA_NOREF;
-    }
-
-    lua_getfield(L, -1, "__init");
-    if (lua_isfunction(L, -1)) {
-        td->init_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    } else {
-        lua_pop(L, 1);
-        td->init_ref = LUA_NOREF;
-    }
-
-    lua_getfield(L, -1, "__update");
-    if (lua_isfunction(L, -1)) {
-        td->update_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    } else {
-        lua_pop(L, 1);
-        td->update_ref = LUA_NOREF;
-    }
-
-    lua_getfield(L, -1, "__uninit");
-    if (lua_isfunction(L, -1)) {
-        td->uninit_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    } else {
-        lua_pop(L, 1);
-        td->uninit_ref = LUA_NOREF;
-    }
+    td->init_ref   = ref_field_if_function(L, -1, "__init");
+    td->update_ref = ref_field_if_function(L, -1, "__update");
+    td->uninit_ref = ref_field_if_function(L, -1, "__uninit");
 
     /* Pop the definition table from stack */
     lua_pop(L, 1);
@@ -1444,25 +1421,7 @@ static int l_xthread_create_thread(lua_State* L) {
     }
 
     /* Create ThreadData that will hold all references */
-    ThreadData* td = (ThreadData*)lua_newuserdata(L, sizeof(ThreadData));
-    td->L = NULL;
-    td->owner_L = L;
-    td->script_path = NULL;
-    td->sync_handler_ref = LUA_NOREF;
-    td->init_ref = LUA_NOREF;
-    td->update_ref = LUA_NOREF;
-    td->uninit_ref = LUA_NOREF;
-    td->sentinel_ref = LUA_NOREF;
-
-    /* Get metatable and set GC */
-    luaL_getmetatable(L, THREAD_DATA_META);
-    if (lua_isnil(L, -1)) {
-        lua_pop(L, 1);
-        luaL_newmetatable(L, THREAD_DATA_META);
-        lua_pushcfunction(L, thread_data_gc);
-        lua_setfield(L, -2, "__gc");
-    }
-    lua_setmetatable(L, -2);
+    ThreadData* td = thread_data_alloc(L, NULL);
 
     /* Store script path copy - the new thread will load it in its own Lua state */
     td->script_path = malloc(strlen(script_path) + 1);
@@ -1677,9 +1636,7 @@ static const struct { const char* name; int val; } THREAD_CONSTS[] = {
 **   xthread.init()   -- or xthread.init(my_handler) */
 LUALIB_API int luaopen_xthread(lua_State* L) {
     /* Create ThreadData metatable on first load */
-    luaL_newmetatable(L, THREAD_DATA_META);
-    lua_pushcfunction(L, thread_data_gc);
-    lua_setfield(L, -2, "__gc");
+    thread_data_push_meta(L);
     lua_pop(L, 1);
 
     luaL_newlib(L, xthread_funcs);
