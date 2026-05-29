@@ -78,7 +78,9 @@ C_UNIT_COVERAGE_CFLAGS := $(C_UNIT_CFLAGS) -O0 -g --coverage
 C_UNIT_COVERAGE_LDFLAGS := $(SYS_LDFLAGS) --coverage
 
 LUA_UNIT_SCRIPTS := \
-	tests/lua/http_codec_spec.lua
+	tests/lua/http_codec_spec.lua \
+	tests/lua/zone_spec.lua \
+	tests/lua/zone_host_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
