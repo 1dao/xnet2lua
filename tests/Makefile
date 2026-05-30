@@ -88,7 +88,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/combat_flow_spec.lua \
 	tests/lua/cluster_spec.lua \
 	tests/lua/gameload_spec.lua \
-	tests/lua/metrics_spec.lua
+	tests/lua/metrics_spec.lua \
+	tests/lua/chat_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
