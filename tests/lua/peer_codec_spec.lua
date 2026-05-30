@@ -148,6 +148,53 @@ spec.describe('peer_codec migration reserve (§19.1 hook 6)', function()
         local h = pc.decode_header(frame)
         spec.equal(h.msg_type, pc.MIGRATE)   -- caller logs + drops, never asserts
     end)
+
+    spec.it('classify routes every v1 type to DISPATCH', function()
+        local known = { pc.UPSTREAM, pc.DOWNSTREAM, pc.ZONE_CTRL, pc.COMBAT,
+                        pc.AOI, pc.BORDER_SUB, pc.WHISPER, pc.CONTROL }
+        for _, mt in ipairs(known) do
+            spec.truthy(pc.is_known(mt), 'known: ' .. mt)
+            spec.equal(pc.classify(mt), pc.DISPATCH, 'dispatch: ' .. mt)
+        end
+    end)
+
+    spec.it('classify drops the whole 0x30 migration band as DROP_MIGRATE', function()
+        spec.equal(pc.classify(pc.MIGRATE), pc.DROP_MIGRATE, '0x30 itself')
+        spec.equal(pc.classify(0x3F), pc.DROP_MIGRATE, 'top of the band')
+        spec.truthy(pc.is_migrate(0x30) and pc.is_migrate(0x3F))
+        spec.truthy(not pc.is_known(pc.MIGRATE), 'v1 does not handle migrate')
+    end)
+
+    spec.it('classify treats out-of-band/unknown types as DROP_UNKNOWN', function()
+        spec.equal(pc.classify(0x2F), pc.DROP_UNKNOWN, 'just below the band')
+        spec.equal(pc.classify(0x40), pc.DROP_UNKNOWN, 'just above the band')
+        spec.equal(pc.classify(0x99), pc.DROP_UNKNOWN, 'garbage type')
+        spec.equal(pc.classify(0x00), pc.DROP_UNKNOWN, 'zero')
+        spec.truthy(not pc.is_migrate(0x2F) and not pc.is_migrate(0x40))
+    end)
+
+    spec.it('classify_frame dispatches a real COMBAT frame with its header/body', function()
+        local frame = pc.encode_host_msg(2, 3, 'attack_player', 101, 7, 5)
+        local disp, h, body = pc.classify_frame(frame)
+        spec.equal(disp, pc.DISPATCH)
+        spec.equal(h.msg_type, pc.COMBAT)
+        spec.equal(pc.unpack_body(body)[1], 'attack_player', 'body still decodable')
+    end)
+
+    spec.it('classify_frame flags a MIGRATE frame for drop, header intact', function()
+        local frame = pc.encode({ msg_type = pc.MIGRATE, src_lane = 4, dst_lane = 4 },
+            'opaque-v2-body')
+        local disp, h = pc.classify_frame(frame)
+        spec.equal(disp, pc.DROP_MIGRATE)
+        spec.equal(h.src_lane, 4, 'header readable for logging')
+    end)
+
+    spec.it('classify_frame swallows a short/garbage frame without erroring', function()
+        local disp, h, body = pc.classify_frame('xx')
+        spec.equal(disp, pc.DROP_UNKNOWN, 'too short -> safe drop')
+        spec.nil_value(h, 'no header')
+        spec.nil_value(body)
+    end)
 end)
 
 local failures = spec.finish()

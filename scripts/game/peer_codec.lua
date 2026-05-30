@@ -30,6 +30,17 @@ M.WHISPER    = 0x21   -- direct message delivery (home_game known)
 M.MIGRATE    = 0x30   -- RESERVED for v2 migration; v1 must log+drop, never crash
 M.CONTROL    = 0xF0   -- control plane (heartbeat / topology)
 
+-- §14.4 reserves the 0x30 band for migration-class messages that only v2 emits.
+-- A rolling upgrade runs v1 and v2 side by side (§19.1 hook 6), so a v1 peer WILL
+-- receive these -- and must drop them, never assert.
+M.MIGRATE_MIN = 0x30
+M.MIGRATE_MAX = 0x3F
+
+-- classify() dispositions: hand the frame to the v1 handler, or drop it safely.
+M.DISPATCH      = 'dispatch'      -- a known v1 type -> unpack the body and handle
+M.DROP_MIGRATE  = 'drop_migrate'  -- reserved 0x30 band -> log+drop (v2 implements)
+M.DROP_UNKNOWN  = 'drop_unknown'  -- unrecognised / malformed -> log+drop
+
 M.MAGIC = 'PEER'
 M.ACK = string.char(0x01)
 M.HEADER_LEN = 13
@@ -178,6 +189,44 @@ end
 function M.unpack_body(body)
     if type(body) ~= 'string' or #body == 0 then return { n = 0 } end
     return pack_values(cmsgpack().unpack(body))
+end
+
+-- ----- dispatch guard (§19.1 hook 6 / §19.3 item 7) -----
+--
+-- The msg_types this v1 build actually handles. Everything else is dropped, not
+-- asserted: a v1 peer must survive both a v2 MIGRATE and outright garbage during
+-- a rolling upgrade. The 0x30 band is split out so the caller can log it as a
+-- known-future message ("migrate not supported in v1") rather than as corruption.
+local KNOWN = {
+    [M.UPSTREAM] = true, [M.DOWNSTREAM] = true,
+    [M.ZONE_CTRL] = true, [M.COMBAT] = true, [M.AOI] = true,
+    [M.BORDER_SUB] = true, [M.WHISPER] = true, [M.CONTROL] = true,
+}
+
+function M.is_known(msg_type)
+    return KNOWN[msg_type] == true
+end
+
+function M.is_migrate(msg_type)
+    return type(msg_type) == 'number'
+        and msg_type >= M.MIGRATE_MIN and msg_type <= M.MIGRATE_MAX
+end
+
+-- msg_type -> disposition (DISPATCH / DROP_MIGRATE / DROP_UNKNOWN). Pure lookup.
+function M.classify(msg_type)
+    if KNOWN[msg_type] then return M.DISPATCH end
+    if M.is_migrate(msg_type) then return M.DROP_MIGRATE end
+    return M.DROP_UNKNOWN
+end
+
+-- Decode a peer frame far enough to decide its disposition, WITHOUT trusting the
+-- body. Returns disposition, header, body. A frame too short to hold a header is
+-- itself a safe DROP_UNKNOWN (header nil), never an error -- the peer read loop
+-- can route every inbound frame through this without a pcall and never crash.
+function M.classify_frame(frame)
+    local header, body = M.decode_header(frame)
+    if not header then return M.DROP_UNKNOWN, nil, nil end
+    return M.classify(header.msg_type), header, body
 end
 
 return M
