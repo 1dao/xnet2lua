@@ -90,7 +90,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/gameload_spec.lua \
 	tests/lua/metrics_spec.lua \
 	tests/lua/chat_spec.lua \
-	tests/lua/chatfilter_spec.lua
+	tests/lua/chatfilter_spec.lua \
+	tests/lua/mailbox_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
