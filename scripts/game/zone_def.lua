@@ -18,6 +18,12 @@ M.LANE_COUNT = 6       -- T: lanes per game (matches GAME_BATTLE_WORKERS default
 M.GRID_SIZE = 32       -- AOI grid edge, world units. R = G/2 (design §8.1)
 M.ZONE_SIZE = 1024     -- zone edge, world units => 32x32 grids per zone
 M.WORLD_COLS = 16      -- zones per row; world is WORLD_COLS*ZONE_SIZE wide
+M.WORLD_ROWS = 16      -- zones per column; bounds the zone lattice vertically
+
+-- AOI grids per zone edge. A zone's local grid coords run 0 .. GRIDS_PER_ZONE-1;
+-- the edge cells (0 and GRIDS_PER_ZONE-1) are the ones whose 3x3 view spills into
+-- the neighbouring zone and so drive border subscription (design §8.4).
+M.GRIDS_PER_ZONE = floor(M.ZONE_SIZE / M.GRID_SIZE)
 
 -- World coord -> AOI grid coord (gx, gy), local to whatever zone the point is
 -- in. Grid coords are zone-relative; full positioning still needs the zone_id.
@@ -45,6 +51,44 @@ function M.neighbors9(gx, gy)
         end
     end
     return out
+end
+
+-- ----- zone lattice topology (design §8.4 border subscription) -----
+
+-- zone_id (1-based) -> lattice coords (zx, zy), row-major. Inverse of
+-- world_to_zone's zone numbering.
+function M.zone_coord(zone_id)
+    local idx = zone_id - 1
+    return idx % M.WORLD_COLS, floor(idx / M.WORLD_COLS)
+end
+
+-- lattice coords (zx, zy) -> zone_id, or nil when outside the world rectangle.
+function M.zone_at(zx, zy)
+    if zx < 0 or zx >= M.WORLD_COLS or zy < 0 or zy >= M.WORLD_ROWS then
+        return nil
+    end
+    return zy * M.WORLD_COLS + zx + 1
+end
+
+-- The zone's (0,0) corner expressed in GLOBAL grid units. Adding a zone-local
+-- grid coord to this yields a world-unique grid coord; subtracting it back out
+-- is how a neighbour translates a foreign entity into its own (possibly
+-- out-of-[0,GRIDS_PER_ZONE) ) local grid for ghost placement.
+function M.zone_origin_grid(zone_id)
+    local zx, zy = M.zone_coord(zone_id)
+    return zx * M.GRIDS_PER_ZONE, zy * M.GRIDS_PER_ZONE
+end
+
+-- World coord -> GLOBAL grid coord (NOT wrapped per zone, unlike pos_to_grid).
+function M.world_to_global_grid(x, y)
+    return floor(x / M.GRID_SIZE), floor(y / M.GRID_SIZE)
+end
+
+-- The neighbour zone one lattice step in direction (dzx, dzy) from zone_id, or
+-- nil at a world edge. Used to resolve a border egress direction to a zone_id.
+function M.neighbor_zone(zone_id, dzx, dzy)
+    local zx, zy = M.zone_coord(zone_id)
+    return M.zone_at(zx + dzx, zy + dzy)
 end
 
 -- zone_id -> owning (game_idx, lane_idx). v1: pure hash; static overrides win

@@ -87,6 +87,11 @@ spec.describe('peer_codec host message round-trip', function()
                 { { t = 3, id = 102, x = 1, y = 2 }, { t = 1, id = 103 } } },
             mt = pc.AOI, dst_id = 5050,
         },
+        {
+            name = 'border_ghost rides the BORDER_SUB type',
+            args = { 'border_ghost', 2, 1, 'enter', 777, 1030, 100 },
+            mt = pc.BORDER_SUB, dst_id = 777,
+        },
     }
 
     for _, c in ipairs(cases) do
@@ -115,6 +120,18 @@ spec.describe('peer_codec host message round-trip', function()
         spec.equal(#got, 2)
         spec.equal(got[1].t, 3); spec.equal(got[1].id, 102); spec.equal(got[1].x, 11)
         spec.equal(got[2].t, 2); spec.equal(got[2].id, 103)
+    end)
+
+    spec.it('border_ghost preserves its ev tag and world pos', function()
+        local frame = pc.encode_host_msg(2, 2, 'border_ghost', 2, 1, 'enter', 777, 1030, 100)
+        local _, body = pc.decode_header(frame)
+        local vals = pc.unpack_body(body)
+        -- vals = { 'border_ghost', zone_id, src_zone, ev, id, x, y }
+        spec.equal(vals[1], 'border_ghost')
+        spec.equal(vals[4], 'enter')
+        spec.equal(vals[5], 777)
+        spec.equal(vals[6], 1030)
+        spec.equal(vals[7], 100)
     end)
 
     spec.it('rejects an unknown host message', function()

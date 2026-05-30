@@ -38,16 +38,18 @@ M.HELLO_LEN = 9
 -- which zone_host message goes in which category, and which positional arg
 -- holds the target entity/sid (so the header's dst_player_id is meaningful).
 local MSG_TYPE_OF = {
-    enter_zone  = M.ZONE_CTRL,
-    leave_zone  = M.ZONE_CTRL,
-    player_move = M.ZONE_CTRL,
-    aoi_in      = M.AOI,
+    enter_zone   = M.ZONE_CTRL,
+    leave_zone   = M.ZONE_CTRL,
+    player_move  = M.ZONE_CTRL,
+    aoi_in       = M.AOI,
+    border_ghost = M.BORDER_SUB,
 }
 local DST_ID_ARG = {
-    enter_zone  = 2,   -- (zone_id, pid, route, pos)
-    leave_zone  = 2,   -- (zone_id, pid)
-    player_move = 2,   -- (zone_id, pid, pos)
-    aoi_in      = 1,   -- (sid, kind, zone_id, seq, payload)
+    enter_zone   = 2,   -- (zone_id, pid, route, pos)
+    leave_zone   = 2,   -- (zone_id, pid)
+    player_move  = 2,   -- (zone_id, pid, pos)
+    aoi_in       = 1,   -- (sid, kind, zone_id, seq, payload)
+    border_ghost = 4,   -- (zone_id, src_zone, ev, id, x, y)
 }
 
 -- cmsgpack is a C module present in worker threads; require lazily so the pure

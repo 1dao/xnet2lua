@@ -155,15 +155,36 @@ function M:recv(msg, ...)
         if z then z:move(pid, pos) end
     elseif msg == 'aoi_in' then
         self:_home_deliver(...)
+    elseif msg == 'border_ghost' then
+        -- owner role: a neighbour zone announced one of its edge entities. Inject
+        -- (or retract) it as a ghost in the target zone we own (design §8.4).
+        local zone_id, _src_zone, ev, id, x, y = ...
+        local z = owned_zone(self, zone_id)
+        if not z then return end
+        if ev == 'leave' then z:ghost_remove(id) else z:ghost_set(id, x, y) end
     end
 end
 
--- owner role: end-of-frame flush of every owned zone (design §9.3).
+-- owner role: route one border egress event to the neighbour zone that lies in
+-- its lattice direction. The neighbour's owner injects the ghost (§8.4).
+function M:_route_border(src_zone, e)
+    local nz = zone_def.neighbor_zone(src_zone, e.dgx, e.dgy)
+    if not nz then return end           -- world edge: no zone in that direction
+    self:_to_owner(nz, 'border_ghost', nz, src_zone, e.ev, e.id, e.x, e.y)
+end
+
+-- owner role: end-of-frame flush of every owned zone (design §9.3). After
+-- draining subscriber deltas, forward this frame's border egress so neighbour
+-- zones can refresh their ghost view of our edge entities.
 function M:tick()
-    for _, z in pairs(self.zones) do
-        z:flush(function(route, zone_id, seq, events)
-            self:_to_home(route, 'delta', zone_id, seq, events)
+    for zone_id, z in pairs(self.zones) do
+        z:flush(function(route, zid, seq, events)
+            self:_to_home(route, 'delta', zid, seq, events)
         end)
+        local egress = z:drain_border()
+        for i = 1, #egress do
+            self:_route_border(zone_id, egress[i])
+        end
     end
 end
 

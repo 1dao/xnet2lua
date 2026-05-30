@@ -128,7 +128,8 @@ local function peer_on_business(conn, frame)
         print(string.format('[GAME-BATTLE:%d] migrate frame dropped (v1)', lane))
         return
     end
-    if mt == peer_codec.ZONE_CTRL or mt == peer_codec.AOI then
+    if mt == peer_codec.ZONE_CTRL or mt == peer_codec.AOI
+    or mt == peer_codec.BORDER_SUB then
         if not host then return end
         local vals = peer_codec.unpack_body(body)
         if vals.n >= 1 then host:recv(unpack_args(vals, 1, vals.n)) end

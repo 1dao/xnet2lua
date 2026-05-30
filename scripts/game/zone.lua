@@ -12,6 +12,17 @@
 -- AOI visibility rule: a player at grid h sees grid g iff g is in the 3x3 block
 -- around h. This is symmetric, so the set of players occupying the 3x3 block
 -- around g IS the set of watchers of g -- no separate watcher index needed.
+--
+-- Cross-zone borders (design §8.4): an entity sitting on a zone edge cell has a
+-- view block that spills one cell into the neighbouring zone. Two mechanisms
+-- bridge that gap, both reusing the same 3x3 machinery:
+--   * EGRESS  -- a local subscriber on an edge cell is announced to the neighbour
+--               owner via `border_out`; zone_host routes it by lattice direction.
+--   * GHOST   -- a foreign entity the neighbour announced is injected here at its
+--               translated (possibly out-of-[0,N)) grid coord. Ghosts are visible
+--               to local subscribers but never receive deltas (they "see" from
+--               their own home zone). Symmetry therefore does NOT apply to ghosts,
+--               so they live in a separate layer rather than in `grid`.
 
 local zone_def = dofile('scripts/game/zone_def.lua')
 
@@ -28,8 +39,10 @@ function M.new(zone_id)
         zone_id     = zone_id,
         seq         = 0,        -- monotonic; stamps every delta (design §7.3)
         grid        = {},       -- grid[gx][gy] = { players = { [pid]=true } }
-        subscribers = {},       -- pid -> { route, pos = {x,y}, gx, gy }
+        subscribers = {},       -- pid -> { route, pos, gx, gy, border = {dirkey=dir} }
         pending     = {},       -- pid -> { event, ... }, cleared each flush
+        ghosts      = {},       -- gid -> { gx, gy, x, y }  foreign entities (§8.4)
+        border_out  = {},       -- egress events for neighbours, drained each frame
     }, M)
 end
 
@@ -77,6 +90,62 @@ local function push(zone, pid, ev)
     q[#q + 1] = ev
 end
 
+-- ----- cross-zone border helpers (design §8.4) -----
+
+-- A direction is one of the 8 lattice steps; key it 0..8 (4 = self, unused).
+local function dirkey(dgx, dgy) return (dgx + 1) * 3 + (dgy + 1) end
+
+-- Recompute which neighbour zones a subscriber on cell (sub.gx, sub.gy) is
+-- visible into, and diff against its previous set to emit enter/move/leave
+-- egress. `removed` forces the empty set (subscriber is leaving). Egress events
+-- carry the entity's world pos; zone_host translates direction -> neighbour zone.
+local function update_border(zone, pid, sub, removed)
+    local maxg = zone_def.GRIDS_PER_ZONE - 1
+    local newdirs = {}
+    if not removed then
+        local gx, gy = sub.gx, sub.gy
+        local atL, atR = (gx <= 0), (gx >= maxg)
+        local atD, atU = (gy <= 0), (gy >= maxg)
+        for dgx = -1, 1 do
+            for dgy = -1, 1 do
+                if dgx ~= 0 or dgy ~= 0 then
+                    local okx = (dgx == 0) or (dgx == -1 and atL) or (dgx == 1 and atR)
+                    local oky = (dgy == 0) or (dgy == -1 and atD) or (dgy == 1 and atU)
+                    if okx and oky then newdirs[dirkey(dgx, dgy)] = { dgx, dgy } end
+                end
+            end
+        end
+    end
+    local old = sub.border
+    for k, d in pairs(old) do
+        if not newdirs[k] then
+            zone.border_out[#zone.border_out + 1] =
+                { ev = 'leave', dgx = d[1], dgy = d[2], id = pid }
+        end
+    end
+    for k, d in pairs(newdirs) do
+        zone.border_out[#zone.border_out + 1] = {
+            ev = old[k] and 'move' or 'enter',
+            dgx = d[1], dgy = d[2], id = pid, x = sub.pos.x, y = sub.pos.y,
+        }
+    end
+    sub.border = newdirs
+end
+
+-- Ghosts (foreign entities) within the 3x3 block around (gx, gy). Returned as a
+-- map gid -> ghost. Ghosts live outside `grid`, so the normal watchers() never
+-- returns them; a moving local subscriber consults this to gain/lose ghosts.
+local function ghosts_in_block(zone, gx, gy)
+    local out = {}
+    for gid, g in pairs(zone.ghosts) do
+        if g.gx >= gx - 1 and g.gx <= gx + 1
+        and g.gy >= gy - 1 and g.gy <= gy + 1 then
+            out[gid] = g
+        end
+    end
+    return out
+end
+
 -- ----- subscription lifecycle (design §7.2) -----
 
 -- ENTER_ZONE: subscribe `pid` (with routing info `route`) at world `pos`.
@@ -85,7 +154,8 @@ end
 function M:enter(pid, route, pos)
     if self.subscribers[pid] then self:leave(pid) end   -- idempotent re-enter
     local gx, gy = zone_def.pos_to_grid(pos.x, pos.y)
-    self.subscribers[pid] = { route = route, pos = pos, gx = gx, gy = gy }
+    local sub = { route = route, pos = pos, gx = gx, gy = gy, border = {} }
+    self.subscribers[pid] = sub
     self.seq = self.seq + 1
 
     local snapshot = {}
@@ -96,7 +166,12 @@ function M:enter(pid, route, pos)
             snapshot[#snapshot + 1] = { id = wpid, x = s.pos.x, y = s.pos.y }
         end
     end
+    -- include any cross-border ghosts already visible from this cell.
+    for gid, g in pairs(ghosts_in_block(self, gx, gy)) do
+        snapshot[#snapshot + 1] = { id = gid, x = g.x, y = g.y }
+    end
     grid_add(self, gx, gy, pid)
+    update_border(self, pid, sub)               -- announce us to neighbours
     return snapshot, self.seq
 end
 
@@ -104,6 +179,7 @@ end
 function M:leave(pid)
     local sub = self.subscribers[pid]
     if not sub then return end
+    update_border(self, pid, sub, true)         -- retract us from neighbours
     grid_del(self, sub.gx, sub.gy, pid)
     self.subscribers[pid] = nil
     self.pending[pid] = nil             -- nothing to deliver to a leaver
@@ -132,6 +208,7 @@ function M:move(pid, pos)
                 push(self, wpid, { t = M.EV_MOVE, id = pid, x = pos.x, y = pos.y })
             end
         end
+        update_border(self, pid, sub)           -- refresh our pos at neighbours
         return
     end
 
@@ -163,6 +240,79 @@ function M:move(pid, pos)
             push(self, pid,  { t = M.EV_LEAVE, id = wpid })
         end
     end
+
+    -- the mover's own changing view of cross-border ghosts (one-directional:
+    -- ghosts don't gain/lose us here -- their home zone handles their side).
+    local old_g = ghosts_in_block(self, gx0, gy0)
+    local new_g = ghosts_in_block(self, gx1, gy1)
+    for gid, g in pairs(new_g) do
+        if not old_g[gid] then
+            push(self, pid, { t = M.EV_ENTER, id = gid, x = g.x, y = g.y })
+        end
+    end
+    for gid in pairs(old_g) do
+        if not new_g[gid] then push(self, pid, { t = M.EV_LEAVE, id = gid }) end
+    end
+
+    update_border(self, pid, sub)               -- our edge exposure may have changed
+end
+
+-- ----- ghost injection: the receiving side of a border subscription (§8.4) -----
+
+-- A foreign entity `gid` from a neighbour zone is at world (x, y). Translate to
+-- this zone's (out-of-range) local grid and push ENTER/MOVE/LEAVE to the local
+-- subscribers who can see that cell. The ghost itself is never a subscriber, so
+-- it receives nothing; its own visibility is maintained by its home zone.
+function M:ghost_set(gid, x, y)
+    local ogx, ogy = zone_def.zone_origin_grid(self.zone_id)
+    local ggx, ggy = zone_def.world_to_global_grid(x, y)
+    local gx, gy = ggx - ogx, ggy - ogy
+    local g = self.ghosts[gid]
+    self.seq = self.seq + 1
+    if not g then
+        self.ghosts[gid] = { gx = gx, gy = gy, x = x, y = y }
+        for wpid in pairs(watchers(self, gx, gy)) do
+            push(self, wpid, { t = M.EV_ENTER, id = gid, x = x, y = y })
+        end
+        return
+    end
+    if g.gx == gx and g.gy == gy then
+        g.x, g.y = x, y
+        for wpid in pairs(watchers(self, gx, gy)) do
+            push(self, wpid, { t = M.EV_MOVE, id = gid, x = x, y = y })
+        end
+        return
+    end
+    local old_w = watchers(self, g.gx, g.gy)
+    g.gx, g.gy, g.x, g.y = gx, gy, x, y
+    local new_w = watchers(self, gx, gy)
+    for wpid in pairs(new_w) do
+        push(self, wpid, old_w[wpid]
+            and { t = M.EV_MOVE,  id = gid, x = x, y = y }
+            or  { t = M.EV_ENTER, id = gid, x = x, y = y })
+    end
+    for wpid in pairs(old_w) do
+        if not new_w[wpid] then push(self, wpid, { t = M.EV_LEAVE, id = gid }) end
+    end
+end
+
+-- A foreign entity left this zone's border view (neighbour retracted it).
+function M:ghost_remove(gid)
+    local g = self.ghosts[gid]
+    if not g then return end
+    self.ghosts[gid] = nil
+    self.seq = self.seq + 1
+    for wpid in pairs(watchers(self, g.gx, g.gy)) do
+        push(self, wpid, { t = M.EV_LEAVE, id = gid })
+    end
+end
+
+-- Hand the frame's buffered border egress to the caller (zone_host), which maps
+-- each event's (dgx, dgy) to a neighbour zone and forwards it. Clears the buffer.
+function M:drain_border()
+    local out = self.border_out
+    self.border_out = {}
+    return out
 end
 
 -- ----- frame flush (design §9.3) -----

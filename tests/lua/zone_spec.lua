@@ -183,6 +183,90 @@ spec.describe('zone leave', function()
     end)
 end)
 
+-- ----- cross-zone border: ghosts + egress (design §8.4) -----
+
+-- right-edge cell of a zone is gx = GRIDS_PER_ZONE-1; pick a world x inside it.
+local EDGE_X = (zone_def.GRIDS_PER_ZONE - 1) * zone_def.GRID_SIZE + 1   -- gx=31
+local NEXT_X = zone_def.ZONE_SIZE + 1                                   -- next zone, gx=0
+
+local function find_egress(list, ev, dgx, dgy, id)
+    for _, e in ipairs(list) do
+        if e.ev == ev and e.dgx == dgx and e.dgy == dgy and e.id == id then
+            return e
+        end
+    end
+    return nil
+end
+
+spec.describe('zone border egress', function()
+    spec.it('announces an edge entity to the neighbour direction', function()
+        local z = Zone.new(1)
+        enter(z, 1, EDGE_X, 100)              -- right edge of zone 1
+        local out = z:drain_border()
+        spec.truthy(find_egress(out, 'enter', 1, 0, 1),
+            'right-edge entity egresses east (dgx=1)')
+    end)
+
+    spec.it('does not announce an interior entity', function()
+        local z = Zone.new(1)
+        enter(z, 1, 500, 500)                 -- grid (15,15) -- fully interior
+        spec.equal(#z:drain_border(), 0)
+    end)
+
+    spec.it('emits a leave egress when an edge entity leaves', function()
+        local z = Zone.new(1)
+        enter(z, 1, EDGE_X, 100)
+        z:drain_border()                      -- clear the enter egress
+        z:leave(1)
+        spec.truthy(find_egress(z:drain_border(), 'leave', 1, 0, 1),
+            'leaving an edge cell retracts the ghost east')
+    end)
+end)
+
+spec.describe('zone ghost injection', function()
+    spec.it('makes a foreign entity visible to a border watcher', function()
+        local z = Zone.new(1)
+        enter(z, 1, EDGE_X, 100)              -- local player on the right edge
+        drain(z)
+        z:ghost_set(99, NEXT_X, 100)          -- foreign entity just across border
+        local got = drain(z)
+        spec.truthy(find_event(got[1], Zone.EV_ENTER, 99),
+            'border watcher should see the ghost enter')
+    end)
+
+    spec.it('tracks ghost move then remove', function()
+        local z = Zone.new(1)
+        enter(z, 1, EDGE_X, 100)
+        z:ghost_set(99, NEXT_X, 100)
+        drain(z)
+        z:ghost_set(99, NEXT_X + 2, 105)      -- same ghost cell -> MOVE
+        local got = drain(z)
+        local mv = find_event(got[1], Zone.EV_MOVE, 99)
+        spec.truthy(mv, 'ghost move reaches the watcher')
+        spec.equal(mv.x, NEXT_X + 2)
+        z:ghost_remove(99)
+        spec.truthy(find_event(drain(z)[1], Zone.EV_LEAVE, 99),
+            'ghost remove reaches the watcher')
+    end)
+
+    spec.it('includes a pre-existing ghost in a new entrant snapshot', function()
+        local z = Zone.new(1)
+        z:ghost_set(99, NEXT_X, 100)          -- ghost present before anyone enters
+        local snap = enter(z, 1, EDGE_X, 100) -- enters into its view
+        local seen = false
+        for _, e in ipairs(snap) do if e.id == 99 then seen = true end end
+        spec.truthy(seen, 'snapshot should carry the visible ghost')
+    end)
+
+    spec.it('does not show a ghost to an interior player', function()
+        local z = Zone.new(1)
+        enter(z, 1, 500, 500)                 -- interior; far from the border
+        drain(z)
+        z:ghost_set(99, NEXT_X, 100)
+        spec.nil_value(drain(z)[1], 'interior player must not see the ghost')
+    end)
+end)
+
 -- ----- seq ordering -----
 
 spec.describe('zone seq', function()
