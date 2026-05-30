@@ -161,6 +161,54 @@ spec.describe('zone_host despawn', function()
     end)
 end)
 
+-- ----- v2 migration seam: subscriber home update (design §19.1 hook 5) -----
+--
+-- After a player migrates, the owner role swaps the cached route in place and the
+-- AOI fan-out must address the NEW home game+lane with NO change to zone.lua. The
+-- single-game build_world bus ignores `game`, so this test uses a bus that records
+-- each post's full {game, lane} address and proves A's delta now targets game 2.
+
+spec.describe('zone_host subscriber home update', function()
+    spec.it('reroutes a migrated subscriber AOI to its new home game/lane', function()
+        local hosts, posts = {}, {}
+        local function post(game, lane, msg, ...)
+            posts[#posts + 1] = { game = game, lane = lane, msg = msg, a = { ... } }
+            if game == 1 and hosts[lane] then hosts[lane]:recv(msg, ...) end
+        end
+        local function to_client() end
+        for lane = 1, zone_def.LANE_COUNT do
+            hosts[lane] = Host.new({ game = 1, lane = lane, post = post, to_client = to_client })
+        end
+        hosts[1]:spawn_player(A, A, { x = 2058, y = 10 })   -- zone 3, home lane 1
+        hosts[2]:spawn_player(B, B, { x = 2068, y = 20 })   -- zone 3, home lane 2
+
+        -- A migrates home {game1,lane1} -> {game2,lane5}; only the zone owner's
+        -- cached route record changes -- zone.lua internals stay untouched.
+        local ret = hosts[3]:update_subscriber_home(3, A, { home_game = 2, home_lane = 5, sid = A })
+        spec.truthy(ret, 'owner returns the swapped route')
+        spec.equal(ret.home_game, 2)
+
+        posts = {}                                          -- drop spawn/enter traffic
+        hosts[2]:client_move(B, { x = 2078, y = 20 })       -- same cell -> MOVE to A
+        hosts[3]:tick()                                     -- zone 3 owner flushes
+
+        local aoi
+        for _, p in ipairs(posts) do
+            if p.msg == 'aoi_in' and p.a[1] == A then aoi = p end
+        end
+        spec.truthy(aoi, 'A\'s AOI delta was posted')
+        spec.equal(aoi.game, 2, 'delta now routed to the migrated home game')
+        spec.equal(aoi.lane, 5, 'delta now routed to the migrated home lane')
+    end)
+
+    spec.it('returns nil when this lane does not own the zone', function()
+        local hosts = build_world()                          -- lane 1 != zone-3 owner
+        spec.nil_value(hosts[1]:update_subscriber_home(3, A,
+            { home_game = 2, home_lane = 5, sid = A }),
+            'a non-owner has no subscription to migrate')
+    end)
+end)
+
 local failures = spec.finish()
 
 return {

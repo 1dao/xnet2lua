@@ -202,6 +202,20 @@ function M:leave(pid)
     end
 end
 
+-- v2 seam (design §19.1 hook 5): a subscriber's home flips on migration. The zone
+-- only caches the route, so swapping that record in place is the ENTIRE change --
+-- the next flush / fx fan-out routes to the new home with no other code touched.
+-- That is precisely why a subscriber stores the full {home_game, home_lane, sid}
+-- rather than a bare `true` (the §19.1 反例). v1 never migrates a player, so it
+-- never calls this; the interface exists so v2's SUBSCRIBER_HOME_UPDATE handler is
+-- a one-liner. Returns the new route, or nil if `pid` is not subscribed here.
+function M:update_route(pid, new_route)
+    local sub = self.subscribers[pid]
+    if not sub then return nil end
+    sub.route = new_route
+    return sub.route
+end
+
 -- ----- movement (design §8.3) -----
 
 -- A subscribed player moved to world `pos`. Emits MOVE/ENTER/LEAVE for affected

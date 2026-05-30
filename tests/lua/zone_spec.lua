@@ -319,6 +319,37 @@ spec.describe('zone NPC combat', function()
     end)
 end)
 
+-- ----- v2 migration seam: subscriber home update (design §19.1 hook 5) -----
+
+spec.describe('zone subscriber home update', function()
+    spec.it('reroutes a subscriber to its new home in place', function()
+        local z = Zone.new(1)
+        enter(z, 1, 10, 10)
+        enter(z, 2, 20, 20)                 -- same cell: mutually visible
+        drain(z)                            -- clear the enter events
+        -- p1's home flips {1,1} -> {2,5}; the zone caches only the route, so
+        -- swapping that record is the entire migration (no other code touched).
+        local nr = { home_game = 2, home_lane = 5, sid = 1, id = 1 }
+        spec.equal(z:update_route(1, nr), nr, 'returns the new route')
+        z:move(2, { x = 25, y = 25 })       -- p1 should be told p2 moved
+        local got = {}
+        z:flush(function(route, _zid, _seq, events)
+            got[route.id] = { route = route, events = events }
+        end)
+        spec.truthy(got[1], 'p1 still receives deltas after migration')
+        spec.equal(got[1].route.home_game, 2, 'delta routed to the new home game')
+        spec.equal(got[1].route.home_lane, 5, 'delta routed to the new home lane')
+        spec.truthy(find_event(got[1], Zone.EV_MOVE, 2),
+            'the delta content is unchanged by the reroute')
+    end)
+
+    spec.it('returns nil for a pid that is not subscribed here', function()
+        local z = Zone.new(1)
+        spec.nil_value(z:update_route(99, { home_game = 2, home_lane = 5, sid = 99 }),
+            'nothing to migrate -> nil')
+    end)
+end)
+
 -- ----- seq ordering -----
 
 spec.describe('zone seq', function()

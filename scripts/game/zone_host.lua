@@ -175,6 +175,18 @@ function M:spawn_npc(zone_id, npc_id, x, y, hp)
     return z:spawn_npc(npc_id, x, y, hp)
 end
 
+-- owner role: a subscriber's home flipped on migration (design §19.1 hook 5). The
+-- zone caches only the route, so swapping that record is the ENTIRE change -- the
+-- next flush / fx fan-out routes to the new home untouched. v1 never migrates a
+-- player, so this is never called; the seam exists so v2's SUBSCRIBER_HOME_UPDATE
+-- handler is a one-liner. Returns the new route, or nil if we don't own the zone /
+-- pid isn't subscribed.
+function M:update_subscriber_home(zone_id, pid, new_route)
+    local z = owned_zone(self, zone_id)
+    if not z then return nil end
+    return z:update_route(pid, new_route)
+end
+
 -- home role: AOI/snapshot landed for one of our players. Applies the staleness
 -- guard (design §7.3) then forwards to the client.
 function M:_home_deliver(sid, kind, zone_id, seq, payload)
