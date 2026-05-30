@@ -80,7 +80,9 @@ C_UNIT_COVERAGE_LDFLAGS := $(SYS_LDFLAGS) --coverage
 LUA_UNIT_SCRIPTS := \
 	tests/lua/http_codec_spec.lua \
 	tests/lua/zone_spec.lua \
-	tests/lua/zone_host_spec.lua
+	tests/lua/zone_host_spec.lua \
+	tests/lua/peer_codec_spec.lua \
+	tests/lua/peer_mesh_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

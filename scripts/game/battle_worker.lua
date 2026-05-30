@@ -5,7 +5,11 @@
 
 local router = dofile('scripts/core/share/xrouter.lua')
 local zone_host = dofile('scripts/game/zone_host.lua')
+local peer_codec = dofile('scripts/game/peer_codec.lua')
 router.set_log_prefix('GAME-BATTLE')
+
+-- LuaJIT here exposes table.unpack, not the bare 5.1 global.
+local unpack_args = table.unpack or unpack
 
 function xthread.register(pt, h) return router.register(pt, h) end
 
@@ -39,6 +43,13 @@ local my_game = 1
 local battle_tids = {}        -- lane_idx -> tid (filled by 'battle_peers')
 local host
 local frame_timer
+
+-- Peer mesh (§6): this lane holds one diagonal TCP link to the SAME lane index
+-- in every other Game. Dialer side waits for ACK before it is "ready"; accept
+-- side (fd handed over by main) is ready the moment it sends ACK.
+local peer_conns = {}         -- peer_game_id -> conn (handshake complete)
+local peer_pending = {}       -- peer_game_id -> conn (dialer, awaiting ACK)
+local conn_peer_game = {}     -- conn -> peer_game_id
 
 local function u16be(n)
     return string.char(math.floor(n / 256) % 256, n % 256)
@@ -102,17 +113,123 @@ local function host_to_client(sid, kind, zone_id, seq, payload)
     end
 end
 
+-- ----- peer mesh: inbound business (§14.3 / §14.4) -----
+-- A decoded peer frame is just a zone_host (msg, ...) tuple; feed it straight
+-- into the local host, which knows whether it is the zone owner or the home.
+local function peer_on_business(conn, frame)
+    local hdr, body = peer_codec.decode_header(frame)
+    if not hdr then
+        print(string.format('[GAME-BATTLE:%d] bad peer frame (%d bytes)', lane, #frame))
+        return
+    end
+    local mt = hdr.msg_type
+    if mt == peer_codec.MIGRATE then
+        -- v2 rolling-upgrade hook: never assert, just drop (design §19.1 hook 6).
+        print(string.format('[GAME-BATTLE:%d] migrate frame dropped (v1)', lane))
+        return
+    end
+    if mt == peer_codec.ZONE_CTRL or mt == peer_codec.AOI then
+        if not host then return end
+        local vals = peer_codec.unpack_body(body)
+        if vals.n >= 1 then host:recv(unpack_args(vals, 1, vals.n)) end
+        return
+    end
+    print(string.format('[GAME-BATTLE:%d] unhandled peer msg_type=0x%02X dropped',
+        lane, mt))
+end
+
+local function clear_peer(conn)
+    local g = conn_peer_game[conn]
+    if not g then return end
+    conn_peer_game[conn] = nil
+    if peer_pending[g] == conn then peer_pending[g] = nil end
+    if peer_conns[g] == conn then peer_conns[g] = nil end
+    return g
+end
+
+-- Accept side: main already validated HELLO and handed us the fd; we are ready
+-- as soon as we send ACK.
+local peer_accept_handler = {}
+function peer_accept_handler.on_packet(conn, body) peer_on_business(conn, body) end
+function peer_accept_handler.on_close(conn, reason)
+    local g = clear_peer(conn)
+    if g then
+        print(string.format('[GAME-BATTLE:%d] peer game=%d closed (accept): %s',
+            lane, g, tostring(reason)))
+    end
+end
+
+-- Dialer side: connect, send HELLO, then the first inbound packet must be ACK.
+local peer_dial_handler = {}
+function peer_dial_handler.on_connect(conn, ip, port)
+    conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
+    local ok, err = conn:send(peer_codec.encode_hello(my_game, lane))
+    if not ok then
+        print(string.format('[GAME-BATTLE:%d] peer hello send failed: %s',
+            lane, tostring(err)))
+        conn:close('peer_hello_failed')
+    end
+end
+function peer_dial_handler.on_packet(conn, body)
+    local g = conn_peer_game[conn]
+    if not g then return end
+    if peer_conns[g] == conn then
+        peer_on_business(conn, body)
+        return
+    end
+    if #body == 1 and string.byte(body, 1) == GATE_ACK_BYTE then
+        peer_pending[g] = nil
+        peer_conns[g] = conn
+        print(string.format('[GAME-BATTLE:%d] peer game=%d ready (dialer)', lane, g))
+        return
+    end
+    print(string.format('[GAME-BATTLE:%d] peer game=%d unexpected pre-ack, closing',
+        lane, g))
+    conn:close('peer_expected_ack')
+    clear_peer(conn)
+end
+function peer_dial_handler.on_close(conn, reason)
+    local g = clear_peer(conn)
+    if g then
+        print(string.format('[GAME-BATTLE:%d] peer game=%d closed (dialer): %s',
+            lane, g, tostring(reason)))
+    end
+end
+
+-- Encode + send a zone_host (msg, ...) onto the diagonal link to peer_game. We
+-- are always on the lane that aligns with the target lane, so src=dst=lane.
+local function peer_send(peer_game, msg, ...)
+    local conn = peer_conns[peer_game]
+    if not conn then
+        -- target Game offline / not yet linked: drop (design §12.3).
+        print(string.format('[GAME-BATTLE:%d] no peer link to game=%s, drop msg=%s',
+            lane, tostring(peer_game), tostring(msg)))
+        return false
+    end
+    local frame, err = peer_codec.encode_host_msg(lane, lane, msg, ...)
+    if not frame then
+        print(string.format('[GAME-BATTLE:%d] peer encode failed: %s', lane, tostring(err)))
+        return false
+    end
+    return conn:send(frame)
+end
+
 -- zone_host deps: route a message to host (game, lane_idx). Only ever called for
 -- a REMOTE target (the host short-circuits same-lane work locally). Same-game
 -- cross-lane rides xthread.post (MessagePack-encodes the table args). Cross-game
--- needs the peer mesh, which is a later stage (design §6 / P4).
+-- aligns the lane locally first, then crosses the process boundary on the
+-- lane_N <-> lane_N diagonal (design §6.2: keeps peer traffic on the diagonal).
 local function host_post(game, lane_idx, msg, ...)
     if game == my_game then
         local tid = battle_tids[lane_idx]
         if tid then xthread.post(tid, msg, ...) end
+        return
+    end
+    if lane_idx == lane then
+        peer_send(game, msg, ...)
     else
-        print(string.format('[GAME-BATTLE:%d] drop cross-game msg=%s game=%s (no peer mesh)',
-            lane, tostring(msg), tostring(game)))
+        local tid = battle_tids[lane_idx]
+        if tid then xthread.post(tid, 'peer_forward', game, msg, ...) end
     end
 end
 
@@ -291,6 +408,57 @@ xthread.register('leave_zone', host_dispatch('leave_zone'))
 xthread.register('player_move', host_dispatch('player_move'))
 xthread.register('aoi_in', host_dispatch('aoi_in'))
 
+-- Peer accept (§6.1): main validated the HELLO and detached the fd to us. Attach
+-- it, register the link, and ACK so the dialer can start business traffic.
+xthread.register('peer_accept', function(fd, peer_game)
+    peer_game = tonumber(peer_game)
+    local conn, err = xnet.attach(fd, peer_accept_handler)
+    if not conn then
+        io.stderr:write('[GAME-BATTLE] peer attach failed: ' .. tostring(err) .. '\n')
+        return
+    end
+    conn:set_framing({ type = 'len16', max_packet = 64 * 1024 })
+    if peer_conns[peer_game] then peer_conns[peer_game]:close('peer_replaced') end
+    conn_peer_game[conn] = peer_game
+    peer_conns[peer_game] = conn
+    local ok, serr = conn:send(peer_codec.ACK)
+    if not ok then
+        print(string.format('[GAME-BATTLE:%d] peer ack send failed game=%s: %s',
+            lane, tostring(peer_game), tostring(serr)))
+        conn:close('peer_ack_failed')
+        clear_peer(conn)
+        return
+    end
+    print(string.format('[GAME-BATTLE:%d] peer game=%d accepted (ack sent)',
+        lane, peer_game))
+end)
+
+-- Peer dial (§6): main discovered a lower-id Game; this lane opens the diagonal
+-- link to the same lane index in that Game.
+xthread.register('peer_dial', function(peer_game, peer_host, peer_port)
+    peer_game = tonumber(peer_game)
+    peer_host = tostring(peer_host or '')
+    peer_port = tonumber(peer_port)
+    if not peer_game or peer_host == '' or not peer_port then return end
+    if peer_conns[peer_game] or peer_pending[peer_game] then return end
+    local conn, err = xnet.connect(peer_host, peer_port, peer_dial_handler)
+    if not conn then
+        print(string.format('[GAME-BATTLE:%d] peer dial game=%d %s:%d failed: %s',
+            lane, peer_game, peer_host, peer_port, tostring(err)))
+        return
+    end
+    conn_peer_game[conn] = peer_game
+    peer_pending[peer_game] = conn
+    print(string.format('[GAME-BATTLE:%d] dialing peer game=%d at %s:%d',
+        lane, peer_game, peer_host, peer_port))
+end)
+
+-- Local-hop relay (§6.2): a sibling lane aligned the lane to us; we hold the
+-- diagonal link to the target Game, so finish the send.
+xthread.register('peer_forward', function(peer_game, msg, ...)
+    peer_send(tonumber(peer_game), msg, ...)
+end)
+
 local function __init()
     assert(xnet.init())
     xtimer.init(32)
@@ -301,6 +469,11 @@ local function __uninit()
     if reconnect_timer then reconnect_timer:del(); reconnect_timer = nil end
     if gate_conn    then gate_conn:close('uninit');    gate_conn = nil end
     if gate_pending then gate_pending:close('uninit'); gate_pending = nil end
+    for _, conn in pairs(peer_conns) do conn:close('uninit') end
+    for _, conn in pairs(peer_pending) do conn:close('uninit') end
+    peer_conns = {}
+    peer_pending = {}
+    conn_peer_game = {}
     xnet.uninit()
 end
 

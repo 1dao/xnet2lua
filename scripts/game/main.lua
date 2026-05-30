@@ -9,6 +9,7 @@
 local xnats = dofile('scripts/core/server/xnats.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
+local peer_codec = dofile('scripts/game/peer_codec.lua')
 router.set_log_prefix('GAME-MAIN')
 
 local ok_cfg, cfg_err = xutils.load_config('xnet.cfg')
@@ -24,10 +25,13 @@ local BATTLE_COUNT = tonumber(xutils.get_config('GAME_BATTLE_WORKERS', '6')) or 
 local WORK_COUNT = tonumber(xutils.get_config('GAME_WORK_WORKERS', '2')) or 2
 local GAME_INDEX = tonumber(xutils.get_config('GAME_INDEX', '1')) or 1
 local GAME_COUNT = tonumber(xutils.get_config('GAME_COUNT', '1')) or 1
+local PEER_HOST = xutils.get_config('GAME_PEER_HOST', '127.0.0.1')
+local PEER_PORT = tonumber(xutils.get_config('GAME_PEER_PORT', '19190')) or 19190
 local NATS_HOST = xutils.get_config('NATS_HOST', '127.0.0.1')
 local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local NATS_RPC_TIMEOUT_MS = tonumber(xutils.get_config('GAME_NATS_RPC_TIMEOUT_MS', '3000')) or 3000
+local HEARTBEAT_MS = tonumber(xutils.get_config('GAME_HEARTBEAT_MS', '5000')) or 5000
 
 local MAIN_ID = xthread.MAIN
 local BATTLE_BASE = xthread.WORKER_GRP1
@@ -48,6 +52,10 @@ local battle_ids = {}
 local work_ids = {}
 local nats_running = false
 local selected_gate
+local peer_listener
+local peer_admission_pending = {}    -- conn -> { ip, port }
+local dialed_peers = {}              -- peer_game_id -> true (dial broadcast sent)
+local heartbeat_timer
 
 local function sanitize_host(v)
     local value = tostring(v or '')
@@ -135,6 +143,38 @@ end)
 
 xthread.register('xadmin_announce', function(_name) end)
 
+local function broadcast_peer_dial(peer_game, host, port)
+    for lane = 1, BATTLE_COUNT do
+        local tid = battle_ids[lane]
+        if tid then xthread.post(tid, 'peer_dial', peer_game, host, port) end
+    end
+end
+
+-- Peer discovery (§6 / §0.7): NATS carries the announce, never hot data. We dial
+-- only Games with a smaller id; higher-id Games dial us (one link per pair). The
+-- battle lanes dedup repeat dials, so re-broadcasting on every heartbeat is safe.
+xthread.register('game_announce', function(name, peer_game, host, port, lane_count)
+    peer_game = tonumber(peer_game)
+    if not peer_game or peer_game >= GAME_INDEX then return end   -- self / we accept
+    host = sanitize_host(host)
+    port = sanitize_port(port)
+    if not host or not port then return end
+    if tonumber(lane_count) and tonumber(lane_count) ~= BATTLE_COUNT then
+        if not dialed_peers[peer_game] then
+            dialed_peers[peer_game] = true
+            xthread.log_error('[GAME-MAIN] peer game=%d lanes=%s != my lanes=%d, skip',
+                peer_game, tostring(lane_count), BATTLE_COUNT)
+        end
+        return
+    end
+    broadcast_peer_dial(peer_game, host, port)
+    if not dialed_peers[peer_game] then
+        dialed_peers[peer_game] = true
+        xthread.log_system('[GAME-MAIN] dial peer game=%d at %s:%d (lanes=%d)',
+            peer_game, tostring(host), port, BATTLE_COUNT)
+    end
+end)
+
 local next_remote_work = 0
 xthread.register('game_message', function(from, topic, payload)
     if #work_ids == 0 then
@@ -190,6 +230,12 @@ local function stop_workers()
     end
 end
 
+local function publish_heartbeat()
+    if not nats_running then return end
+    xnats.publish('xadmin_announce', PROCESS_NAME)
+    xnats.publish('game_announce', PROCESS_NAME, GAME_INDEX, PEER_HOST, PEER_PORT, BATTLE_COUNT)
+end
+
 local function start_nats()
     local routed_workers = { MAIN_ID }
     for i = 1, #work_ids do routed_workers[#routed_workers + 1] = work_ids[i] end
@@ -209,6 +255,70 @@ local function start_nats()
     nats_running = true
     xnats.bind_workers(work_ids)
     xnats.publish('xadmin_announce', PROCESS_NAME)
+    publish_heartbeat()
+    heartbeat_timer = xtimer.add(HEARTBEAT_MS, publish_heartbeat, -1)
+end
+
+-- Peer admission (§6.1): mirrors the gate's single-port admission. A peer lane
+-- dials here, sends a PEER HELLO, and we detach the fd to the same lane index.
+local peer_admission_handler = {}
+
+function peer_admission_handler.on_connect(conn, ip, port)
+    conn:set_framing({ type = 'len16', max_packet = 64 })
+    peer_admission_pending[conn] = { ip = ip, port = port }
+end
+
+function peer_admission_handler.on_packet(conn, body)
+    local st = peer_admission_pending[conn]
+    if not st then
+        conn:close('peer_admission_extra_packet')
+        return
+    end
+    peer_admission_pending[conn] = nil
+    local peer_game, lane, err = peer_codec.decode_hello(body)
+    if not peer_game then
+        xthread.log_error('[GAME-MAIN] peer admission bad hello from %s:%s: %s',
+            tostring(st.ip), tostring(st.port), tostring(err))
+        conn:close('peer_bad_hello')
+        return
+    end
+    if lane < 1 or lane > BATTLE_COUNT then
+        xthread.log_error('[GAME-MAIN] peer admission bad lane=%d (lanes=%d)',
+            lane, BATTLE_COUNT)
+        conn:close('peer_lane_out_of_range')
+        return
+    end
+    local target_tid = battle_ids[lane]
+    if not target_tid then
+        conn:close('peer_lane_unready')
+        return
+    end
+    local fd = conn:detach()
+    local ok, perr = xthread.post(target_tid, 'peer_accept', fd, peer_game)
+    if not ok then
+        xthread.log_error('[GAME-MAIN] peer admission post lane=%d failed: %s; closing fd',
+            lane, tostring(perr))
+        xnet.close_fd(fd)
+        return
+    end
+    xthread.log_info('[GAME-MAIN] peer admission: game=%d lane=%d -> tid=%d',
+        peer_game, lane, target_tid)
+end
+
+function peer_admission_handler.on_close(conn, reason)
+    if peer_admission_pending[conn] then
+        peer_admission_pending[conn] = nil
+    end
+end
+
+local function listen_peers()
+    if GAME_COUNT <= 1 then
+        xthread.log_system('[GAME-MAIN] GAME_COUNT=1, peer mesh disabled')
+        return
+    end
+    peer_listener = assert(xnet.listen(PEER_HOST, PEER_PORT, peer_admission_handler))
+    xthread.log_system('[GAME-MAIN] peer admission %s:%d game=%d lanes=%d',
+        PEER_HOST, PEER_PORT, GAME_INDEX, BATTLE_COUNT)
 end
 
 local function __init()
@@ -218,6 +328,7 @@ local function __init()
     xtimer.init(32)
     start_workers()
     start_nats()
+    listen_peers()
 
     -- Static endpoint lets a local deployment run even without a broker.
     send_topology_to_battles(GATE_TARGET ~= '' and GATE_TARGET or 'static',
@@ -225,6 +336,10 @@ local function __init()
 end
 
 local function __uninit()
+    if heartbeat_timer then heartbeat_timer:del(); heartbeat_timer = nil end
+    if peer_listener then peer_listener:close('uninit'); peer_listener = nil end
+    for conn in pairs(peer_admission_pending) do conn:close('uninit') end
+    peer_admission_pending = {}
     if nats_running then xnats.stop(true); nats_running = false end
     stop_workers()
     xnet.uninit()
