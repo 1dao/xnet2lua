@@ -335,6 +335,11 @@ function gate_handler.on_packet(conn, body)
         -- sid doubles as the entity id in v1 (one connection == one player).
         if host and #payload >= 8 then
             host:spawn_player(sid, sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
+            -- bring the player resident in the persistent store (§19.1.3 lifecycle);
+            -- persistence lives on the work lane, off the battle frame (§19.1.4).
+            if work_tid then
+                xthread.post(work_tid, 'battle_session_new', lane, sid)
+            end
         end
         return
     end
