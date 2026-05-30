@@ -7,6 +7,7 @@
 -- Run with: ./bin/xnet scripts/game/main.lua SERVER_NAME=game1
 
 local xnats = dofile('scripts/core/server/xnats.lua')
+local xredis = dofile('scripts/core/server/xredis.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
 local peer_codec = dofile('scripts/game/peer_codec.lua')
@@ -32,6 +33,10 @@ local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local NATS_RPC_TIMEOUT_MS = tonumber(xutils.get_config('GAME_NATS_RPC_TIMEOUT_MS', '3000')) or 3000
 local HEARTBEAT_MS = tonumber(xutils.get_config('GAME_HEARTBEAT_MS', '5000')) or 5000
+local REDIS_HOST = xutils.get_config('REDIS_HOST', '127.0.0.1')
+local REDIS_PORT = tonumber(xutils.get_config('REDIS_PORT', '6379')) or 6379
+local REDIS_DB = tonumber(xutils.get_config('REDIS_DB', '0')) or 0
+local REDIS_POOL = tonumber(xutils.get_config('REDIS_POOL', '4')) or 4
 
 local MAIN_ID = xthread.MAIN
 local BATTLE_BASE = xthread.WORKER_GRP1
@@ -51,6 +56,7 @@ function xthread.register(pt, h) return router.register(pt, h) end
 local battle_ids = {}
 local work_ids = {}
 local nats_running = false
+local redis_running = false
 local selected_gate
 local peer_listener
 local peer_admission_pending = {}    -- conn -> { ip, port }
@@ -230,6 +236,27 @@ local function stop_workers()
     end
 end
 
+-- §19.1.4 write-through target. xredis runs a singleton REDIS service thread; the
+-- work workers each dofile xredis and RPC their HGETALL/HSET to it, so the store's
+-- load/write never block a battle lane. Start it before the workers so the first
+-- player spawn can cold-load.
+local function start_redis()
+    local ok, err = xredis.start({
+        host = REDIS_HOST,
+        port = REDIS_PORT,
+        db = REDIS_DB,
+        pool_size = REDIS_POOL,
+        reconnect_ms = 1000,
+    })
+    if not ok then
+        xthread.log_error('[GAME-MAIN] xredis.start failed: %s', tostring(err))
+        return
+    end
+    redis_running = true
+    xthread.log_system('[GAME-MAIN] redis %s:%d db=%d pool=%d',
+        REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_POOL)
+end
+
 local function publish_heartbeat()
     if not nats_running then return end
     xnats.publish('xadmin_announce', PROCESS_NAME)
@@ -326,6 +353,7 @@ local function __init()
         PROCESS_NAME, BATTLE_COUNT, WORK_COUNT, BATTLES_PER_WORK)
     assert(xnet.init())
     xtimer.init(32)
+    start_redis()
     start_workers()
     start_nats()
     listen_peers()
@@ -341,7 +369,8 @@ local function __uninit()
     for conn in pairs(peer_admission_pending) do conn:close('uninit') end
     peer_admission_pending = {}
     if nats_running then xnats.stop(true); nats_running = false end
-    stop_workers()
+    stop_workers()                 -- workers force-flush their stores on the way out
+    if redis_running then xredis.stop(); redis_running = false end
     xnet.uninit()
     xthread.log_system('[GAME-MAIN] uninit')
 end

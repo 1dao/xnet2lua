@@ -48,16 +48,29 @@ function M.start(cfg)
 end
 
 function M.call(cmd, ...)
-    return xthread.rpc(REDIS_ID, 'xredis_call', 0, cmd, ...)
+    -- The RPC reply is (transport_ok, redis_ok, value): xrouter prepends its own
+    -- transport_ok, and the worker's xredis_call handler returns (redis_ok, value).
+    -- Collapse both `ok` flags into the conventional (ok, reply) callers expect; a
+    -- transport failure surfaces its error string in the second slot.
+    local transport_ok, redis_ok, value = xthread.rpc(REDIS_ID, 'xredis_call', 0, cmd, ...)
+    if not transport_ok then
+        return false, redis_ok
+    end
+    return redis_ok, value
 end
 
-function M.post(cb, cmd, ...)
-    if type(cb) ~= 'function' then
-        cmd = cb
+function M.post(cb, ...)
+    -- A non-function first arg IS the command: `post('HSET', key, ...)`. Fold it
+    -- back into the command args so nothing is dropped (the previous shift onto a
+    -- separate `cmd` param silently lost the first data arg, e.g. the hash key).
+    local args
+    if type(cb) == 'function' then
+        args = { n = select('#', ...), ... }
+    else
+        args = { n = select('#', ...) + 1, cb, ... }
         cb = nil
     end
 
-    local args = { n = select('#', ...) + 1, cmd, ... }
     local co = coroutine.create(function()
         local ok, value = M.call(unpack_args(args, 1, args.n))
         if cb then

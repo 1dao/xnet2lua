@@ -5,8 +5,10 @@
 -- of cross-process RPC handling.
 
 local xnats = dofile('scripts/core/server/xnats.lua')
+local xredis = dofile('scripts/core/server/xredis.lua')
 local router = dofile('scripts/core/share/xrouter.lua')
 local playerstore = dofile('scripts/game/playerstore.lua')
+local playerstore_redis = dofile('scripts/game/playerstore_redis.lua')
 router.set_log_prefix('GAME-WORK')
 
 function xthread.register(pt, h) return router.register(pt, h) end
@@ -29,13 +31,10 @@ end
 -- memory on the battle frame), and reclaims a player 30s after disconnect. v1 sid
 -- doubles as the player id (one connection == one player), so the store keys by sid.
 --
--- DEFERRED LIVE EDGE: load/write are the Redis sink. Until the work worker grows an
--- xredis client they are no-op stubs -- the lifecycle (spawn/disconnect/reap/flush)
--- is live, only the persistence target is not yet connected.
-local store = playerstore.new({
-    load = function(_sid) return {} end,
-    write = function(_sid, _fields) return true end,
-})
+-- load/write are backed by the Redis sink: HGETALL on cold spawn, field-level HSET
+-- (fire-and-forget, off the battle frame) on flush. The REDIS service thread is
+-- started once by game/main; every work worker RPCs HGETALL/HSET to it.
+local store = playerstore.new(playerstore_redis.make(xredis))
 
 xthread.register('game_work_start', function(worker_index, name)
     index = tonumber(worker_index) or 0
