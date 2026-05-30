@@ -6,14 +6,15 @@
 local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('GATE-WORKER')
 
+-- SID bit layout lives in exactly one place (design §19.1 hook 7).
+local sidcodec = dofile('scripts/gate/sid.lua')
+
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local K_C2S = string.rep('\1', 32)
 local K_S2C = string.rep('\2', 32)
 local CLIENT_MAX_BODY = 65535 - 24
 local SESSION_GONE = 0xFFFE
-local SID_LANE_MULTIPLIER = 16777216
-local SID_LOCAL_MAX = SID_LANE_MULTIPLIER - 1
 local BATTLE_ACK = string.char(0x01)    -- single-byte ACK sent right after attach
 
 local lane = 0
@@ -42,10 +43,8 @@ local function r32be(s, i)
 end
 
 local function alloc_sid()
-    if lane < 1 or next_local_sid > SID_LOCAL_MAX then
-        return nil
-    end
-    local sid = (lane - 1) * SID_LANE_MULTIPLIER + next_local_sid
+    local sid = sidcodec.encode(lane, next_local_sid)   -- single-site SID layout
+    if not sid then return nil end                       -- lane<1 or seq exhausted
     next_local_sid = next_local_sid + 1
     return sid
 end
