@@ -81,9 +81,11 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/http_codec_spec.lua \
 	tests/lua/zone_spec.lua \
 	tests/lua/zone_host_spec.lua \
+	tests/lua/combat_spec.lua \
 	tests/lua/peer_codec_spec.lua \
 	tests/lua/peer_mesh_spec.lua \
-	tests/lua/border_aoi_spec.lua
+	tests/lua/border_aoi_spec.lua \
+	tests/lua/combat_flow_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

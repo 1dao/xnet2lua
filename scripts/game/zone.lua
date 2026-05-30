@@ -43,6 +43,7 @@ function M.new(zone_id)
         pending     = {},       -- pid -> { event, ... }, cleared each flush
         ghosts      = {},       -- gid -> { gx, gy, x, y }  foreign entities (§8.4)
         border_out  = {},       -- egress events for neighbours, drained each frame
+        npcs        = {},        -- npc_id -> { x, y, gx, gy, hp, max_hp } (§7.5)
     }, M)
 end
 
@@ -80,6 +81,18 @@ local function watchers(zone, gx, gy)
                 end
             end
         end
+    end
+    return out
+end
+
+-- The subscriber routes watching cell (gx, gy): the AOI audience a combat fx
+-- must reach (design §7.4 "广播表现给同 grid 订阅者"). Each entry pairs the
+-- pid with the cached home route so zone_host can deliver without a lookup.
+local function watcher_routes(zone, gx, gy)
+    local out = {}
+    for pid in pairs(watchers(zone, gx, gy)) do
+        local s = zone.subscribers[pid]
+        if s then out[#out + 1] = { pid = pid, route = s.route } end
     end
     return out
 end
@@ -313,6 +326,59 @@ function M:drain_border()
     local out = self.border_out
     self.border_out = {}
     return out
+end
+
+-- ----- NPC combat: zone owner is authoritative (design §7.4.A, §7.5) -----
+--
+-- NPCs live on the zone owner lane (the opposite of players, who live on their
+-- home lane), so the zone owner settles every player->NPC hit with no lock and
+-- no cross-lane read: the attacker's position is already cached as a subscriber.
+
+-- Place an NPC at world (x, y) with `hp` (default 100). Returns the entity.
+function M:spawn_npc(npc_id, x, y, hp)
+    local gx, gy = zone_def.pos_to_grid(x, y)
+    local n = { x = x, y = y, gx = gx, gy = gy, hp = hp or 100, max_hp = hp or 100 }
+    self.npcs[npc_id] = n
+    return n
+end
+
+function M:npc(npc_id) return self.npcs[npc_id] end
+
+-- Settle one attacker_pid -> npc_id hit with the (already looked-up) skill_def
+-- { range, damage }. Validates the attacker is a local subscriber and within
+-- range of the NPC, then applies damage. Returns:
+--   result = { ok = true, npc_id, damage, npc_hp, dead, attacker_route }
+--          | { ok = false, reason = 'no_attacker'|'no_npc'|'out_of_range' }
+--   fx     = watcher_routes around the NPC (only when ok) -- the fx audience.
+-- Authority note: only this lane ever writes npc.hp, so the read-modify-write is
+-- race-free (design §9.2 "谁被改谁就是权威").
+function M:attack_npc(attacker_pid, npc_id, skill_def)
+    local atk = self.subscribers[attacker_pid]
+    if not atk then return { ok = false, reason = 'no_attacker' } end
+    local n = self.npcs[npc_id]
+    if not n or n.hp <= 0 then return { ok = false, reason = 'no_npc' } end
+    local dx, dy = atk.pos.x - n.x, atk.pos.y - n.y
+    if dx * dx + dy * dy > skill_def.range * skill_def.range then
+        return { ok = false, reason = 'out_of_range' }
+    end
+    local dmg = skill_def.damage
+    n.hp = n.hp - dmg
+    local dead = n.hp <= 0
+    if dead then n.hp = 0 end
+    local result = {
+        ok = true, npc_id = npc_id, damage = dmg, npc_hp = n.hp, dead = dead,
+        attacker_route = atk.route,
+    }
+    return result, watcher_routes(self, n.gx, n.gy)
+end
+
+-- The subscriber routes that should see a hit centred on `pid`'s cell -- used to
+-- fan a player-vs-player HIT_BROADCAST out as fx (design §7.4.B). Empty if pid
+-- is not (or no longer) a local subscriber.
+function M:fx_watchers(pid)
+    local s = self.subscribers[pid]
+    if not s then return {} end
+    return watcher_routes(self, s.gx, s.gy)
 end
 
 -- ----- frame flush (design §9.3) -----

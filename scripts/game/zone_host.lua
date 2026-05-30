@@ -18,6 +18,9 @@
 
 local zone_def = dofile('scripts/game/zone_def.lua')
 local Zone = dofile('scripts/game/zone.lua')
+local combat = dofile('scripts/game/combat.lua')
+
+local DEFAULT_HP = 100
 
 local M = {}
 M.__index = M
@@ -75,14 +78,43 @@ function M:_to_home(route, kind, zone_id, seq, payload)
     end
 end
 
+-- Deliver a message to an explicit home route (self when local). Used by the
+-- combat settler, which already holds the recipient's cached route (the zone
+-- owner has the attacker's subscription route; §7.4).
+function M:_to_route(route, msg, ...)
+    if route.home_game == self.game and route.home_lane == self.lane then
+        self:recv(msg, ...)
+    else
+        self.post(route.home_game, route.home_lane, msg, ...)
+    end
+end
+
+-- Deliver a message to a player's home lane, resolved from the id ALONE via the
+-- lifetime-fixed affinity hash (design §9.1): an attacker routes ATTACK_PLAYER
+-- to its target without ever holding the target's route.
+function M:_to_player_home(pid, msg, ...)
+    local g, l = zone_def.resolve_player_home(pid)
+    if g == self.game and l == self.lane then
+        self:recv(msg, ...)
+    else
+        self.post(g, l, msg, ...)
+    end
+end
+
 -- ----- home role: lifecycle (design §19.1 hook 3) -----
 
 -- Bring a player online on this (its home) lane. runtime_hint is nil in v1 (cold
 -- load from Redis); v2 migration passes the live runtime state through here.
-function M:spawn_player(pid, sid, pos, _runtime_hint)
+function M:spawn_player(pid, sid, pos, runtime_hint)
     local route = { home_game = self.game, home_lane = self.lane, sid = sid }
     self.players[pid] = {
         sid = sid, pos = pos, current_zone = nil, last_seq = {}, route = route,
+        -- combat state lives ONLY here, on the home lane (design §9.1): hp is
+        -- authoritative, `known` caches other entities' last-seen world pos from
+        -- AOI so this lane can range-check an inbound ATTACK_PLAYER locally.
+        hp = (runtime_hint and runtime_hint.hp) or DEFAULT_HP,
+        max_hp = (runtime_hint and runtime_hint.max_hp) or DEFAULT_HP,
+        known = {},
     }
     self.sid_to_pid[sid] = pid
     self:_enter_zone(pid, zone_def.world_to_zone(pos.x, pos.y))
@@ -119,6 +151,30 @@ function M:client_move(pid, new_pos)
     end
 end
 
+-- home role: this player's client fired a skill at an NPC. The NPC is owned by
+-- the zone owner (design §7.4.A), so forward the intent there to be settled.
+function M:client_attack_npc(pid, npc_id, skill_id)
+    local p = self.players[pid]
+    if not p or not p.current_zone then return end
+    self:_to_owner(p.current_zone, 'attack_npc', p.current_zone, npc_id, pid, skill_id)
+end
+
+-- home role: this player's client fired a skill at another player. The TARGET's
+-- home lane is authoritative for its hp (design §9.1), so route the intent there
+-- by the target id alone -- we never need to know where the target physically is.
+function M:client_attack_player(pid, target_pid, skill_id)
+    if not self.players[pid] then return end
+    self:_to_player_home(target_pid, 'attack_player', target_pid, pid, skill_id)
+end
+
+-- owner role: place an NPC into a zone this lane owns (design §7.5). NPC AI/spawn
+-- all live here; v1 exposes just the placement so combat has a target.
+function M:spawn_npc(zone_id, npc_id, x, y, hp)
+    local z = owned_zone(self, zone_id)
+    if not z then return nil end
+    return z:spawn_npc(npc_id, x, y, hp)
+end
+
 -- home role: AOI/snapshot landed for one of our players. Applies the staleness
 -- guard (design §7.3) then forwards to the client.
 function M:_home_deliver(sid, kind, zone_id, seq, payload)
@@ -127,12 +183,24 @@ function M:_home_deliver(sid, kind, zone_id, seq, payload)
     if not p then return end
     if kind == 'snapshot' then
         p.last_seq[zone_id] = seq                       -- snapshot resets baseline
+        for _, e in ipairs(payload) do                  -- seed last-known positions
+            p.known[e.id] = { x = e.x, y = e.y }
+        end
         self.to_client(sid, 'snapshot', zone_id, seq, payload)
         return
     end
     if zone_id ~= p.current_zone then return end         -- tail from an old zone
     if seq <= (p.last_seq[zone_id] or 0) then return end -- out-of-order / stale
     p.last_seq[zone_id] = seq
+    -- maintain the last-known-pos cache the combat range check reads (§9.1):
+    -- ENTER/MOVE refresh the foreign entity's pos, LEAVE forgets it.
+    for _, e in ipairs(payload) do
+        if e.t == Zone.EV_LEAVE then
+            p.known[e.id] = nil
+        elseif e.x then
+            p.known[e.id] = { x = e.x, y = e.y }
+        end
+    end
     self.to_client(sid, 'delta', zone_id, seq, payload)
 end
 
@@ -162,6 +230,93 @@ function M:recv(msg, ...)
         local z = owned_zone(self, zone_id)
         if not z then return end
         if ev == 'leave' then z:ghost_remove(id) else z:ghost_set(id, x, y) end
+    elseif msg == 'attack_npc' then
+        self:_settle_attack_npc(...)
+    elseif msg == 'attack_player' then
+        self:_settle_attack_player(...)
+    elseif msg == 'damage_dealt' then
+        -- home role: the settler reported a hit our player landed -> floating number.
+        local pid, target_id, dmg, target_hp, dead = ...
+        local p = self.players[pid]
+        if not p then return end
+        self.to_client(p.sid, 'combat', p.current_zone or 0, 0,
+            { kind = 'damage', target = target_id, damage = dmg,
+              target_hp = target_hp, dead = dead })
+    elseif msg == 'hit_broadcast' then
+        self:_broadcast_hit(...)
+    elseif msg == 'combat_fx' then
+        -- home role: zone owner asked us to show a hit to one of our subscribers.
+        local sid, zone_id, attacker_id, target_id, skill_id, dmg = ...
+        local pid = self.sid_to_pid[sid]
+        local p = pid and self.players[pid]
+        if not p then return end
+        self.to_client(p.sid, 'combat', zone_id, 0,
+            { kind = 'fx', attacker = attacker_id, target = target_id,
+              skill = skill_id, damage = dmg })
+    end
+end
+
+-- owner role: settle a player->NPC hit (design §7.4.A). The zone is authoritative
+-- for the NPC; on success we send DAMAGE_DEALT back to the attacker's home (for
+-- the damage number / exp) and fan COMBAT_FX out to every same-grid subscriber.
+function M:_settle_attack_npc(zone_id, npc_id, attacker_pid, skill_id)
+    local z = self.zones[zone_id]
+    if not z then return end
+    local skill = combat.skill(skill_id)
+    if not skill then return end
+    local result, fx = z:attack_npc(attacker_pid, npc_id, skill)
+    if not result.ok then return end
+    self:_to_route(result.attacker_route, 'damage_dealt',
+        attacker_pid, npc_id, result.damage, result.npc_hp, result.dead)
+    for i = 1, #fx do
+        local w = fx[i]
+        self:_to_route(w.route, 'combat_fx',
+            w.route.sid, zone_id, attacker_pid, npc_id, skill_id, result.damage)
+    end
+end
+
+-- home role (target side): settle an inbound player->player hit (design §9.1).
+-- This lane owns the target's hp, so it validates locally (target online, the
+-- attacker was actually seen, in range) then applies damage. Results fan out to
+-- the target's own client (authoritative hp), the attacker's home (the number),
+-- and the zone owner (so it can broadcast the fx to nearby players).
+function M:_settle_attack_player(target_pid, attacker_pid, skill_id)
+    local tp = self.players[target_pid]
+    if not tp then return end                       -- target not home here / offline
+    local skill = combat.skill(skill_id)
+    if not skill then return end
+    local apos = tp.known[attacker_pid]
+    if not apos then return end                     -- never saw the attacker -> reject
+    if not combat.in_range(skill, tp.pos.x, tp.pos.y, apos.x, apos.y) then return end
+
+    local dmg = combat.roll_damage(skill, nil, tp)
+    tp.hp = (tp.hp or DEFAULT_HP) - dmg
+    local dead = tp.hp <= 0
+    if dead then tp.hp = 0 end
+
+    -- authoritative hp update to the target's own client.
+    self.to_client(tp.sid, 'combat', tp.current_zone or 0, 0,
+        { kind = 'hp', target = target_pid, hp = tp.hp, damage = dmg, dead = dead })
+    -- the damage number back to the attacker (resolve its home by id).
+    self:_to_player_home(attacker_pid, 'damage_dealt',
+        attacker_pid, target_pid, dmg, tp.hp, dead)
+    -- let the zone owner paint the hit for everyone watching the target's cell.
+    if tp.current_zone then
+        self:_to_owner(tp.current_zone, 'hit_broadcast',
+            tp.current_zone, attacker_pid, target_pid, skill_id)
+    end
+end
+
+-- owner role: a target's home asked us to show a player-vs-player hit to nearby
+-- subscribers (design §7.4.B). Fan COMBAT_FX to every watcher of the target cell.
+function M:_broadcast_hit(zone_id, attacker_pid, target_pid, skill_id)
+    local z = self.zones[zone_id]
+    if not z then return end
+    local fx = z:fx_watchers(target_pid)
+    for i = 1, #fx do
+        local w = fx[i]
+        self:_to_route(w.route, 'combat_fx',
+            w.route.sid, zone_id, attacker_pid, target_pid, skill_id, 0)
     end
 end
 

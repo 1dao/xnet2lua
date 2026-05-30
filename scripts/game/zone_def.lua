@@ -103,4 +103,29 @@ function M.resolve_zone_owner(zone_id)
     return game, lane
 end
 
+-- player_id -> owning (home_game, home_lane). Affinity is LIFETIME-FIXED (design
+-- §0 item 5): a player's hp/buff/cooldown live forever on this lane, and combat
+-- routes ATTACK_PLAYER to it by re-deriving it from the target id alone -- the
+-- attacker never carries the target's route, only its id (design §9.1). This is
+-- the single hashing site for player affinity, mirroring resolve_zone_owner.
+--
+-- A multiplicative hash (NOT raw `pid % T`) so contiguous id ranges spread
+-- across lanes instead of skewing onto a few (design §0 item 3). HASH_MUL is
+-- kept < 2^22 so `pid * HASH_MUL` stays exact in a Lua double for pid < 2^31.
+M.player_home_override = {}        -- [pid] = { game_idx, lane_idx }
+local HASH_MUL = 2654435           -- Knuth-ish constant, trimmed to stay exact
+local function pid_hash(pid)
+    local n = pid % 2147483648
+    return (n * HASH_MUL + 1013904223) % 4294967296
+end
+
+function M.resolve_player_home(pid)
+    local o = M.player_home_override[pid]
+    if o then return o[1], o[2] end
+    local h = pid_hash(pid)
+    local game = h % M.GAME_COUNT + 1
+    local lane = floor(h / M.GAME_COUNT) % M.LANE_COUNT + 1
+    return game, lane
+end
+
 return M

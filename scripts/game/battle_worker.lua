@@ -21,6 +21,9 @@ local OP_ENTER_WORLD = 0x0002             -- client -> server: x(u32) y(u32)
 local OP_MOVE = 0x0003                     -- client -> server: x(u32) y(u32)
 local OP_AOI_SNAPSHOT = 0x0004             -- server -> client: full view
 local OP_AOI_DELTA = 0x0005               -- server -> client: incremental view
+local OP_ATTACK_NPC = 0x0006             -- client -> server: npc_id(u32) skill(u16)
+local OP_ATTACK_PLAYER = 0x0007          -- client -> server: target(u32) skill(u16)
+local OP_COMBAT_EVENT = 0x0008           -- server -> client: see encode_combat
 local OP_SESSION_GONE = 0xFFFE
 local GATE_ACK_BYTE = 0x01
 
@@ -104,10 +107,31 @@ local function encode_delta(zone_id, seq, events)
     return table.concat(parts)
 end
 
+-- combat: kind(u8) zone(u32) a(u32) b(u32) damage(u32) value(u32) dead(u8) where
+-- (a,b,value) carry per-kind ids/hp:
+--   hp     -> a=target, b=0,        value=target_hp   (authoritative, to victim)
+--   damage -> a=target, b=0,        value=target_hp   (floating number, to attacker)
+--   fx     -> a=attacker, b=target, value=0           (effect, to nearby players)
+local COMBAT_KIND = { hp = 1, damage = 2, fx = 3 }
+local function encode_combat(zone_id, p)
+    local a, b, value
+    if p.kind == 'fx' then
+        a, b, value = p.attacker or 0, p.target or 0, 0
+    else
+        a, b, value = p.target or 0, 0, p.hp or p.target_hp or 0
+    end
+    return string.char(COMBAT_KIND[p.kind] or 0)
+        .. u32be(zone_id or 0) .. u32be(a) .. u32be(b)
+        .. u32be(p.damage or 0) .. u32be(value)
+        .. string.char(p.dead and 1 or 0)
+end
+
 -- zone_host deps: final delivery to a home client on this lane.
 local function host_to_client(sid, kind, zone_id, seq, payload)
     if kind == 'snapshot' then
         send_to_client(sid, OP_AOI_SNAPSHOT, encode_snapshot(zone_id, seq, payload))
+    elseif kind == 'combat' then
+        send_to_client(sid, OP_COMBAT_EVENT, encode_combat(zone_id, payload))
     else
         send_to_client(sid, OP_AOI_DELTA, encode_delta(zone_id, seq, payload))
     end
@@ -129,7 +153,7 @@ local function peer_on_business(conn, frame)
         return
     end
     if mt == peer_codec.ZONE_CTRL or mt == peer_codec.AOI
-    or mt == peer_codec.BORDER_SUB then
+    or mt == peer_codec.BORDER_SUB or mt == peer_codec.COMBAT then
         if not host then return end
         local vals = peer_codec.unpack_body(body)
         if vals.n >= 1 then host:recv(unpack_args(vals, 1, vals.n)) end
@@ -320,6 +344,18 @@ function gate_handler.on_packet(conn, body)
         end
         return
     end
+    if opcode == OP_ATTACK_NPC then
+        if host and #payload >= 6 then
+            host:client_attack_npc(sid, r32be(payload, 1), r16be(payload, 5))
+        end
+        return
+    end
+    if opcode == OP_ATTACK_PLAYER then
+        if host and #payload >= 6 then
+            host:client_attack_player(sid, r32be(payload, 1), r16be(payload, 5))
+        end
+        return
+    end
     if opcode == OP_SESSION_GONE then
         if host then host:despawn_player(sid) end
         if work_tid then
@@ -408,6 +444,13 @@ xthread.register('enter_zone', host_dispatch('enter_zone'))
 xthread.register('leave_zone', host_dispatch('leave_zone'))
 xthread.register('player_move', host_dispatch('player_move'))
 xthread.register('aoi_in', host_dispatch('aoi_in'))
+-- cross-lane combat inbox (design §7.4 / §9): same five msgs the peer mesh feeds
+-- in, but arriving from a sibling lane via xthread.post.
+xthread.register('attack_npc', host_dispatch('attack_npc'))
+xthread.register('attack_player', host_dispatch('attack_player'))
+xthread.register('damage_dealt', host_dispatch('damage_dealt'))
+xthread.register('hit_broadcast', host_dispatch('hit_broadcast'))
+xthread.register('combat_fx', host_dispatch('combat_fx'))
 
 -- Peer accept (§6.1): main validated the HELLO and detached the fd to us. Attach
 -- it, register the link, and ACK so the dialer can start business traffic.

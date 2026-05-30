@@ -267,6 +267,58 @@ spec.describe('zone ghost injection', function()
     end)
 end)
 
+-- ----- NPC combat: zone owner authority (design §7.4.A / §7.5) -----
+
+-- A skill_def is just { range, damage }; zone.lua never reaches into combat.lua.
+local MELEE = { range = 48, damage = 12 }
+
+spec.describe('zone NPC combat', function()
+    spec.it('settles an in-range hit and returns the fx audience', function()
+        local z = Zone.new(1)
+        enter(z, 1, 20, 20)                   -- attacker, grid (0,0)
+        z:spawn_npc(901, 24, 22, 50)          -- npc in the same cell
+        local r, fx = z:attack_npc(1, 901, MELEE)
+        spec.truthy(r.ok, 'the hit lands')
+        spec.equal(r.damage, 12)
+        spec.equal(r.npc_hp, 38)
+        spec.truthy(not r.dead, 'npc survives')
+        spec.equal(r.attacker_route.sid, 1, 'attacker route carried back for DAMAGE_DEALT')
+        local seen = false
+        for _, w in ipairs(fx) do if w.pid == 1 then seen = true end end
+        spec.truthy(seen, 'attacker is part of the fx audience')
+    end)
+
+    spec.it('rejects an out-of-range hit and leaves hp intact', function()
+        local z = Zone.new(1)
+        enter(z, 1, 20, 20)
+        z:spawn_npc(901, 500, 500, 50)        -- far across the zone
+        local r = z:attack_npc(1, 901, MELEE)
+        spec.truthy(not r.ok)
+        spec.equal(r.reason, 'out_of_range')
+        spec.equal(z:npc(901).hp, 50, 'a miss never touches hp')
+    end)
+
+    spec.it('rejects a hit from a non-subscriber', function()
+        local z = Zone.new(1)
+        z:spawn_npc(901, 20, 20, 50)
+        local r = z:attack_npc(42, 901, MELEE)
+        spec.truthy(not r.ok)
+        spec.equal(r.reason, 'no_attacker')
+    end)
+
+    spec.it('marks the npc dead, clamps hp at 0, and refuses a second hit', function()
+        local z = Zone.new(1)
+        enter(z, 1, 20, 20)
+        z:spawn_npc(901, 24, 22, 10)          -- one 12-dmg melee kills it
+        local r = z:attack_npc(1, 901, MELEE)
+        spec.truthy(r.dead, 'npc dies')
+        spec.equal(r.npc_hp, 0, 'hp clamped at 0, never negative')
+        local again = z:attack_npc(1, 901, MELEE)
+        spec.truthy(not again.ok, 'a corpse cannot be hit')
+        spec.equal(again.reason, 'no_npc')
+    end)
+end)
+
 -- ----- seq ordering -----
 
 spec.describe('zone seq', function()
