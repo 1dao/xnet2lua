@@ -155,4 +155,25 @@ function M.resolve_player_home(pid)
     return game, lane
 end
 
+-- Mint a NEW character's permanent home at creation (design §4.0). Returns
+-- (home_game, home_lane); the caller persists them (DB / player_home_override)
+-- and they never change for that character's lifetime.
+--
+--   * home_lane is ALWAYS the structural hash: T is a lifetime-fixed deployment
+--     constant (design §0 / §19), so the lane is not a choice.
+--   * home_game PREFERS the load picker (design §17.8: pick_least_loaded steers
+--     new characters onto the freest Game) and only falls back to the hash when
+--     no load intel is available (design §2: "DB 字段为主,缺字段时退化到 hash").
+--
+-- `pick_game` is an optional `function() -> game_id|nil` (e.g.
+-- gameload:picker(now)); with no picker, or when it returns nil, this is exactly
+-- resolve_player_home(pid) -- the pure-hash deployment.
+function M.assign_home(pid, pick_game)
+    local h = pid_hash(pid)
+    local home_lane = floor(h / M.GAME_COUNT) % M.LANE_COUNT + 1
+    local home_game = pick_game and pick_game() or nil
+    if not home_game then home_game = h % M.GAME_COUNT + 1 end
+    return home_game, home_lane
+end
+
 return M
