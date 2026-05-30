@@ -319,7 +319,12 @@ spec.describe('zone NPC combat', function()
     end)
 end)
 
--- ----- v2 migration seam: subscriber home update (design §19.1 hook 5) -----
+-- ----- v2-facing seam: subscriber home update (design §19.1 hook 5) -----
+--
+-- This is NOT a v1 feature: v1 never migrates a player, so update_route has no v1
+-- caller. The test drives the seam directly to prove that IF a future v2 swaps the
+-- cached route, the subscriber's deltas re-address to the new home with no change
+-- to any zone logic -- and that nothing else is required of v1 but to store it.
 
 spec.describe('zone subscriber home update', function()
     spec.it('reroutes a subscriber to its new home in place', function()

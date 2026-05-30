@@ -202,13 +202,19 @@ function M:leave(pid)
     end
 end
 
--- v2 seam (design §19.1 hook 5): a subscriber's home flips on migration. The zone
--- only caches the route, so swapping that record in place is the ENTIRE change --
--- the next flush / fx fan-out routes to the new home with no other code touched.
--- That is precisely why a subscriber stores the full {home_game, home_lane, sid}
--- rather than a bare `true` (the §19.1 反例). v1 never migrates a player, so it
--- never calls this; the interface exists so v2's SUBSCRIBER_HOME_UPDATE handler is
--- a one-liner. Returns the new route, or nil if `pid` is not subscribed here.
+-- v2-FACING SEAM, NOT USED IN v1 (design §19.1 hook 5). v1 has no player
+-- migration at all (design §2 / §7: home_game/home_lane 终身不变), so NOTHING in
+-- the v1 code path ever calls this -- v1 does not depend on it in any way.
+--
+-- v1's actual hook-5 obligation is satisfied by STORAGE alone: a subscriber
+-- already holds the full {home_game, home_lane, sid} route (see M.new / M:enter),
+-- not a bare `true` (the §19.1 反例), so flush / fx fan-out already route by that
+-- record and never by hash. THIS setter adds nothing v1 needs; it is purely the
+-- mutator that v2's SUBSCRIBER_HOME_UPDATE handler will call to swap that one
+-- cached record, so a migrated subscriber's deltas route to the new home with zero
+-- change to any zone logic. No player data is moved here -- player state never
+-- leaves its home lane. Kept at zero runtime cost as the documented 留口.
+-- Returns the new route, or nil if `pid` is not subscribed here.
 function M:update_route(pid, new_route)
     local sub = self.subscribers[pid]
     if not sub then return nil end

@@ -161,12 +161,14 @@ spec.describe('zone_host despawn', function()
     end)
 end)
 
--- ----- v2 migration seam: subscriber home update (design §19.1 hook 5) -----
+-- ----- v2-facing seam: subscriber home update (design §19.1 hook 5) -----
 --
--- After a player migrates, the owner role swaps the cached route in place and the
--- AOI fan-out must address the NEW home game+lane with NO change to zone.lua. The
--- single-game build_world bus ignores `game`, so this test uses a bus that records
--- each post's full {game, lane} address and proves A's delta now targets game 2.
+-- This is NOT a v1 feature: v1 never migrates a player, so update_subscriber_home
+-- has no v1 caller. The test drives the seam directly to prove that IF a future v2
+-- swaps the owner's cached route, the AOI fan-out re-addresses to the NEW home
+-- game+lane with NO change to zone.lua. The single-game build_world bus ignores
+-- `game`, so this test uses a bus that records each post's full {game, lane}
+-- address and proves A's delta now targets game 2.
 
 spec.describe('zone_host subscriber home update', function()
     spec.it('reroutes a migrated subscriber AOI to its new home game/lane', function()
