@@ -94,7 +94,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/mailbox_spec.lua \
 	tests/lua/fault_drill_spec.lua \
 	tests/lua/player_route_spec.lua \
-	tests/lua/sid_spec.lua
+	tests/lua/sid_spec.lua \
+	tests/lua/playerstore_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
