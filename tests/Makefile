@@ -85,7 +85,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/peer_codec_spec.lua \
 	tests/lua/peer_mesh_spec.lua \
 	tests/lua/border_aoi_spec.lua \
-	tests/lua/combat_flow_spec.lua
+	tests/lua/combat_flow_spec.lua \
+	tests/lua/cluster_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

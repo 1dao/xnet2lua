@@ -93,14 +93,41 @@ end
 
 -- zone_id -> owning (game_idx, lane_idx). v1: pure hash; static overrides win
 -- for hot zones (design §7.7). This is the only hashing site for zone owners.
-M.zone_owner_override = {}        -- [zone_id] = { game_idx, lane_idx }
+--
+-- Failover (design §3 / §17.3): a zone may carry a standby (game, lane). When the
+-- controller declares the zone's primary game down (M.mark_game_down), the owner
+-- resolves to that standby until the game is restored. Because this stays the one
+-- ownership site, every caller -- combat settlement, AOI broadcast, border
+-- subscription -- follows the flip without a change of its own.
+M.zone_owner_override = {}        -- [zone_id] = { game_idx, lane_idx } (primary)
+M.zone_standby = {}               -- [zone_id] = { game_idx, lane_idx } (failover)
+M.game_down = {}                  -- [game_idx] = true while controller-declared down
 
-function M.resolve_zone_owner(zone_id)
+local function primary_zone_owner(zone_id)
     local o = M.zone_owner_override[zone_id]
     if o then return o[1], o[2] end
     local lane = (zone_id - 1) % M.LANE_COUNT + 1
     local game = (zone_id - 1) % M.GAME_COUNT + 1
     return game, lane
+end
+
+function M.resolve_zone_owner(zone_id)
+    local game, lane = primary_zone_owner(zone_id)
+    if M.game_down[game] then
+        local sb = M.zone_standby[zone_id]
+        if sb then return sb[1], sb[2] end
+    end
+    return game, lane
+end
+
+-- Controller hooks (design §17.3). Idempotent: flip every zone whose primary
+-- lives on `game` to its standby owner, or restore the primary once healthy.
+function M.mark_game_down(game)
+    M.game_down[game] = true
+end
+
+function M.mark_game_up(game)
+    M.game_down[game] = nil
 end
 
 -- player_id -> owning (home_game, home_lane). Affinity is LIFETIME-FIXED (design
