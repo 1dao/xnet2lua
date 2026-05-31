@@ -5,6 +5,16 @@
 -- battle connection, so gameplay packets are forwarded without a cross-thread
 -- hop inside gate.
 --
+-- Client admission protocol (client -> gate, weak-auth scheme, design §4/§19.0
+-- 身份 ≠ 位置): a new client accept does NOT go to a round-robin worker. It goes to
+-- the auth lane first, which resolves the login frame to a permanent account_id,
+-- shards lane = hash(account_id)%T (zone_def's single affinity hash site), and hands
+-- the bare fd to that lane's worker -- so the session lands on the SAME lane its
+-- battle home / persistent state use. The worker sends a 1-byte PROCEED ack and then
+-- runs the existing salt/AEAD handshake. No AEAD state is migrated (none exists yet),
+-- so the handoff is a cheap fd move. (recv half: gate/worker.lua client_admit; send
+-- half: gate/auth_worker.lua; proven over real sockets by demo/gate_admit_main.lua.)
+--
 -- Internal admission protocol (battle -> gate, single port):
 --   1. battle connects to GATE_INTERNAL_PORT
 --   2. battle sends HELLO frame [lane_idx:1B] (LEN16-framed), then waits
@@ -16,9 +26,10 @@
 --
 -- Run with: ./bin/xnet scripts/gate/main.lua SERVER_NAME=gate1
 
-local xnats  = dofile('scripts/core/server/xnats.lua')
-local xutils = require('xutils')
-local router = dofile('scripts/core/share/xrouter.lua')
+local xnats    = dofile('scripts/core/server/xnats.lua')
+local xutils   = require('xutils')
+local router   = dofile('scripts/core/share/xrouter.lua')
+local zone_def = dofile('scripts/game/zone_def.lua')
 router.set_log_prefix('GATE-MAIN')
 
 local ok_cfg, cfg_err = xutils.load_config('xnet.cfg')
@@ -41,10 +52,23 @@ local MAIN_ID = xthread.MAIN
 local WORKER_BASE = xthread.WORKER_GRP1
 local WORKER_SCRIPT = 'scripts/gate/worker.lua'
 
+-- Weak-auth admission lane (design §4/§19.0). New client accepts land HERE first;
+-- it resolves the login frame to a permanent account_id and hands the fd to the
+-- owning lane's worker. Placed off the worker group (WORKER_GRP2) so its tid can
+-- never collide with a lane worker (WORKER_GRP1 + lane - 1).
+local AUTH_ID = xthread.WORKER_GRP2
+local AUTH_SCRIPT = 'scripts/gate/auth_worker.lua'
+
 assert(WORKER_COUNT >= 1 and WORKER_COUNT <= 20, 'GATE_WORKERS must be in [1,20]')
 assert(CLIENT_PORT >= 1 and CLIENT_PORT <= 65535, 'GATE_CLIENT_PORT must be in [1,65535]')
 assert(INTERNAL_PORT >= 1 and INTERNAL_PORT <= 65535,
     'GATE_INTERNAL_PORT must be in [1,65535]')
+-- The auth lane shards by hash(account_id) % zone_def.LANE_COUNT and posts to
+-- WORKER_BASE + lane - 1, so the lane->worker map must be exactly 1:1 (the single
+-- affinity hash site, design §19.1 hook 2). Fail loud rather than silently mis-route.
+assert(WORKER_COUNT == zone_def.LANE_COUNT, string.format(
+    'GATE_WORKERS (%d) must equal zone_def.LANE_COUNT (%d) for admission routing',
+    WORKER_COUNT, zone_def.LANE_COUNT))
 
 function xthread.register(pt, h) return router.register(pt, h) end
 
@@ -54,7 +78,6 @@ local admission_pending = {}     -- conn -> { ip, port }
 local client_listener
 local heartbeat_timer
 local nats_running = false
-local next_client_lane = 0
 
 xthread.register('gate_get_internal_addr', function()
     return true, INTERNAL_HOST, INTERNAL_PORT, WORKER_COUNT
@@ -71,11 +94,6 @@ end)
 -- NATS broadcasts are looped to the publishing process too.
 xthread.register('xadmin_announce', function(_name) end)
 xthread.register('gate_announce', function(_name, _host, _port, _workers) end)
-
-local function pick_client_worker()
-    next_client_lane = (next_client_lane % WORKER_COUNT) + 1
-    return worker_ids[next_client_lane], next_client_lane
-end
 
 local function start_workers()
     for lane = 1, WORKER_COUNT do
@@ -94,6 +112,20 @@ local function stop_workers()
         xthread.shutdown_thread(worker_ids[lane])
         worker_ids[lane] = nil
     end
+end
+
+-- The auth lane must come up AFTER the workers (so a handoff always finds its
+-- target lane) and is told the worker group's base tid + count: lane L's worker is
+-- WORKER_BASE + L - 1, the same arithmetic start_workers uses.
+local function start_auth()
+    local ok, err = xthread.create_thread(AUTH_ID, 'gate-auth', AUTH_SCRIPT)
+    assert(ok, err)
+    ok, err = xthread.post(AUTH_ID, 'gate_auth_start', WORKER_BASE, WORKER_COUNT)
+    assert(ok, err)
+end
+
+local function stop_auth()
+    xthread.shutdown_thread(AUTH_ID)
 end
 
 local function publish_heartbeat()
@@ -124,11 +156,14 @@ end
 local function listen_clients()
     client_listener = assert(xnet.listen_fd(CLIENT_HOST, CLIENT_PORT, {
         on_accept = function(_, fd, ip, port)
-            local tid, lane = pick_client_worker()
-            local ok, err = xthread.post(tid, 'client_accept', fd, ip, port)
+            -- Weak-auth admission (design §4/§19.0): every new client goes to the
+            -- auth lane first, NOT a round-robin worker. The auth lane resolves the
+            -- login frame to account_id, shards lane = hash(account_id)%T, and hands
+            -- the fd to that lane's worker. A worker is never picked here anymore.
+            local ok, err = xthread.post(AUTH_ID, 'auth_accept', fd, ip, port)
             if not ok then
-                xthread.log_error('[GATE-MAIN] client accept lane=%d failed: %s',
-                    lane, tostring(err))
+                xthread.log_error('[GATE-MAIN] client accept -> auth post failed: %s',
+                    tostring(err))
                 return false
             end
             return true
@@ -211,6 +246,7 @@ local function __init()
     assert(xnet.init())
     xtimer.init(32)
     start_workers()
+    start_auth()
     start_nats()
     listen_clients()
     listen_battles()
@@ -223,6 +259,9 @@ local function __uninit()
     for conn in pairs(admission_pending) do conn:close('uninit') end
     admission_pending = {}
     if nats_running then xnats.stop(true); nats_running = false end
+    -- Stop the auth lane before the workers so no late accept is handed to a
+    -- lane that is already tearing down.
+    stop_auth()
     stop_workers()
     xnet.uninit()
     xthread.log_system('[GATE-MAIN] uninit')
