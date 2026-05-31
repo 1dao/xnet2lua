@@ -28,8 +28,11 @@ end
 
 -- This work worker owns its lane's resident player store. Design §19.1.4 puts
 -- persistent state write-through on the non-battle lane (never accumulated as dirty
--- memory on the battle frame), and reclaims a player 30s after disconnect. v1 sid
--- doubles as the player id (one connection == one player), so the store keys by sid.
+-- memory on the battle frame), and reclaims a player 30s after disconnect. The store
+-- keys by the PERMANENT player_id the battle lane binds at login admission (§19.0
+-- 身份 ≠ 位置), so a returning player -- a new connection with a fresh sid but the
+-- same pid -- restores the state written through on their last disconnect. A session
+-- that never logged in falls back to its sid (anonymous, per-connection).
 --
 -- load/write are backed by the Redis sink: HGETALL on cold spawn, field-level HSET
 -- (fire-and-forget, off the battle frame) on flush. The REDIS service thread is
@@ -65,39 +68,44 @@ end)
 -- disconnect; a first-login player (no saved x/y) falls back to the coords the client
 -- proposed. We reply 'spawn_at' to the requesting battle lane, which builds the live
 -- entity -- the battle frame never blocks on the load.
-xthread.register('battle_session_new', function(battle_tid, lane, sid, fx, fy)
-    store:spawn(sid, nil, now_ms())
+xthread.register('battle_session_new', function(battle_tid, lane, sid, pid, fx, fy)
+    -- Cold-load is keyed by the permanent player_id (pid): a returning player -- a
+    -- NEW connection, fresh sid, same pid -- restores the state written through on
+    -- their last disconnect. sid is only the live delivery handle we echo back so
+    -- the battle lane builds the entity on the right channel.
+    store:spawn(pid, nil, now_ms())
     -- persistent hash values round-trip as strings (playerstore_redis limitation);
     -- tonumber recovers the integer, or nil -> fall back to the client's coords.
-    local x = tonumber(store:get(sid, 'x')) or fx
-    local y = tonumber(store:get(sid, 'y')) or fy
+    local x = tonumber(store:get(pid, 'x')) or fx
+    local y = tonumber(store:get(pid, 'y')) or fy
     if battle_tid and x and y then
         xthread.post(battle_tid, 'spawn_at', sid, x, y)
     end
-    print(string.format('[GAME-WORK:%d] lane=%s sid=%s spawn pos=%s,%s',
-        index, tostring(lane), tostring(sid), tostring(x), tostring(y)))
+    print(string.format('[GAME-WORK:%d] lane=%s sid=%s pid=%s spawn pos=%s,%s',
+        index, tostring(lane), tostring(sid), tostring(pid), tostring(x), tostring(y)))
 end)
 
-xthread.register('battle_session_gone', function(lane, sid, x, y)
+xthread.register('battle_session_gone', function(lane, sid, pid, x, y)
     -- §19.1.4 hook (4) write-through, made non-vacuous: the battle lane hands us
-    -- the player's logout position, which we mark as dirty persistent state. set()
-    -- never touches Redis itself -- the persist_timer's flush() drains the dirty
-    -- (x,y) to Redis via HSET within the time bound, off the battle frame. Position
-    -- is a real persistent field (first-class in OP_ENTER_WORLD/OP_MOVE), not a
-    -- fabricated stat, so this exercises the genuine v1 write-through path.
+    -- the player's logout position, which we mark as dirty persistent state under
+    -- the permanent player_id (pid). set() never touches Redis itself -- the
+    -- persist_timer's flush() drains the dirty (x,y) to Redis via HSET within the
+    -- time bound, off the battle frame. Position is a real persistent field
+    -- (first-class in OP_ENTER_WORLD/OP_MOVE), not a fabricated stat, so this
+    -- exercises the genuine v1 write-through path.
     local t = now_ms()
     if x ~= nil and y ~= nil then
-        store:set(sid, 'x', x, t)
-        store:set(sid, 'y', y, t)
+        store:set(pid, 'x', x, t)
+        store:set(pid, 'y', y, t)
     end
     -- A gone session starts the disconnect grace -- memory is kept briefly so a
     -- quick return skips the cold load, then reap() reclaims it (force-flushing any
-    -- field changed in the last sub-second). v1 never reuses a sid (a returning
-    -- client gets a fresh one), so the entry just ages out: the "断线 30s 没回来 →
-    -- 清内存,不丢数据" path.
-    store:disconnect(sid, t)
-    print(string.format('[GAME-WORK:%d] lane=%s sid=%s gone pos=%s,%s',
-        index, tostring(lane), tostring(sid), tostring(x), tostring(y)))
+    -- field changed in the last sub-second). Keyed by pid, a quick reconnect under
+    -- the SAME player_id reuses the warm entry; otherwise it ages out: the
+    -- "断线 30s 没回来 → 清内存,不丢数据" path, with the state safe in Redis.
+    store:disconnect(pid, t)
+    print(string.format('[GAME-WORK:%d] lane=%s sid=%s pid=%s gone pos=%s,%s',
+        index, tostring(lane), tostring(sid), tostring(pid), tostring(x), tostring(y)))
 end)
 
 -- Public game-to-game entry point. Remote calls are deliberately served on

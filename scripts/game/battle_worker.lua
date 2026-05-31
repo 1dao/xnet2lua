@@ -6,6 +6,7 @@
 local router = dofile('scripts/core/share/xrouter.lua')
 local zone_host = dofile('scripts/game/zone_host.lua')
 local peer_codec = dofile('scripts/game/peer_codec.lua')
+local player_route = dofile('scripts/game/player_route.lua')
 router.set_log_prefix('GAME-BATTLE')
 
 -- LuaJIT here exposes table.unpack, not the bare 5.1 global.
@@ -17,6 +18,7 @@ local RECONNECT_MS = 2000
 local INTERNAL_MAX_PAYLOAD = 65535 - 4 - 2
 local FRAME_MS = 50                       -- AOI flush cadence (~20 Hz)
 local OP_ECHO = 0x0001
+local OP_LOGIN = 0x0009                    -- client -> server: player_id(u32); ack echoes it
 local OP_ENTER_WORLD = 0x0002             -- client -> server: x(u32) y(u32)
 local OP_MOVE = 0x0003                     -- client -> server: x(u32) y(u32)
 local OP_AOI_SNAPSHOT = 0x0004             -- server -> client: full view
@@ -53,6 +55,15 @@ local frame_timer
 local peer_conns = {}         -- peer_game_id -> conn (handshake complete)
 local peer_pending = {}       -- peer_game_id -> conn (dialer, awaiting ACK)
 local conn_peer_game = {}     -- conn -> peer_game_id
+
+-- Session identity (§19.1 hooks 1+2 / §19.0 "身份 ≠ 位置"). The gate sid is a
+-- per-connection handle; the player_id is the PERMANENT key persistent state is
+-- filed under. Login binds them; ENTER_WORLD/SESSION_GONE look the pid up per
+-- packet (a mutable hashmap, never a closure constant -- §19.3 #1); the binding is
+-- dropped when the connection ends. The route table is the single resolve() site
+-- (hook 2): v1 fills it at login admission, v2's cross-game lookup reads it.
+local sid_pid = {}            -- sid -> player_id (this lane's live sessions)
+local routes = player_route.new()
 
 local function u16be(n)
     return string.char(math.floor(n / 256) % 256, n % 256)
@@ -331,17 +342,40 @@ function gate_handler.on_packet(conn, body)
         send_to_client(sid, OP_ECHO, payload)
         return
     end
+    if opcode == OP_LOGIN then
+        -- Admission (§4 / §19.1 hooks 1+2): the client declares its permanent
+        -- player_id and we bind it to this connection's sid. v1 TRUSTS the declared
+        -- id -- the gate AEAD handshake already authenticated the channel, but there
+        -- is no account DB yet, so a real auth/account lookup is this packet's
+        -- eventual replacement (NOT a security boundary today). We also record the
+        -- DB-sourced route at its design-named call site; home is structural in v1
+        -- (this lane/game, fixed pairing), and resolve() stays the one authority a
+        -- v2 cross-game lookup consults. Ack by echoing the bound id.
+        if #payload >= 4 then
+            local pid = r32be(payload, 1)
+            sid_pid[sid] = pid
+            routes:learn(pid, my_game, lane, sid)
+            send_to_client(sid, OP_LOGIN, u32be(pid))
+        end
+        return
+    end
     if opcode == OP_ENTER_WORLD then
         -- Defer the live spawn (§19.1.3 build_entity(persistent, runtime_hint)): the
         -- work lane owns the persistent store, so we ask IT to cold-load the player
         -- and resolve the spawn position, then it replies 'spawn_at'. The client's
         -- coords are only a first-login fallback -- a returning player spawns at the
-        -- logout location written through on their last disconnect. sid doubles as
-        -- the entity id in v1 (one connection == one player). on_packet can't block
-        -- on Redis, so the round-trip stays on the work lane, off the battle frame.
+        -- logout location written through on their last disconnect. We hand the work
+        -- lane the PERMANENT player_id (the persistence key, so the restore survives
+        -- a new connection) AND the sid (the live delivery handle it echoes back).
+        -- The live entity itself stays keyed by sid in v1: keying it by player_id
+        -- too would additionally require admission to place the session on the
+        -- player's home lane (hash(pid)%T), which this slice deliberately does not
+        -- change. A pre-login session falls back to sid (anonymous, per-connection).
+        -- on_packet can't block on Redis, so the round-trip stays off the battle frame.
         if host and work_tid and #payload >= 8 then
+            local pid = sid_pid[sid] or sid
             xthread.post(work_tid, 'battle_session_new',
-                xthread.current_id(), lane, sid, r32be(payload, 1), r32be(payload, 5))
+                xthread.current_id(), lane, sid, pid, r32be(payload, 1), r32be(payload, 5))
         end
         return
     end
@@ -370,12 +404,18 @@ function gate_handler.on_packet(conn, body)
         local pos = host and host:player_pos(sid)
         if host then host:despawn_player(sid) end
         if work_tid then
+            -- write-through is filed under the permanent player_id (§19.1.4), so the
+            -- logout position is what the SAME player cold-loads on a later connection.
+            local pid = sid_pid[sid] or sid
             if pos then
-                xthread.post(work_tid, 'battle_session_gone', lane, sid, pos.x, pos.y)
+                xthread.post(work_tid, 'battle_session_gone', lane, sid, pid, pos.x, pos.y)
             else
-                xthread.post(work_tid, 'battle_session_gone', lane, sid)
+                xthread.post(work_tid, 'battle_session_gone', lane, sid, pid)
             end
         end
+        -- the connection is over: forget the session binding. The route (keyed by the
+        -- permanent pid) is left intact -- a player's home never changes (§19.0).
+        sid_pid[sid] = nil
         return
     end
     if work_tid then
