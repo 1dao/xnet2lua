@@ -84,7 +84,7 @@ set "THREAD_EXE=xthread_test.exe"
 
 set "COMMON_SOURCES=..\xthread.c ..\xpoll.c ..\xsock.c ..\xchannel.c ..\xargs.c ..\xtimer.c ..\xdaemon.c ..\xlog.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% ..\3rd\rpmalloc\rpmalloc.c"
-set "XNET_SOURCES=..\xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
+set "XNET_SOURCES=..\xlua\xnet_main.c ..\xlua\lua_xthread.c ..\xlua\lua_xnet.c ..\xlua\lua_xnet_tls.c ..\xlua\lua_cmsgpack.c ..\xlua\lua_xutils.c ..\xlua\lua_xtimer.c ..\3rd\yyjson.c"
 set "THREAD_SOURCES=xthread_test.c"
 set "LUAJIT_DIR=..\3rd\luajit\src"
 set "LUAJIT_INC=..\3rd\luajit\src"
