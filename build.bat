@@ -66,42 +66,20 @@ if "%WITH_IO_URING%"=="1" (
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
 echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% rpmalloc=%WITH_RPMALLOC%
 
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+    echo %RED%[ERROR]%RESET% vswhere.exe not found. Install Visual Studio 2017+ or the VS Build Tools.
+    exit /b 1
+)
+
 set "VS_VCVARS="
-if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
-    for /f "usebackq tokens=*" %%P in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do (
-        set "VS_VCVARS=%%P"
-    )
+for /f "usebackq tokens=*" %%P in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find VC\Auxiliary\Build\vcvarsall.bat`) do (
+    set "VS_VCVARS=%%P"
 )
 
 if not defined VS_VCVARS (
-    for %%P in (
-        "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\Program Files\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "C:\software\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\software\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\software\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-        "D:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
-    ) do (
-        if exist %%P (
-            set "VS_VCVARS=%%P"
-            goto :found_vcvars
-        )
-    )
-)
-
-:found_vcvars
-if not defined VS_VCVARS (
-    echo %RED%[ERROR]%RESET% Visual Studio vcvarsall.bat not found.
+    echo %RED%[ERROR]%RESET% Visual Studio with VC x86/x64 tools not found via vswhere.
     exit /b 1
 )
 
