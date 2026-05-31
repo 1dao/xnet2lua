@@ -43,10 +43,9 @@ See [`xnet2lua-docs-en.md`](xnet2lua-docs-en.md) (or the Chinese version) for th
 ```
 xnet2lua/
   Makefile / build.bat       GNU make + MSVC entry points
-  xnet_main.c                "xnet" runner — the embeddable example main()
   x{poll,sock,thread,timer,channel,args,daemon,log}.[ch]
                              C core (event loop, thread pool, sockets, ...)
-  xlua/                      C->Lua bindings (luaopen_xnet, luaopen_xthread, ...)
+  xlua/                      Lua runner + C->Lua bindings (luaopen_xnet, luaopen_xthread, ...)
   scripts/core/share/        Reusable pure-Lua modules (xrouter, xhttp_router, xsession, ...)
   scripts/core/server/       Service threads (xhttp, xredis, xmysql, xnats workers)
   demo/                      Runnable example scripts + the xthread C regression
@@ -234,7 +233,7 @@ More entry points:
 
 ## Lua Modules
 
-C-registered (auto-loaded via `luaL_requiref` in `xnet_main.c`; `require()` works without a search path):
+C-registered (auto-loaded via `luaL_requiref` in `xlua/xnet_main.c`; `require()` works without a search path):
 
 | Module      | Purpose                                                            | Reference            |
 | ----------- | ------------------------------------------------------------------ | -------------------- |
