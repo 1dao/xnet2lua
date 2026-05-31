@@ -370,11 +370,12 @@ function gate_handler.on_packet(conn, body)
         -- logout location written through on their last disconnect. We hand the work
         -- lane the PERMANENT player_id (the persistence key, so the restore survives
         -- a new connection) AND the sid (the live delivery handle it echoes back).
-        -- The live entity itself stays keyed by sid in v1. Keying it by player_id too
-        -- is now UNBLOCKED -- weak-auth admission places the session on its home lane
-        -- (hash(pid)%T) and the gate authors the bound id -- but that change is left to
-        -- its own slice; v1 keeps the sid key. A pre-login session falls back to sid
-        -- (anonymous, per-connection).
+        -- The live entity is keyed by that player_id (see 'spawn_at'): weak-auth
+        -- admission placed this fd on its home lane (hash(pid)%T) and the gate authored
+        -- the bound id on OP_LOGIN, so the AOI id other clients see -- and target in
+        -- OP_ATTACK_PLAYER (§9.1) -- is the stable player_id, and resolve_player_home
+        -- routes an attack to the target's real home lane. A pre-login session falls
+        -- back to sid (anonymous, per-connection).
         -- on_packet can't block on Redis, so the round-trip stays off the battle frame.
         if host and work_tid and #payload >= 8 then
             local pid = sid_pid[sid] or sid
@@ -385,32 +386,35 @@ function gate_handler.on_packet(conn, body)
     end
     if opcode == OP_MOVE then
         if host and #payload >= 8 then
-            host:client_move(sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
+            host:client_move(sid_pid[sid] or sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
         end
         return
     end
     if opcode == OP_ATTACK_NPC then
         if host and #payload >= 6 then
-            host:client_attack_npc(sid, r32be(payload, 1), r16be(payload, 5))
+            host:client_attack_npc(sid_pid[sid] or sid, r32be(payload, 1), r16be(payload, 5))
         end
         return
     end
     if opcode == OP_ATTACK_PLAYER then
         if host and #payload >= 6 then
-            host:client_attack_player(sid, r32be(payload, 1), r16be(payload, 5))
+            host:client_attack_player(sid_pid[sid] or sid, r32be(payload, 1), r16be(payload, 5))
         end
         return
     end
     if opcode == OP_SESSION_GONE then
+        -- The live entity is keyed by the permanent player_id (gate-authored on
+        -- OP_LOGIN); resolve it ONCE for the despawn AND the write-through below. A
+        -- pre-login session falls back to its sid (anonymous, per-connection).
+        local pid = sid_pid[sid] or sid
         -- Capture the logout position BEFORE despawn drops the entity; the work
         -- lane write-throughs it to Redis as the player's persistent location
         -- (§19.1.4). pos is nil if the player never entered the world.
-        local pos = host and host:player_pos(sid)
-        if host then host:despawn_player(sid) end
+        local pos = host and host:player_pos(pid)
+        if host then host:despawn_player(pid) end
         if work_tid then
             -- write-through is filed under the permanent player_id (§19.1.4), so the
             -- logout position is what the SAME player cold-loads on a later connection.
-            local pid = sid_pid[sid] or sid
             if pos then
                 xthread.post(work_tid, 'battle_session_gone', lane, sid, pid, pos.x, pos.y)
             else
@@ -476,7 +480,12 @@ end)
 -- live entity now. This is the SAME spawn entry point v2 will call on the MIGRATE
 -- recv end; v1 only ever reaches it via this cold-load reply.
 xthread.register('spawn_at', function(sid, x, y)
-    if host then host:spawn_player(sid, sid, { x = x, y = y }) end
+    -- Key the live entity by the gate-authored player_id (admission placed this fd on
+    -- hash(pid)%T and the gate rewrote OP_LOGIN to the resolved id), so the AOI id
+    -- other clients see -- and target in OP_ATTACK_PLAYER (§9.1) -- is the stable
+    -- player_id; resolve_player_home(target) then routes an attack to its real home.
+    -- A pre-login (anonymous) session has no sid_pid entry and falls back to its sid.
+    if host then host:spawn_player(sid_pid[sid] or sid, sid, { x = x, y = y }) end
 end)
 
 -- Sibling lane directory + game index, sent once after 'battle_start'. With it
