@@ -110,7 +110,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xnet_main.lua \
 	demo/xrouter_test.lua \
 	demo/xhttp_router_test.lua \
-	demo/xhttp_main.lua
+	demo/xhttp_main.lua \
+	demo/gate_admit_main.lua
 
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \

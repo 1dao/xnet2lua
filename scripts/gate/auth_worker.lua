@@ -15,15 +15,21 @@
 -- The decision lives in admit.lua (pure, unit-tested by admit_spec). This file is the
 -- socket glue around it.
 --
--- NOT YET ON THE LIVE ACCEPT PATH. Two follow-ups complete the cutover and need
--- live/manual verification (they change the client login protocol), so they are kept
--- out of this tested building block:
+-- The RECV half of the handoff is done: gate/worker.lua handles 'client_admit'
+-- (attach, send the 1-byte PROCEED ack, then run the existing AEAD handshake). The
+-- whole login-frame -> admit -> fd-handoff -> PROCEED path is exercised over real
+-- sockets by demo/gate_admit_main.lua.
+--
+-- NOT YET ON THE LIVE ACCEPT PATH. The cutover's remaining steps change the client
+-- login protocol, so they need live/manual verification and are kept out until then:
 --   * gate/main.lua: start this thread and route new client accepts to 'auth_accept'
 --     here, instead of the round-robin pick_client_worker.
---   * gate/worker.lua: handle 'client_admit' -- send the 1-byte PROCEED ack (so the
---     client does not pipeline AEAD-handshake bytes into this lane's framing buffer,
---     which detach() would drop), then run the existing AEAD handshake and bind the
---     session under the carried account_id (the permanent player_id).
+--   * the client: send the login ticket first and await PROCEED before the salt, so
+--     no AEAD-handshake bytes are pipelined into this lane's framing buffer (which
+--     detach() would drop).
+--   * gate/worker.lua: bind the battle session under the carried account_id (the
+--     permanent player_id), replacing the client-sent OP_LOGIN -- the seam the admit
+--     handler records on conn_state today.
 
 local router = dofile('scripts/core/share/xrouter.lua')
 local auth = dofile('scripts/gate/auth.lua')
