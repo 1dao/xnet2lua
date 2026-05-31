@@ -100,7 +100,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/player_persist_spec.lua \
 	tests/lua/home_residency_spec.lua \
 	tests/lua/auth_spec.lua \
-	tests/lua/admit_spec.lua
+	tests/lua/admit_spec.lua \
+	tests/lua/gate_relay_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

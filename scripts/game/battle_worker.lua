@@ -343,14 +343,17 @@ function gate_handler.on_packet(conn, body)
         return
     end
     if opcode == OP_LOGIN then
-        -- Admission (§4 / §19.1 hooks 1+2): the client declares its permanent
-        -- player_id and we bind it to this connection's sid. v1 TRUSTS the declared
-        -- id -- the gate AEAD handshake already authenticated the channel, but there
-        -- is no account DB yet, so a real auth/account lookup is this packet's
-        -- eventual replacement (NOT a security boundary today). We also record the
-        -- DB-sourced route at its design-named call site; home is structural in v1
-        -- (this lane/game, fixed pairing), and resolve() stays the one authority a
-        -- v2 cross-game lookup consults. Ack by echoing the bound id.
+        -- Admission (§4 / §19.1 hooks 1+2): bind the connection's permanent player_id
+        -- to its sid. The id in this payload is GATE-AUTHORITATIVE for an admitted
+        -- session: weak-auth admission resolved the account_id and the gate worker
+        -- (relay.authoritative_login) substituted it for whatever the client declared,
+        -- so the bound id matches the lane this fd was placed on (hash(id)%T). We read
+        -- it straight from the payload -- the gate, not the client, is the authority,
+        -- closing the residency gap. (A v2 account DB would move the resolution itself,
+        -- still landing here as the gate-authored id.) We also record the route at its
+        -- design-named call site; home is structural in v1 (this lane/game, fixed
+        -- pairing), and resolve() stays the one authority a v2 cross-game lookup
+        -- consults. Ack by echoing the bound id so the client learns its real id.
         if #payload >= 4 then
             local pid = r32be(payload, 1)
             sid_pid[sid] = pid
@@ -367,10 +370,11 @@ function gate_handler.on_packet(conn, body)
         -- logout location written through on their last disconnect. We hand the work
         -- lane the PERMANENT player_id (the persistence key, so the restore survives
         -- a new connection) AND the sid (the live delivery handle it echoes back).
-        -- The live entity itself stays keyed by sid in v1: keying it by player_id
-        -- too would additionally require admission to place the session on the
-        -- player's home lane (hash(pid)%T), which this slice deliberately does not
-        -- change. A pre-login session falls back to sid (anonymous, per-connection).
+        -- The live entity itself stays keyed by sid in v1. Keying it by player_id too
+        -- is now UNBLOCKED -- weak-auth admission places the session on its home lane
+        -- (hash(pid)%T) and the gate authors the bound id -- but that change is left to
+        -- its own slice; v1 keeps the sid key. A pre-login session falls back to sid
+        -- (anonymous, per-connection).
         -- on_packet can't block on Redis, so the round-trip stays off the battle frame.
         if host and work_tid and #payload >= 8 then
             local pid = sid_pid[sid] or sid

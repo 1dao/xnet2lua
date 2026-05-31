@@ -9,6 +9,11 @@ router.set_log_prefix('GATE-WORKER')
 -- SID bit layout lives in exactly one place (design §19.1 hook 7).
 local sidcodec = dofile('scripts/gate/sid.lua')
 
+-- Gate-side identity authority over the client's in-band OP_LOGIN (design §4/§19.0):
+-- for an admitted session the gate substitutes the resolved account_id for whatever
+-- player_id the client declares, so battle binds under hash(account_id)%T == this lane.
+local relay = dofile('scripts/gate/relay.lua')
+
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local K_C2S = string.rep('\1', 32)
@@ -97,7 +102,11 @@ function client_handler.on_packet(conn, body)
     end
     if #body < 2 then return end
 
-    local ok, err = battle_conn:send(u32be(sid) .. body)
+    -- Identity is gate-authoritative for admitted sessions: rewrite the OP_LOGIN
+    -- player_id to the admission-resolved account_id (state.account_id, set only by
+    -- admit_handler). A non-admitted session or non-LOGIN body passes through.
+    local fwd = relay.authoritative_login(body, state.account_id)
+    local ok, err = battle_conn:send(u32be(sid) .. fwd)
     if not ok then
         print(string.format('[GATE-WORKER:%d] sid=%d battle send failed: %s',
             lane, sid, tostring(err)))
