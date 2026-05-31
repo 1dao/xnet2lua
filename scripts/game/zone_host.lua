@@ -129,6 +129,16 @@ function M:despawn_player(pid, _reason)
     self.players[pid] = nil
 end
 
+-- home role: the last-known world position of a resident player, or nil if the
+-- player is not home here. The battle lane reads this at disconnect to hand the
+-- logout location to the work lane, which write-throughs it to Redis (§19.1.4) --
+-- a position is the genuine v1 persistent field, not a fabricated stat. Returns
+-- the live pos table; callers must copy out x/y if they keep it past despawn.
+function M:player_pos(pid)
+    local p = self.players[pid]
+    return p and p.pos or nil
+end
+
 function M:_enter_zone(pid, zone_id)
     local p = self.players[pid]
     p.current_zone = zone_id

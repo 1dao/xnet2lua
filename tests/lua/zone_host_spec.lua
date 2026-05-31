@@ -161,6 +161,30 @@ spec.describe('zone_host despawn', function()
     end)
 end)
 
+-- The logout-position read the battle lane hands to the work lane for the §19.1.4
+-- write-through. It must reflect the LIVE position (post-move), and must be nil
+-- for a player who is not home here (so the work lane skips the persist).
+spec.describe('zone_host player_pos (§19.1.4 logout location)', function()
+    spec.it('returns the live position, tracking moves', function()
+        local hosts = build_world()
+        spawn_AB(hosts)
+        local pos = hosts[1]:player_pos(A)
+        spec.truthy(pos, 'A has a resident position')
+        spec.equal(pos.x, 2058); spec.equal(pos.y, 10)
+        hosts[1]:client_move(A, { x = 2078, y = 11 })       -- same zone, grid (0,0)
+        local moved = hosts[1]:player_pos(A)
+        spec.equal(moved.x, 2078); spec.equal(moved.y, 11)
+    end)
+
+    spec.it('returns nil for a player not home on this lane', function()
+        local hosts = build_world()
+        spawn_AB(hosts)
+        spec.nil_value(hosts[2]:player_pos(A), 'A is home on lane 1, not lane 2')
+        hosts[1]:despawn_player(A)
+        spec.nil_value(hosts[1]:player_pos(A), 'a despawned player has no position')
+    end)
+end)
+
 -- ----- v2-facing seam: subscriber home update (design §19.1 hook 5) -----
 --
 -- This is NOT a v1 feature: v1 never migrates a player, so update_subscriber_home

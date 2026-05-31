@@ -332,14 +332,16 @@ function gate_handler.on_packet(conn, body)
         return
     end
     if opcode == OP_ENTER_WORLD then
-        -- sid doubles as the entity id in v1 (one connection == one player).
-        if host and #payload >= 8 then
-            host:spawn_player(sid, sid, { x = r32be(payload, 1), y = r32be(payload, 5) })
-            -- bring the player resident in the persistent store (§19.1.3 lifecycle);
-            -- persistence lives on the work lane, off the battle frame (§19.1.4).
-            if work_tid then
-                xthread.post(work_tid, 'battle_session_new', lane, sid)
-            end
+        -- Defer the live spawn (§19.1.3 build_entity(persistent, runtime_hint)): the
+        -- work lane owns the persistent store, so we ask IT to cold-load the player
+        -- and resolve the spawn position, then it replies 'spawn_at'. The client's
+        -- coords are only a first-login fallback -- a returning player spawns at the
+        -- logout location written through on their last disconnect. sid doubles as
+        -- the entity id in v1 (one connection == one player). on_packet can't block
+        -- on Redis, so the round-trip stays on the work lane, off the battle frame.
+        if host and work_tid and #payload >= 8 then
+            xthread.post(work_tid, 'battle_session_new',
+                xthread.current_id(), lane, sid, r32be(payload, 1), r32be(payload, 5))
         end
         return
     end
@@ -362,9 +364,17 @@ function gate_handler.on_packet(conn, body)
         return
     end
     if opcode == OP_SESSION_GONE then
+        -- Capture the logout position BEFORE despawn drops the entity; the work
+        -- lane write-throughs it to Redis as the player's persistent location
+        -- (§19.1.4). pos is nil if the player never entered the world.
+        local pos = host and host:player_pos(sid)
         if host then host:despawn_player(sid) end
         if work_tid then
-            xthread.post(work_tid, 'battle_session_gone', lane, sid)
+            if pos then
+                xthread.post(work_tid, 'battle_session_gone', lane, sid, pos.x, pos.y)
+            else
+                xthread.post(work_tid, 'battle_session_gone', lane, sid)
+            end
         end
         return
     end
@@ -415,6 +425,14 @@ xthread.register('work_reply', function(sid, opcode, payload)
         print(string.format('[GAME-BATTLE:%d] work reply failed sid=%s: %s',
             lane, tostring(sid), tostring(err)))
     end
+end)
+
+-- Async completion of the enter-world handshake (§19.1.3): the work lane loaded
+-- this player's persistent state and resolved their spawn position, so build the
+-- live entity now. This is the SAME spawn entry point v2 will call on the MIGRATE
+-- recv end; v1 only ever reaches it via this cold-load reply.
+xthread.register('spawn_at', function(sid, x, y)
+    if host then host:spawn_player(sid, sid, { x = x, y = y }) end
 end)
 
 -- Sibling lane directory + game index, sent once after 'battle_start'. With it
