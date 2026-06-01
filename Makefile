@@ -137,7 +137,7 @@ XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(EXE_EXT)
 
 TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
-TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)
 

@@ -299,7 +299,9 @@ static void close_internal(xChannel* ch, const char* reason, bool notify) {
 #if defined(XCHANNEL_WITH_IO_URING)
     if (ch->read_req) {
         xpoll_cancel_request(ch->read_req);
+        ch->read_req = NULL;
     }
+    ch->read_pending = false;
     if (ch->write_req) {
         xpoll_cancel_request(ch->write_req);
         ch->write_req = NULL;
@@ -466,9 +468,9 @@ static int try_send_iov(SOCKET_T fd,
 
 static int arm_writable(xChannel* ch, bool while_connecting) {
 #if defined(XCHANNEL_WITH_IO_URING)
-    (void)while_connecting;
-    return xchannel_uring_arm_write(ch);
-#else
+    if (xpoll_uring_enabled())
+        return xchannel_uring_arm_write(ch);
+#endif
     xFileProc writable = while_connecting ? xchannel_connect_event
                                           : xchannel_write_event;
     if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
@@ -477,7 +479,6 @@ static int arm_writable(xChannel* ch, bool while_connecting) {
         return -1;
     }
     return 0;
-#endif
 }
 
 #if defined(XCHANNEL_WITH_IO_URING)
@@ -488,6 +489,16 @@ static int xchannel_uring_arm_read(xChannel* ch) {
     }
     if (ch->in.max > 0 && xbuf_size(&ch->in) > ch->in.max)
         return 0;
+
+    if (!xpoll_uring_enabled()) {
+        if (xpoll_add_event(ch->fd, XPOLL_READABLE,
+                            xchannel_read_event, NULL,
+                            xchannel_error_event, ch) != 0) {
+            xchannel_close(ch, "poll_error");
+            return -1;
+        }
+        return 0;
+    }
 
     if (!xbuf_reserve(&ch->in, XCHANNEL_READ_CHUNK)) {
         xchannel_close(ch, "out_of_memory");
@@ -514,6 +525,17 @@ static int xchannel_uring_arm_read(xChannel* ch) {
 static int xchannel_uring_arm_write(xChannel* ch) {
     if (!ch || ch->closed || !ch->attached ||
         ch->fd == INVALID_SOCKET_VAL || ch->write_pending) {
+        return 0;
+    }
+
+    if (!xpoll_uring_enabled()) {
+        xFileProc writable = ch->connect_pending ? xchannel_connect_event
+                                                 : xchannel_write_event;
+        if (xpoll_add_event(ch->fd, XPOLL_WRITABLE, NULL,
+                            writable, xchannel_error_event, ch) != 0) {
+            xchannel_close(ch, "poll_error");
+            return -1;
+        }
         return 0;
     }
 
@@ -934,7 +956,9 @@ void xchannel_destroy(xChannel* ch) {
 #if defined(XCHANNEL_WITH_IO_URING)
         if (ch->read_req) {
             xpoll_cancel_request(ch->read_req);
+            ch->read_req = NULL;
         }
+        ch->read_pending = false;
         if (ch->write_req) {
             xpoll_cancel_request(ch->write_req);
             ch->write_req = NULL;
@@ -1053,7 +1077,9 @@ void xchannel_detach(xChannel* ch) {
     ch->attached = false;
     if (ch->read_req) {
         xpoll_cancel_request(ch->read_req);
+        ch->read_req = NULL;
     }
+    ch->read_pending = false;
     if (ch->write_req) {
         xpoll_cancel_request(ch->write_req);
         ch->write_req = NULL;
