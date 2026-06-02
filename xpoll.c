@@ -36,8 +36,14 @@
 
 #include "xpoll.h"
 #include "xlog.h"
-#include "xhash.h"      /* transitively pulls xmacro.h */
-#include "xmacro.h"     /* explicit, in case xhash.h is replaced */
+#include "xhash.h"
+#if defined(__has_include)
+#  if __has_include("xmacro.h")
+#    include "xmacro.h" /* malloc/free -> rpmalloc when available */
+#  endif
+#else
+#  include "xmacro.h"
+#endif
 
 #if defined(XPOLL_WITH_IO_URING)
 #   include <liburing.h>
