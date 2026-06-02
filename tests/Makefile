@@ -4,6 +4,7 @@ BUILD_MODE ?= release
 WITH_HTTPS ?= 1
 WITH_RPMALLOC ?= 1
 WITH_XDEBUG ?= 0
+WITH_IO_URING ?= 0
 LUA_BACKEND ?= minilua
 LUAJIT_DIR ?= 3rd/luajit
 LUAJIT_INC ?= $(LUAJIT_DIR)/src
@@ -16,6 +17,11 @@ ifeq ($(WITH_RPMALLOC),1)
 	BASE_CFLAGS += -DENABLE_OVERRIDE=0 -DXMACRO_USE_RPMALLOC=1
 else
 	BASE_CFLAGS += -DXMACRO_USE_RPMALLOC=0
+endif
+ifeq ($(WITH_IO_URING),1)
+ifneq ($(OS),Windows_NT)
+	BASE_CFLAGS += -DXPOLL_USE_IO_URING -DXCHANNEL_USE_IO_URING
+endif
 endif
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS := $(BASE_CFLAGS) -O0 -g -DDEBUG
@@ -38,6 +44,12 @@ ifeq ($(OS),Windows_NT)
 	MV := /usr/bin/mv -f
 else
 	SYS_LDFLAGS += -lpthread -lm
+endif
+
+ifeq ($(WITH_IO_URING),1)
+ifneq ($(OS),Windows_NT)
+	SYS_LDFLAGS += -luring
+endif
 endif
 
 ifeq ($(WITH_HTTPS),1)
@@ -68,6 +80,11 @@ C_UNIT_BUILD := $(BIN_DIR)/test_core_build$(EXE_EXT)
 C_UNIT_TARGET := $(BIN_DIR)/test_core$(EXE_EXT)
 C_UNIT_RUNNER := bin/test_core$(EXE_EXT)
 C_UNIT_CFLAGS := -Wall -Wextra -I$(ROOT) -MMD -MP -DXMACRO_USE_RPMALLOC=0
+ifeq ($(WITH_IO_URING),1)
+ifneq ($(OS),Windows_NT)
+	C_UNIT_CFLAGS += -DXPOLL_USE_IO_URING
+endif
+endif
 
 C_UNIT_COVERAGE_OBJS := \
 	$(addprefix $(COVERAGE_DIR)/tests/,$(C_UNIT_LOCAL_SRCS:.c=.o)) \
@@ -126,6 +143,7 @@ ROOT_BUILD_ARGS := \
 	WITH_HTTPS="$(WITH_HTTPS)" \
 	WITH_RPMALLOC="$(WITH_RPMALLOC)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
+	WITH_IO_URING="$(WITH_IO_URING)" \
 	LUA_BACKEND="$(LUA_BACKEND)" \
 	LUAJIT_DIR="$(LUAJIT_DIR)" \
 	LUAJIT_INC="$(LUAJIT_INC)" \
@@ -135,6 +153,7 @@ SELF_ARGS := \
 	ROOT="$(ROOT)" \
 	CC="$(CC)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
+	WITH_IO_URING="$(WITH_IO_URING)" \
 	LUA_BACKEND="$(LUA_BACKEND)" \
 	LUAJIT_DIR="$(LUAJIT_DIR)" \
 	LUAJIT_INC="$(LUAJIT_INC)" \

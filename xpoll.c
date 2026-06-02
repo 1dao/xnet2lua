@@ -36,8 +36,14 @@
 
 #include "xpoll.h"
 #include "xlog.h"
-#include "xhash.h"      /* transitively pulls xmacro.h */
-#include "xmacro.h"     /* explicit, in case xhash.h is replaced */
+#include "xhash.h"
+#if defined(__has_include)
+#  if __has_include("xmacro.h")
+#    include "xmacro.h" /* malloc/free -> rpmalloc when available */
+#  endif
+#else
+#  include "xmacro.h"
+#endif
 
 #if defined(XPOLL_WITH_IO_URING)
 #   include <liburing.h>
@@ -135,12 +141,12 @@ static int _uring_mask_from_poll_events(int events) {
     if (events & POLLIN)  mask |= XPOLL_READABLE;
     if (events & POLLOUT) mask |= XPOLL_WRITABLE;
     if (events & POLLERR) mask |= XPOLL_ERROR;
-    if (events & POLLHUP) mask |= XPOLL_CLOSE;
+    if ((events & POLLHUP) && !(events & POLLIN)) mask |= XPOLL_CLOSE;
 #ifdef POLLNVAL
     if (events & POLLNVAL) mask |= XPOLL_ERROR | XPOLL_CLOSE;
 #endif
 #ifdef POLLRDHUP
-    if (events & POLLRDHUP) mask |= XPOLL_CLOSE;
+    if ((events & POLLRDHUP) && !(events & POLLIN)) mask |= XPOLL_CLOSE;
 #endif
     return mask;
 }
@@ -374,6 +380,9 @@ static void _pfd_sync(xPollState *loop, int idx) {
     if (!fe) return;
     if (fe->mask & XPOLL_READABLE) loop->poll_fds[idx].events |= POLLIN;
     if (fe->mask & XPOLL_WRITABLE) loop->poll_fds[idx].events |= POLLOUT;
+#ifdef POLLRDHUP
+    loop->poll_fds[idx].events |= POLLRDHUP;
+#endif
 }
 
 #endif /* poll / WSAPoll */
@@ -420,9 +429,12 @@ int xpoll_init(void) {
 
 #if defined(XPOLL_WITH_IO_URING)
     if (_uring_loop_init(loop) != 0) {
-        free(loop->ep_events);
-        close(loop->epfd);
-        goto fail;
+        int saved_errno = errno;
+        xlogw("[xpoll] io_uring unavailable, falling back to epoll: %s",
+              strerror(saved_errno));
+        loop->uring_ready = 0;
+        loop->uring_fd = -1;
+        errno = 0;
     }
 #endif
 
@@ -807,14 +819,16 @@ int xpoll_poll(int timeout_ms) {
 #if defined(XPOLL_BACKEND_EPOLL)
 
 int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
+int wait_ms = timeout_ms;
 #if defined(XPOLL_WITH_IO_URING)
-    num_processed += _uring_drain(loop);
-    if (num_processed > 0) return num_processed;
+    int drained = _uring_drain(loop);
+    num_processed += drained;
+    if (drained > 0) wait_ms = 0;
     if (loop->uring_ready) maxevents++;
 #endif
 
     if (maxevents > loop->setsize) maxevents = loop->setsize;
-    num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, timeout_ms);
+    num_ready = epoll_wait(loop->epfd, loop->ep_events, maxevents, wait_ms);
 
     if (num_ready < 0) {
         if (errno == EINTR) return 0;
@@ -837,9 +851,11 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe || fe->mask == XPOLL_NONE) continue;
 
         int mask = 0;
-        if (e->events & (EPOLLIN  | EPOLLRDHUP)) mask |= XPOLL_READABLE;
+        if (e->events & EPOLLIN)                  mask |= XPOLL_READABLE;
         if (e->events & EPOLLOUT)                 mask |= XPOLL_WRITABLE;
-        if (e->events & (EPOLLERR | EPOLLHUP))    mask |= XPOLL_ERROR | XPOLL_CLOSE;
+        if ((e->events & (EPOLLRDHUP | EPOLLHUP)) && !(e->events & EPOLLIN))
+                                                    mask |= XPOLL_CLOSE;
+        if (e->events & EPOLLERR)                 mask |= XPOLL_ERROR | XPOLL_CLOSE;
 
         SOCKET_T fd = fe->fd;
 
@@ -892,9 +908,12 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         if (!fe || fe->mask == XPOLL_NONE) continue;
 
         int mask = 0;
-        if (ke->filter == EVFILT_READ)   mask |= XPOLL_READABLE;
+        int readable = (ke->filter == EVFILT_READ)
+                       && (!(ke->flags & EV_EOF) || ke->data > 0);
+        if (readable)                    mask |= XPOLL_READABLE;
         if (ke->filter == EVFILT_WRITE)  mask |= XPOLL_WRITABLE;
-        if (ke->flags  & EV_EOF)         mask |= XPOLL_CLOSE;
+        if ((ke->flags & EV_EOF) && !readable)
+                                            mask |= XPOLL_CLOSE;
         if (ke->flags  & EV_ERROR)       mask |= XPOLL_ERROR;
 
         SOCKET_T fd = fe->fd;
@@ -952,7 +971,13 @@ int maxevents = (loop->nfds > 0) ? loop->nfds : 1;
         int mask = 0;
         if (revents & POLLIN)                       mask |= XPOLL_READABLE;
         if (revents & POLLOUT)                      mask |= XPOLL_WRITABLE;
-        if (revents & (POLLERR | POLLHUP | POLLNVAL))
+#ifdef POLLRDHUP
+        if ((revents & POLLRDHUP) && !(revents & POLLIN))
+                                                    mask |= XPOLL_CLOSE;
+#endif
+        if ((revents & POLLHUP) && !(revents & POLLIN))
+                                                    mask |= XPOLL_CLOSE;
+        if (revents & (POLLERR | POLLNVAL))
                                                     mask |= XPOLL_ERROR | XPOLL_CLOSE;
         loop->poll_fds[i].revents = 0;
 
@@ -1110,7 +1135,8 @@ int xpoll_cancel_request(xPollRequest *request) {
 /* Return the active backend name */
 const char* xpoll_name(void) {
 #if   defined(XPOLL_WITH_IO_URING)
-    return "epoll+io_uring";
+    xPollState *loop = _xpoll;
+    return (loop && loop->uring_ready) ? "epoll+io_uring" : "epoll";
 #elif defined(XPOLL_BACKEND_EPOLL)
     return "epoll";
 #elif defined(XPOLL_BACKEND_KQUEUE)
