@@ -18,6 +18,7 @@ LUA_BACKEND ?= minilua
 LUAJIT_DIR ?= 3rd/luajit
 LUAJIT_INC ?= $(LUAJIT_DIR)/src
 LUAJIT_LIB ?= $(LUAJIT_DIR)/src/libluajit.a
+QJS_DIR ?= 3rd/quickjs
 BUILD_MODE ?= release
 
 BASE_CFLAGS := -Wall -Wextra -I. -MMD -MP
@@ -50,6 +51,7 @@ CORE_DEPS := $(CORE_OBJS:.o=.d)
 
 EXE_EXT :=
 SYS_LDFLAGS :=
+QJS_EXTRA_LDFLAGS :=
 RM := rm -rf
 MKDIR := mkdir -p
 MV := mv -f
@@ -61,10 +63,15 @@ ifeq ($(OS),Windows_NT)
 	MV := /usr/bin/mv -f
 else
 	SYS_LDFLAGS += -lpthread -lm
+	QJS_EXTRA_LDFLAGS += -ldl
 endif
 
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
 XNET_CFLAGS := -I3rd/libdeflate
+QJS_CFLAGS := -I$(QJS_DIR) -D_GNU_SOURCE -DQUICKJS_NG_BUILD -Wno-unused-parameter -Wno-sign-compare -Wno-implicit-fallthrough
+ifeq ($(OS),Windows_NT)
+	QJS_CFLAGS += -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0601
+endif
 XNET_HTTPS_SRC :=
 
 # Pick libdeflate's per-arch cpu_features.c based on the host machine.
@@ -90,6 +97,10 @@ XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(EXE_EXT)
+XJS_BUILD := $(BIN_DIR)/xjs_build$(EXE_EXT)
+XJS_TARGET := $(BIN_DIR)/xjs$(EXE_EXT)
+QJS_SRC := $(QJS_DIR)/dtoa.c $(QJS_DIR)/libregexp.c $(QJS_DIR)/libunicode.c $(QJS_DIR)/quickjs.c $(QJS_DIR)/quickjs-libc.c
+XJS_SRC := xjs/xnet_main.c xjs/xjs_common.c xjs/xjs_runtime.c xjs/js_xutils.c xjs/js_xtimer.c xjs/js_xthread.c xjs/js_xnet.c
 
 # rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
 # directly. libxnet.a itself does NOT contain rpmalloc symbols, so xnet adds
@@ -145,11 +156,16 @@ $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 	$(RM) $(XDEBUG_DAP_TARGET)
 	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 -o $@ $(XDEBUG_DAP_SRCS) $(SYS_LDFLAGS)
 
-.PHONY: all xnet xdebug_dap clean $(TEST_TARGETS) run-lua
+.PHONY: all xnet xjs xjs-asan xdebug_dap clean $(TEST_TARGETS) run-lua run-js
 
-all: $(TARGET_LIB) $(XNET_TARGET) $(XDEBUG_DAP_TARGET)
+all: $(TARGET_LIB) $(XNET_TARGET) $(XJS_TARGET) $(XDEBUG_DAP_TARGET)
 
 xnet: $(XNET_TARGET)
+
+xjs: $(XJS_TARGET)
+
+xjs-asan:
+	$(MAKE) -B xjs CC="/c/software/msys64/clang64/bin/clang -fsanitize=address -fno-omit-frame-pointer -g" BUILD_MODE=debug WITH_RPMALLOC=0
 
 $(TARGET_LIB): $(CORE_OBJS)
 	$(AR) $(ARFLAGS) $@ $(CORE_OBJS)
@@ -161,6 +177,11 @@ $(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_S
 	$(RM) $(XNET_BUILD)
 	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
+
+$(XJS_TARGET): $(XJS_SRC) $(QJS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) | $(BIN_DIR)
+	$(RM) $(XJS_BUILD)
+	$(CC) $(CFLAGS) $(QJS_CFLAGS) $(XNET_DEFS) -o $(XJS_BUILD) $(XJS_SRC) $(QJS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(SYS_LDFLAGS) $(QJS_EXTRA_LDFLAGS)
+	$(MV) $(XJS_BUILD) $(XJS_TARGET)
 
 $(OBJ_DIR):
 	$(MKDIR) $(OBJ_DIR)
@@ -178,8 +199,15 @@ run-lua: $(XNET_TARGET)
 	fi
 	$(XNET_TARGET) $(SCRIPT)
 
+run-js: $(XJS_TARGET)
+	@if [ -z "$(SCRIPT)" ]; then \
+		echo "Usage: make run-js SCRIPT=demo/xjs_main.mjs"; \
+		exit 1; \
+	fi
+	$(XJS_TARGET) $(SCRIPT)
+
 clean:
-	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
+	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XJS_BUILD) $(XJS_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
 	$(TEST_MAKE) clean
 
 -include $(CORE_DEPS)

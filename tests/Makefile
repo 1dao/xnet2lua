@@ -113,6 +113,13 @@ LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xmysql_main.lua \
 	demo/xnats_main.lua
 
+XJS_RUNNER := bin/xjs$(EXE_EXT)
+JS_TEST_SCRIPTS := \
+	demo/xjs_smoke.mjs \
+	demo/xjs_timer_del.mjs \
+	demo/xjs_close_in_cb.mjs \
+	demo/xjs_raw_consume.mjs
+
 ROOT_BUILD_ARGS := \
 	CC="$(CC)" \
 	BUILD_MODE="$(BUILD_MODE)" \
@@ -135,7 +142,7 @@ SELF_ARGS := \
 	LUAJIT_INC="$(LUAJIT_INC)" \
 	LUAJIT_LIB="$(LUAJIT_LIB)"
 
-.PHONY: matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all run-lua xnet clean
+.PHONY: matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all run-lua xnet xjs test-js test-xjs clean
 
 matrix: ci-fast ci-feature
 
@@ -204,6 +211,17 @@ run-lua: xnet
 xnet:
 	$(MAKE) -C $(ROOT) xnet $(ROOT_BUILD_ARGS)
 
+xjs:
+	$(MAKE) -C $(ROOT) xjs $(ROOT_BUILD_ARGS)
+
+test-js: xjs
+	@set -e; \
+	cd $(ROOT); \
+	for script in $(JS_TEST_SCRIPTS); do \
+		echo "==> $$script"; \
+		$(XJS_RUNNER) $$script; \
+	done
+
 $(XTHREAD_TEST_TARGET): $(XTHREAD_TEST_SRCS) | $(BIN_DIR)
 	$(RM) $(XTHREAD_TEST_BUILD)
 	$(CC) $(CFLAGS) -o $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_SRCS) $(SYS_LDFLAGS)
@@ -225,6 +243,31 @@ $(COVERAGE_DIR)/tests/%.o: %.c
 $(COVERAGE_DIR)/%.o: $(ROOT)/%.c
 	$(MKDIR) $(dir $@)
 	$(CC) $(C_UNIT_COVERAGE_CFLAGS) -c $< -o $@
+
+XJS_OBJ_SRCS := \
+	$(ROOT)/xjs/xjs_common.c $(ROOT)/xjs/xjs_runtime.c \
+	$(ROOT)/xjs/js_xutils.c $(ROOT)/xjs/js_xtimer.c \
+	$(ROOT)/xjs/js_xthread.c $(ROOT)/xjs/js_xnet.c
+QJS_SRCS := \
+	$(ROOT)/3rd/quickjs/dtoa.c $(ROOT)/3rd/quickjs/libregexp.c \
+	$(ROOT)/3rd/quickjs/libunicode.c $(ROOT)/3rd/quickjs/quickjs.c \
+	$(ROOT)/3rd/quickjs/quickjs-libc.c
+XJS_CORE_SRCS := $(addprefix $(ROOT)/,xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c)
+XJS_TEST_SRCS := c/test_xjs_actor.c $(XJS_OBJ_SRCS) $(QJS_SRCS) $(XJS_CORE_SRCS)
+XJS_TEST_CFLAGS := -Wall -Wextra -I$(ROOT) -I$(ROOT)/3rd/quickjs \
+	-D_GNU_SOURCE -DQUICKJS_NG_BUILD -DXNET_WITH_HTTP=0 -DXNET_WITH_HTTPS=0 \
+	-DXMACRO_USE_RPMALLOC=0 \
+	-Wno-unused-parameter -Wno-sign-compare -Wno-implicit-fallthrough
+ifeq ($(OS),Windows_NT)
+	XJS_TEST_CFLAGS += -DWIN32_LEAN_AND_MEAN -D_WIN32_WINNT=0x0601
+endif
+XJS_TEST_TARGET := $(BIN_DIR)/test_xjs_actor$(EXE_EXT)
+
+test-xjs: $(XJS_TEST_TARGET)
+	cd $(ROOT) && bin/test_xjs_actor$(EXE_EXT)
+
+$(XJS_TEST_TARGET): $(XJS_TEST_SRCS) | $(BIN_DIR)
+	$(CC) $(XJS_TEST_CFLAGS) -o $@ $(XJS_TEST_SRCS) $(SYS_LDFLAGS)
 
 $(BIN_DIR):
 	$(MKDIR) $(BIN_DIR)
