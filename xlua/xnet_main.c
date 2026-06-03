@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "xargs.h"
 #include "xdaemon.h"
@@ -115,6 +116,8 @@ static void lua_runtime_post_init(lua_State* L) {
 
 static xArgsCFG g_arg_configs[] = {
     { 'c', "config", NULL, 0 },
+    { 'd', "daemon", NULL, 1 },
+    { 0,   "DAEMON", NULL, 0 },
     { 0,   "SERVER_NAME", NULL, 0 },
     { 0,   "NATS_HOST", NULL, 0 },
     { 0,   "NATS_PORT", NULL, 0 },
@@ -160,6 +163,50 @@ static xArgsCFG g_arg_configs[] = {
     { 0,   "MYSQL_PASSWORD", NULL, 0 },
     { 0,   "MYSQL_DATABASE", NULL, 0 },
 };
+
+static bool config_bool_enabled(const char* value) {
+    if (!value) return false;
+    if (value[0] == '\0') return true;
+
+    char buf[16];
+    size_t n = strlen(value);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    for (size_t i = 0; i < n; ++i) {
+        char c = value[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        buf[i] = c;
+    }
+    buf[n] = '\0';
+
+    return strcmp(buf, "1") == 0 ||
+           strcmp(buf, "true") == 0 ||
+           strcmp(buf, "yes") == 0 ||
+           strcmp(buf, "on") == 0 ||
+           strcmp(buf, "daemon") == 0;
+}
+
+static int load_runner_config(void) {
+    const char* config_file = xargs_get("config");
+    if (config_file && config_file[0]) {
+        if (xargs_load_config(config_file) != 0) {
+            fprintf(stderr, "[xnet] config not loaded: %s\n", config_file);
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Best-effort default preload so process-level options such as DAEMON can
+    ** take effect before Lua starts. Lua scripts may load xnet.cfg again; argv
+    ** and already-loaded values keep priority in xargs_load_config(). */
+    (void)xargs_load_config("xnet.cfg");
+    return 0;
+}
+
+static bool daemon_requested(void) {
+    const char* daemon_arg = xargs_get("daemon");
+    if (daemon_arg) return config_bool_enabled(daemon_arg);
+    return config_bool_enabled(xargs_get("DAEMON"));
+}
 
 static int l_xthread_stop(lua_State* L) {
     if (lua_gettop(L) >= 1 && !lua_isnil(L, 1)) {
@@ -521,8 +568,22 @@ int main(int argc, char** argv) {
     g_script_argv = (argc > 2) ? &argv[2] : NULL;
     xargs_init(g_arg_configs, (int)(sizeof(g_arg_configs) / sizeof(g_arg_configs[0])),
                argc - 1, &argv[1]);
+    if (load_runner_config() != 0) {
+        xargs_cleanup();
+        rpmalloc_finalize();
+        return 1;
+    }
     g_process_name = xargs_get("SERVER_NAME");
     xdebug_configure(xargs_get("XDEBUG_BOOT"), xargs_get("XDEBUG_PORT"), xargs_get("XDEBUG_WAIT"));
+
+    if (daemon_requested() && xdaemon_daemonize() != 0) {
+        fprintf(stderr, "[xnet] daemonize failed\n");
+        xargs_cleanup();
+        xdebug_shutdown();
+        rpmalloc_finalize();
+        return 1;
+    }
+
     xlog_init("logs", g_process_name ? g_process_name : "xnet", !xdaemon_is_daemon());
 
     if (!xthread_init()) {

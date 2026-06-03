@@ -117,6 +117,28 @@ Build artifacts:
 - `bin/test_core` (`.exe`) — C unit binary (built by the test targets, not by `all`)
 - `bin/xthread_test` (`.exe`) — C threading regression binary (built by the test targets)
 
+### Linux daemon mode
+
+On Linux, `xnet` can detach into the background before Lua starts. Enable it
+from `xnet.cfg`:
+
+```ini
+DAEMON=1
+```
+
+or from the command line:
+
+```sh
+bin/xnet scripts/xadmin/xadmin_main.lua DAEMON=1
+bin/xnet scripts/xadmin/xadmin_main.lua -d
+bin/xnet scripts/xadmin/xadmin_main.lua --daemon
+```
+
+The runner preloads `xnet.cfg` before daemonizing so process-level settings can
+take effect early. Use `-c path/to/file.cfg` or `--config path/to/file.cfg` to
+load another config file before daemonizing. Daemon mode is Linux-only; other
+platforms return a startup error if it is requested.
+
 ## Test
 
 Test orchestration lives in `tests/Makefile`. The root `Makefile` keeps compatibility shortcuts such as `make test` and delegates them into `tests/`. You can also call targets directly from inside the tests directory — `ROOT` defaults to `..`, so `cd tests && make <target>` works without extra arguments.
