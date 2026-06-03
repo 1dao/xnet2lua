@@ -285,8 +285,41 @@ More entry points:
 - `demo/xhttp_compress_main.lua` — HTTP response compression and request decompression smoke test
 - `demo/xnet_main.lua`  — raw TCP + `xsession` RPC
 - `demo/xcompress_main.lua` — `xcompress` gzip/deflate/zlib/checksum smoke test
+- `demo/xraygui_main.lua` — interactive RayGUI controls demo (needs `tools/raygui.dll`)
 - `demo/xrouter_test.lua` / `demo/xhttp_router_test.lua` — router unit checks
 - `demo/xnats_main.lua` — cross-process RPC over NATS (needs a NATS server)
+
+### RayGUI demo
+
+`demo/xraygui_main.lua` shows the exported RayGUI controls in an interactive
+window:
+
+```sh
+bin/xnet demo/xraygui_main.lua
+```
+
+For automated checks, add a frame limit so the window exits by itself:
+
+```sh
+bin/xnet demo/xraygui_main.lua frames=120
+```
+
+### RayGUI smoke test
+
+`tools/raygui_smoke_test.lua` exercises the Lua 5.5 RayGUI module in
+`tools/raygui.dll`. Run it through the embedded xnet Lua runtime:
+
+```sh
+bin/xnet tools/raygui_smoke_test.lua frames=120
+```
+
+It can also run under a standalone Lua executable that matches the DLL ABI:
+
+```sh
+lua tools/raygui_smoke_test.lua frames=120
+# or: lua.exe tools/raygui_smoke_test.lua frames=120
+```
+**Source code & packaging repository**: https://github.com/1dao/xlua_raygui.git
 
 ## Lua Modules
 
