@@ -34,8 +34,8 @@ static void test_xargs_cli(xTestState* st) {
     char arg1[] = "-p";
     char arg2[] = "8080";
     char arg3[] = "--verbose";
-    char arg4[] = "--mode=prod";
-    char arg5[] = "loose";
+    char arg4[] = "loose";
+    char arg5[] = "--mode=prod";
     char arg6[] = "raw=1";
     char* argv[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
 
