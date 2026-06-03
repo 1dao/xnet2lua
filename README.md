@@ -106,6 +106,7 @@ Useful build flags:
 - `WITH_HTTPS=0|1`
 - `WITH_RPMALLOC=0|1`
 - `WITH_XDEBUG=0|1`  (compile the Lua debugger into `bin/xnet`; runtime is opt-in)
+- `SANITIZE=none|asan`
 - `LUA_BACKEND=minilua|luajit`
 
 Build artifacts:
@@ -152,6 +153,40 @@ build.bat unit
 build.bat test
 build.bat run-lua script=demo/xutils_main.lua
 ```
+
+### ASan / leak diagnostics
+
+Use the ASan targets when chasing native memory bugs:
+
+```sh
+make asan
+make asan-test
+make asan-run-lua SCRIPT=demo/xutils_main.lua
+```
+
+These targets expand to `BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0`. On Linux/macOS toolchains they export:
+
+```sh
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1:strict_string_checks=1
+```
+
+On Windows the default omits `detect_leaks=1` because the MSVC ASan runtime does not support LeakSanitizer-style leak reports. It still catches native memory errors such as out-of-bounds accesses and use-after-free. For leak reports specifically, run the GNU target on Linux/WSL or another GCC/Clang runtime that ships LeakSanitizer.
+
+ASan builds write separate binaries such as `bin/xnet_asan`, `bin/test_core_asan`, and `bin/xthread_test_asan`, so they can live next to normal release/debug builds. You can also call the switch directly:
+
+```sh
+make -B test BUILD_MODE=debug SANITIZE=asan
+```
+
+On Windows with MSVC:
+
+```bat
+build.bat asan
+build.bat asan test
+build.bat asan run-lua script=demo/xutils_main.lua
+```
+
+`SANITIZE=asan` and `build.bat asan` both force `WITH_RPMALLOC=0` so allocations stay visible to the sanitizer runtime.
 
 ### CI matrix
 

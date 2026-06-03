@@ -14,6 +14,12 @@ WITH_XDEBUG ?= 0
 #   xmacro.h stubs out the rpmalloc_* lifecycle API as no-ops so callers
 #   compile unchanged.
 WITH_RPMALLOC ?= 1
+SANITIZE ?= none
+ifeq ($(OS),Windows_NT)
+ASAN_OPTIONS ?= halt_on_error=1:abort_on_error=1:strict_string_checks=1
+else
+ASAN_OPTIONS ?= detect_leaks=1:halt_on_error=1:abort_on_error=1:strict_string_checks=1
+endif
 LUA_BACKEND ?= minilua
 LUAJIT_DIR ?= 3rd/luajit
 LUAJIT_INC ?= $(LUAJIT_DIR)/src
@@ -21,6 +27,19 @@ LUAJIT_LIB ?= $(LUAJIT_DIR)/src/libluajit.a
 BUILD_MODE ?= release
 
 BASE_CFLAGS := -Wall -Wextra -I. -MMD -MP
+SANITIZE_CFLAGS :=
+SANITIZE_LDFLAGS :=
+PROGRAM_SUFFIX :=
+
+ifeq ($(SANITIZE),asan)
+    override WITH_RPMALLOC := 0
+    SANITIZE_CFLAGS := -fsanitize=address -fno-omit-frame-pointer -fno-common
+    SANITIZE_LDFLAGS := -fsanitize=address
+    PROGRAM_SUFFIX := _asan
+    export ASAN_OPTIONS
+else ifneq ($(SANITIZE),none)
+    $(error Unsupported SANITIZE '$(SANITIZE)'; expected 'none' or 'asan')
+endif
 
 ifeq ($(WITH_RPMALLOC),1)
     # ENABLE_OVERRIDE=0 stops rpmalloc.c from pulling in malloc.c which would
@@ -33,9 +52,9 @@ else
     BASE_CFLAGS  += -DXMACRO_USE_RPMALLOC=0
 endif
 ifeq ($(BUILD_MODE),debug)
-	CFLAGS := $(BASE_CFLAGS) -O0 -g -DDEBUG
+	CFLAGS := $(BASE_CFLAGS) -O0 -g -DDEBUG $(SANITIZE_CFLAGS)
 else ifeq ($(BUILD_MODE),release)
-	CFLAGS := $(BASE_CFLAGS) -O2 -DNDEBUG
+	CFLAGS := $(BASE_CFLAGS) -O2 -DNDEBUG $(SANITIZE_CFLAGS)
 else
 	$(error Unsupported BUILD_MODE '$(BUILD_MODE)'; expected 'debug' or 'release')
 endif
@@ -43,7 +62,12 @@ endif
 OBJ_DIR := obj
 BIN_DIR := bin
 
-TARGET_LIB := lib$(LIB_NAME).a
+ifeq ($(SANITIZE),asan)
+    OBJ_DIR := obj/asan
+    TARGET_LIB := $(OBJ_DIR)/lib$(LIB_NAME).a
+else
+    TARGET_LIB := lib$(LIB_NAME).a
+endif
 CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
@@ -88,8 +112,8 @@ XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_
 XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=
-XNET_BUILD := $(BIN_DIR)/xnet_build$(EXE_EXT)
-XNET_TARGET := $(BIN_DIR)/xnet$(EXE_EXT)
+XNET_BUILD := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)_build$(EXE_EXT)
+XNET_TARGET := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 # rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
 # directly. libxnet.a itself does NOT contain rpmalloc symbols, so xnet adds
@@ -134,22 +158,39 @@ ifeq ($(WITH_HTTPS),1)
 endif
 
 XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
-XDEBUG_DAP_TARGET := tools/xdebug_dap$(EXE_EXT)
+XDEBUG_DAP_TARGET := tools/xdebug_dap$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
-TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+ASAN_BUILD_ARGS := BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)
 
 $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 	$(RM) $(XDEBUG_DAP_TARGET)
-	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 -o $@ $(XDEBUG_DAP_SRCS) $(SYS_LDFLAGS)
+	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 $(SANITIZE_CFLAGS) -o $@ $(XDEBUG_DAP_SRCS) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS)
 
-.PHONY: all xnet xdebug_dap clean $(TEST_TARGETS) run-lua
+.PHONY: all xnet xdebug_dap asan asan-test asan-unit asan-run-lua clean $(TEST_TARGETS) run-lua
 
 all: $(TARGET_LIB) $(XNET_TARGET) $(XDEBUG_DAP_TARGET)
 
 xnet: $(XNET_TARGET)
+
+asan:
+	$(MAKE) -B all $(ASAN_BUILD_ARGS)
+
+asan-test:
+	ASAN_OPTIONS="$(ASAN_OPTIONS)" $(MAKE) -B test $(ASAN_BUILD_ARGS)
+
+asan-unit:
+	ASAN_OPTIONS="$(ASAN_OPTIONS)" $(MAKE) -B unit $(ASAN_BUILD_ARGS)
+
+asan-run-lua:
+	@if [ -z "$(SCRIPT)" ]; then \
+		echo "Usage: make asan-run-lua SCRIPT=demo/xutils_main.lua"; \
+		exit 1; \
+	fi
+	ASAN_OPTIONS="$(ASAN_OPTIONS)" $(MAKE) -B run-lua $(ASAN_BUILD_ARGS) SCRIPT="$(SCRIPT)"
 
 $(TARGET_LIB): $(CORE_OBJS)
 	$(AR) $(ARFLAGS) $@ $(CORE_OBJS)
@@ -159,7 +200,7 @@ $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 
 $(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(OBJ_DIR):
@@ -179,7 +220,7 @@ run-lua: $(XNET_TARGET)
 	$(XNET_TARGET) $(SCRIPT)
 
 clean:
-	$(RM) $(OBJ_DIR) $(TARGET_LIB) $(XNET_BUILD) $(XNET_TARGET) $(XDEBUG_DAP_TARGET) tools/xdebug_dap.d
+	$(RM) obj lib$(LIB_NAME).a $(BIN_DIR)/xnet$(EXE_EXT) $(BIN_DIR)/xnet_asan$(EXE_EXT) $(BIN_DIR)/xnet_build$(EXE_EXT) $(BIN_DIR)/xnet_asan_build$(EXE_EXT) tools/xdebug_dap$(EXE_EXT) tools/xdebug_dap_asan$(EXE_EXT) tools/xdebug_dap.d tools/xdebug_dap_asan.d
 	$(TEST_MAKE) clean
 
 -include $(CORE_DEPS)
