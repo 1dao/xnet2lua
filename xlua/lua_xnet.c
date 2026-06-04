@@ -995,6 +995,7 @@ static const luaL_Reg xnet_funcs[] = {
     { "random_bytes", l_xnet_random_bytes },
 #if XNET_WITH_HTTPS
     { "attach_tls", l_xnet_attach_tls },
+    { "connect_tls", l_xnet_connect_tls },
 #endif
     { NULL, NULL }
 };

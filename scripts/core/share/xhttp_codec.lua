@@ -129,6 +129,38 @@ function M.parse_target(target)
     return path, query_string, M.parse_query(query_string)
 end
 
+-- Split an absolute URL into its parts for the HTTP client.
+-- Returns scheme, host, port, path (path includes any query string; defaults
+-- to "/"). Port defaults to 443 for https and 80 otherwise. On a malformed URL
+-- returns nil plus an error message.
+function M.parse_url(url)
+    url = tostring(url or '')
+    local scheme, rest = url:match('^(%a[%w+.-]*)://(.*)$')
+    if not scheme then return nil, 'missing scheme' end
+    scheme = M.lower(scheme)
+
+    local authority, path = rest:match('^([^/]*)(/?.*)$')
+    if not path or path == '' then path = '/' end
+
+    -- Drop any userinfo ("user:pass@").
+    local at = authority:find('@', 1, true)
+    if at then authority = authority:sub(at + 1) end
+
+    local host, port
+    if authority:sub(1, 1) == '[' then          -- bracketed IPv6 literal
+        local h, tail = authority:match('^%[([^%]]*)%](.*)$')
+        host = h
+        port = tail and tail:match('^:(%d+)$') or nil
+    else
+        host, port = authority:match('^([^:]*):?(%d*)$')
+    end
+    if not host or host == '' then return nil, 'missing host' end
+
+    port = tonumber(port)
+    if not port then port = (scheme == 'https') and 443 or 80 end
+    return scheme, host, port, path
+end
+
 function M.parse_chunked(data, pos)
     local chunks = {}
     local len = #data
@@ -324,21 +356,65 @@ function M.parse_response(data, pos, opts)
     end
 
     local body_start = header_end + 4
-    local body_len = tonumber(headers['content-length'] or '0') or 0
-    if opts.method == 'HEAD' then body_len = 0 end
-    if body_len < 0 then return nil, nil, 'bad content length' end
-    if #data < body_start + body_len - 1 then
+
+    -- Responses to HEAD, plus 1xx/204/304, carry no body regardless of headers.
+    local no_body = opts.method == 'HEAD'
+        or status == 204 or status == 304
+        or (status >= 100 and status < 200)
+
+    local body, next_pos
+    local transfer_encoding = M.lower(headers['transfer-encoding'] or '')
+
+    if no_body then
+        body, next_pos = '', body_start
+    elseif transfer_encoding:find('chunked', 1, true) then
+        local chunk_body, chunk_next, chunk_err = M.parse_chunked(data, body_start)
+        if chunk_err == 'incomplete' then return nil, nil, 'incomplete' end
+        if chunk_err then return nil, nil, chunk_err end
+        body, next_pos = chunk_body, chunk_next
+    elseif headers['content-length'] then
+        local body_len = tonumber(headers['content-length']) or -1
+        if body_len < 0 then return nil, nil, 'bad content length' end
+        if #data < body_start + body_len - 1 then
+            return nil, nil, 'incomplete'
+        end
+        body = body_len > 0 and data:sub(body_start, body_start + body_len - 1) or ''
+        next_pos = body_start + body_len
+    elseif opts.eof then
+        -- No Content-Length and no chunking: the body runs to end of stream
+        -- (HTTP/1.0 or "Connection: close" framing). The caller passes eof=true
+        -- once the peer has closed, so the remaining bytes are the full body.
+        body = data:sub(body_start)
+        next_pos = #data + 1
+    else
         return nil, nil, 'incomplete'
     end
 
-    local body = body_len > 0 and data:sub(body_start, body_start + body_len - 1) or ''
+    -- Optional: transparently decode a compressed body (mirrors parse_request).
+    local content_encoding = nil
+    local raw_encoding = headers['content-encoding']
+    if opts.decompress and body ~= '' and raw_encoding then
+        local enc = M.lower(raw_encoding)
+        if enc == 'gzip' or enc == 'x-gzip' or enc == 'deflate' then
+            local max_dec = opts.max_decompressed_size or (16 * 1024 * 1024)
+            local plain, derr = M.decompress_body(body, enc, max_dec)
+            if not plain then
+                return nil, nil, 'decompress: ' .. tostring(derr)
+            end
+            content_encoding = enc
+            body = plain
+            headers['content-length'] = tostring(#body)
+        end
+    end
+
     return {
         version = version,
         status = status,
         headers = headers,
         header_list = header_list,
         body = body,
-    }, body_start + body_len
+        content_encoding = content_encoding,  -- nil unless we decompressed
+    }, next_pos
 end
 
 -- ============================================================================

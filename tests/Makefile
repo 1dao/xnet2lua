@@ -114,7 +114,8 @@ C_UNIT_COVERAGE_CFLAGS := $(C_UNIT_CFLAGS) -O0 -g --coverage
 C_UNIT_COVERAGE_LDFLAGS := $(SYS_LDFLAGS) --coverage
 
 LUA_UNIT_SCRIPTS := \
-	tests/lua/http_codec_spec.lua
+	tests/lua/http_codec_spec.lua \
+	tests/lua/http_client_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
@@ -124,7 +125,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xnet_main.lua \
 	demo/xrouter_test.lua \
 	demo/xhttp_router_test.lua \
-	demo/xhttp_main.lua
+	demo/xhttp_main.lua \
+	demo/xhttp_client_main.lua
 
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \
