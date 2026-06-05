@@ -137,7 +137,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/home_residency_spec.lua \
 	tests/lua/auth_spec.lua \
 	tests/lua/admit_spec.lua \
-	tests/lua/gate_relay_spec.lua
+	tests/lua/gate_relay_spec.lua \
+	tests/lua/http_client_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
@@ -148,7 +149,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xrouter_test.lua \
 	demo/xhttp_router_test.lua \
 	demo/xhttp_main.lua \
-	demo/gate_admit_main.lua
+	demo/gate_admit_main.lua \
+	demo/xhttp_client_main.lua
 
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \

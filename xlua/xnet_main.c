@@ -114,54 +114,13 @@ static void lua_runtime_post_init(lua_State* L) {
 #endif
 }
 
+/* Only options that need a short alias or flag semantics are registered here.
+** Plain KEY=VALUE parameters (SERVER_NAME, NATS_*, HTTP_*, XADMIN_*, ...) no
+** longer need an entry: pass them as `KEY=value` on argv or in the config file
+** and read them back with xargs_get()/xargs_get_int()/xargs_get_bool()/... */
 static xArgsCFG g_arg_configs[] = {
     { 'c', "config", NULL, 0 },
     { 'd', "daemon", NULL, 1 },
-    { 0,   "DAEMON", NULL, 0 },
-    { 0,   "SERVER_NAME", NULL, 0 },
-    { 0,   "NATS_HOST", NULL, 0 },
-    { 0,   "NATS_PORT", NULL, 0 },
-    { 0,   "NATS_PREFIX", NULL, 0 },
-    { 0,   "NATS_TEST_DELAY_SEC", NULL, 0 },
-    { 0,   "NATS_TEST_TIMEOUT_SEC", NULL, 0 },
-    { 0,   "NATS_TEST_HOLD_SEC", NULL, 0 },
-    { 0,   "NATS_TEST_PEER", NULL, 0 },
-    { 0,   "HTTP_ENABLE", NULL, 0 },
-    { 0,   "HTTP_HOST", NULL, 0 },
-    { 0,   "HTTP_PORT", NULL, 0 },
-    { 0,   "HTTP_WORKERS", NULL, 0 },
-    { 0,   "HTTPS_ENABLE", NULL, 0 },
-    { 0,   "HTTPS_PORT", NULL, 0 },
-    { 0,   "HTTPS_CERT", NULL, 0 },
-    { 0,   "HTTPS_KEY", NULL, 0 },
-    { 0,   "HTTPS_KEY_PASSWORD", NULL, 0 },
-    { 0,   "HTTPS_TEST_SECONDS", NULL, 0 },
-    { 0,   "PAC_WEB_HOST", NULL, 0 },
-    { 0,   "PAC_WEB_PORT", NULL, 0 },
-    { 0,   "PAC_FILE", NULL, 0 },
-    { 0,   "PAC_STATIC_DIR", NULL, 0 },
-    { 0,   "PAC_HTTP_PROXY_HOST", NULL, 0 },
-    { 0,   "PAC_HTTP_PROXY_PORT", NULL, 0 },
-    { 0,   "PAC_SOCKS5_PROXY_HOST", NULL, 0 },
-    { 0,   "PAC_SOCKS5_PROXY_PORT", NULL, 0 },
-    { 0,   "XADMIN_HOST", NULL, 0 },
-    { 0,   "XADMIN_PORT", NULL, 0 },
-    { 0,   "XADMIN_HTTPS", NULL, 0 },
-    { 0,   "XADMIN_STATIC_DIR", NULL, 0 },
-    { 0,   "XADMIN_TOKEN", NULL, 0 },
-    { 0,   "XADMIN_HEARTBEAT_MS", NULL, 0 },
-    { 0,   "XADMIN_PEER_TTL_MS", NULL, 0 },
-    { 0,   "XDEBUG_BOOT", NULL, 0 },
-    { 0,   "XDEBUG_PORT", NULL, 0 },
-    { 0,   "XDEBUG_WAIT", NULL, 0 },
-    { 0,   "REDIS_HOST", NULL, 0 },
-    { 0,   "REDIS_PORT", NULL, 0 },
-    { 0,   "REDIS_DB", NULL, 0 },
-    { 0,   "MYSQL_HOST", NULL, 0 },
-    { 0,   "MYSQL_PORT", NULL, 0 },
-    { 0,   "MYSQL_USER", NULL, 0 },
-    { 0,   "MYSQL_PASSWORD", NULL, 0 },
-    { 0,   "MYSQL_DATABASE", NULL, 0 },
 };
 
 static bool config_bool_enabled(const char* value) {

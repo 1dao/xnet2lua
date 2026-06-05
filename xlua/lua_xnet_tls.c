@@ -38,6 +38,8 @@
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
 
+#include "xnet_cacert.h"   /* bundled Mozilla CA bundle: _cacert_pem[] */
+
 #define LUA_XNET_TLS_META "xnet.tls_connection"
 
 typedef struct LuaTlsConn {
@@ -47,6 +49,8 @@ typedef struct LuaTlsConn {
     int handler_ref;
     bool closed;
     bool handshake_done;
+    bool connecting;          /* client: async TCP connect still in progress */
+    char host[256];           /* client: SNI / verification hostname */
     char peer_ip[64];
     int peer_port;
     size_t max_packet;
@@ -92,6 +96,7 @@ static void tls_write_event(SOCKET_T fd, int mask,
                             void* clientData, xPollRequest* submit_arg);
 static void tls_error_event(SOCKET_T fd, int mask,
                             void* clientData, xPollRequest* submit_arg);
+static void tls_finish_connect(LuaTlsConn* c);
 
 static LuaTlsConn* check_tls_conn(lua_State* L, int idx) {
     return (LuaTlsConn*)luaL_checkudata(L, idx, LUA_XNET_TLS_META);
@@ -428,7 +433,12 @@ static void tls_read_plain(LuaTlsConn* c) {
             continue;
         }
         if (rc == 0 || rc == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
-            tls_close_internal(c, "eof", true);
+            /* The peer may deliver its final application data and the EOF in
+            ** the same read burst (typical for a small Connection: close
+            ** response). Hand any buffered bytes to the handler before tearing
+            ** the connection down, otherwise that last response is lost. */
+            if (c->inlen > 0) tls_process_input(c);
+            if (!c->closed) tls_close_internal(c, "eof", true);
             return;
         }
         if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
@@ -461,6 +471,7 @@ static void tls_read_event(SOCKET_T fd, int mask,
     LuaTlsConn* c = (LuaTlsConn*)clientData;
     if (!c || c->closed) return;
 
+    if (c->connecting) { tls_finish_connect(c); return; }
     if (!c->handshake_done) tls_drive_handshake(c);
     else tls_read_plain(c);
     if (!c->closed && c->outlen > 0) tls_flush_output(c);
@@ -474,6 +485,7 @@ static void tls_write_event(SOCKET_T fd, int mask,
     LuaTlsConn* c = (LuaTlsConn*)clientData;
     if (!c || c->closed) return;
 
+    if (c->connecting) { tls_finish_connect(c); return; }
     if (!c->handshake_done) tls_drive_handshake(c);
     else tls_flush_output(c);
 }
@@ -619,6 +631,158 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     return 0;
 }
 
+/* Client-mode TLS setup. cfg_idx may be 0 (no config table). Configures an
+** outbound handshake with optional CA verification and SNI. c->host must hold
+** the target hostname (used for SNI and certificate name verification). */
+static int tls_setup_client_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
+    bool verify = true;
+    const char* ca_file = NULL;
+    const char* server_name = NULL;
+    size_t max_packet = 0;
+    size_t max_send = 0;
+    bool has_max_send = false;
+
+    if (cfg_idx != 0) {
+        lua_getfield(L, cfg_idx, "verify");
+        if (!lua_isnil(L, -1)) verify = lua_toboolean(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, cfg_idx, "ca_file");
+        if (lua_isstring(L, -1)) ca_file = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, cfg_idx, "server_name");
+        if (lua_isstring(L, -1)) server_name = lua_tostring(L, -1);
+        lua_pop(L, 1);
+
+        lua_getfield(L, cfg_idx, "max_packet");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer mp = lua_tointeger(L, -1);
+            if (mp > 0) max_packet = (size_t)mp;
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, cfg_idx, "max_send");
+        if (lua_isnumber(L, -1)) {
+            lua_Integer ms = lua_tointeger(L, -1);
+            if (ms >= 0) { max_send = (size_t)ms; has_max_send = true; }
+        }
+        lua_pop(L, 1);
+    }
+
+    if (max_packet > 0) c->max_packet = max_packet;
+    if (has_max_send) c->max_send = max_send;
+
+    if (!s_psa_ready) {
+        psa_status_t status = psa_crypto_init();
+        if (status != PSA_SUCCESS) {
+            lua_pushfstring(L, "psa_crypto_init failed: %d", (int)status);
+            return -1;
+        }
+        s_psa_ready = 1;
+    }
+
+    mbedtls_ssl_init(&c->ssl);
+    mbedtls_ssl_config_init(&c->conf);
+    mbedtls_x509_crt_init(&c->cert);   /* holds the CA chain in client mode */
+    mbedtls_pk_init(&c->pkey);
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->ctr_drbg);
+
+    const char* pers = "xnet_tls_client";
+    int rc = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
+                                   &c->entropy, (const unsigned char*)pers,
+                                   strlen(pers));
+    if (rc != 0) {
+        char errbuf[160];
+        tls_errmsg(rc, errbuf, sizeof(errbuf));
+        lua_pushfstring(L, "ctr_drbg_seed failed: %s", errbuf);
+        return -1;
+    }
+
+    if (verify) {
+        if (ca_file) {
+            rc = mbedtls_x509_crt_parse_file(&c->cert, ca_file);
+            if (rc != 0) {
+                char errbuf[160];
+                tls_errmsg(rc, errbuf, sizeof(errbuf));
+                lua_pushfstring(L, "parse ca failed: %s: %s", ca_file, errbuf);
+                return -1;
+            }
+        } else {
+            rc = mbedtls_x509_crt_parse(&c->cert, _cacert_pem, _cacert_pem_len);
+            if (rc < 0) {
+                char errbuf[160];
+                tls_errmsg(rc, errbuf, sizeof(errbuf));
+                lua_pushfstring(L, "parse bundled ca failed: %s", errbuf);
+                return -1;
+            }
+        }
+    }
+
+    rc = mbedtls_ssl_config_defaults(&c->conf, MBEDTLS_SSL_IS_CLIENT,
+                                     MBEDTLS_SSL_TRANSPORT_STREAM,
+                                     MBEDTLS_SSL_PRESET_DEFAULT);
+    if (rc != 0) {
+        char errbuf[160];
+        tls_errmsg(rc, errbuf, sizeof(errbuf));
+        lua_pushfstring(L, "ssl_config_defaults failed: %s", errbuf);
+        return -1;
+    }
+
+    mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
+    if (verify) {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        mbedtls_ssl_conf_ca_chain(&c->conf, &c->cert, NULL);
+    } else {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
+
+    rc = mbedtls_ssl_setup(&c->ssl, &c->conf);
+    if (rc != 0) {
+        char errbuf[160];
+        tls_errmsg(rc, errbuf, sizeof(errbuf));
+        lua_pushfstring(L, "ssl_setup failed: %s", errbuf);
+        return -1;
+    }
+
+    const char* sni = server_name ? server_name : (c->host[0] ? c->host : NULL);
+    if (sni) {
+        rc = mbedtls_ssl_set_hostname(&c->ssl, sni);
+        if (rc != 0) {
+            char errbuf[160];
+            tls_errmsg(rc, errbuf, sizeof(errbuf));
+            lua_pushfstring(L, "ssl_set_hostname failed: %s", errbuf);
+            return -1;
+        }
+    }
+
+    mbedtls_ssl_set_bio(&c->ssl, c, tls_net_send, tls_net_recv, NULL);
+    return 0;
+}
+
+/* Called once the non-blocking TCP connect has signalled writable. Checks the
+** socket-level result; on success transitions out of the connecting state and
+** kicks off the TLS handshake. */
+static void tls_finish_connect(LuaTlsConn* c) {
+    if (!c || c->closed) return;
+    int err = 0;
+#ifdef _WIN32
+    int err_len = sizeof(err);
+    int rc = getsockopt(c->fd, SOL_SOCKET, SO_ERROR, (char*)&err, &err_len);
+#else
+    socklen_t err_len = sizeof(err);
+    int rc = getsockopt(c->fd, SOL_SOCKET, SO_ERROR, &err, &err_len);
+#endif
+    if (rc != 0 || err != 0) {
+        tls_close_internal(c, "connect_error", true);
+        return;
+    }
+    c->connecting = false;
+    tls_disarm_write(c);
+    tls_drive_handshake(c);
+}
+
 int l_xnet_attach_tls(lua_State* L) {
     SOCKET_T fd = (SOCKET_T)luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TTABLE);
@@ -697,6 +861,77 @@ int l_xnet_attach_tls(lua_State* L) {
     }
 
     tls_drive_handshake(c);
+    return 1;
+}
+
+/* xnet.connect_tls(host, port, handler [, tls_config])
+** Opens a non-blocking outbound TCP connection and, once connected, performs a
+** client-mode TLS handshake before firing the handler's on_connect. Returns the
+** TLS connection userdata, or nil + error string. */
+int l_xnet_connect_tls(lua_State* L) {
+    const char* host = luaL_checkstring(L, 1);
+    int port = (int)luaL_checkinteger(L, 2);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    int cfg_idx = lua_istable(L, 4) ? 4 : 0;
+
+    char err[XSOCK_ERR_LEN] = {0};
+    SOCKET_T fd = xsock_tcp_aconnect(err, host, port);
+    if (fd == INVALID_SOCKET_VAL) {
+        lua_pushnil(L);
+        lua_pushstring(L, err[0] ? err : "connect failed");
+        return 2;
+    }
+
+    LuaTlsConn* c = (LuaTlsConn*)lua_newuserdata(L, sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->L = main_lua_state(L);
+    c->fd = fd;
+    c->self_ref = LUA_NOREF;
+    c->handler_ref = LUA_NOREF;
+    c->closed = false;
+    c->handshake_done = false;
+    c->connecting = true;
+    c->max_packet = 16u * 1024u * 1024u;
+    c->max_send = 10u * 1024u * 1024u + 4u;
+    strncpy(c->host, host, sizeof(c->host) - 1);
+    c->host[sizeof(c->host) - 1] = '\0';
+    strncpy(c->peer_ip, host, sizeof(c->peer_ip) - 1);
+    c->peer_ip[sizeof(c->peer_ip) - 1] = '\0';
+    c->peer_port = port;
+
+    luaL_getmetatable(L, LUA_XNET_TLS_META);
+    lua_setmetatable(L, -2);
+
+    int tls_top = lua_gettop(L);
+    int rc = tls_setup_client_context(L, c, cfg_idx);
+    if (rc != 0) {
+        const char* msg = lua_tostring(L, -1);
+        char saved[256];
+        snprintf(saved, sizeof(saved), "%s", msg ? msg : "tls setup failed");
+        lua_settop(L, tls_top);
+        tls_free_crypto(c);
+        xsock_close(fd);
+        c->fd = INVALID_SOCKET_VAL;
+        c->closed = true;
+        lua_pushnil(L);
+        lua_pushstring(L, saved);
+        return 2;
+    }
+    lua_settop(L, tls_top);
+
+    ref_from_stack(L, 3, &c->handler_ref);
+    lua_pushvalue(L, -1);
+    c->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    /* READABLE to drive the handshake, WRITABLE to learn when the async TCP
+    ** connect completes (tls_finish_connect then kicks off the handshake). */
+    if (tls_arm_read(c) != 0 || tls_arm_write(c) != 0) {
+        tls_close_internal(c, "poll_error", false);
+        lua_pushnil(L);
+        lua_pushstring(L, "xpoll_add_event failed");
+        return 2;
+    }
+
     return 1;
 }
 

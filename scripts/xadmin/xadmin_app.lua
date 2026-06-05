@@ -11,10 +11,17 @@
 --   channel_ok = true    → (true, app_ok, app_ret1, app_ret2, ...)
 
 local router = dofile('scripts/core/share/xhttp_router.lua')
+local store  = dofile('scripts/xadmin/xadmin_store.lua')
 local xutils = require('xutils')
 
 local STATIC_DIR = xutils.get_config('XADMIN_STATIC_DIR', 'scripts/xadmin/static')
 local TOKEN = xutils.get_config('XADMIN_TOKEN', '')
+-- Master bypass token: any request carrying it skips authentication entirely
+-- (and the "not configured" gate). Empty disables the feature. Keep it secret
+-- and prefer HTTPS, since it grants unconditional access.
+local SUPER_TOKEN = xutils.get_config('XADMIN_SUPER_TOKEN', '')
+local SESSION_COOKIE = 'xadmin_sid'
+local SESSION_MAX_AGE = 7 * 24 * 3600
 
 local M = {}
 
@@ -90,6 +97,50 @@ local function check_token(req)
     return false
 end
 
+-- True when the request carries the master bypass token. Accepted either via a
+-- dedicated X-Xadmin-Super-Token header or the regular X-Xadmin-Token header.
+local function is_super(req)
+    if SUPER_TOKEN == '' then return false end
+    local got = header_get(req, 'X-Xadmin-Super-Token') or header_get(req, 'X-Xadmin-Token')
+    return got ~= nil and got == SUPER_TOKEN
+end
+
+-- ---------------------------------------------------------------------------
+-- Cookie / session helpers
+-- ---------------------------------------------------------------------------
+local function get_cookie(req, name)
+    local raw = header_get(req, 'cookie')
+    if not raw then return nil end
+    for pair in tostring(raw):gmatch('[^;]+') do
+        local k, v = pair:match('^%s*([^=]+)=(.*)$')
+        if k == name then return v end
+    end
+    return nil
+end
+
+local function session_cookie(token, max_age)
+    -- Lax SameSite + HttpOnly; no Secure flag since the console is commonly
+    -- served over plain HTTP on localhost.
+    return string.format('%s=%s; Path=/; HttpOnly; SameSite=Lax; Max-Age=%d',
+        SESSION_COOKIE, token, max_age)
+end
+
+-- Resolve the authenticated principal for a request.
+-- Returns the username for a valid session cookie, the literal 'token' when a
+-- matching X-Xadmin-Token is supplied, or nil when unauthenticated.
+local function current_user(req, db_cfg)
+    if is_super(req) then return 'super' end
+    local token = get_cookie(req, SESSION_COOKIE)
+    if token and token ~= '' then
+        local user = store.validate_session(db_cfg.db.database, token)
+        if user then return user end
+    end
+    if TOKEN ~= '' and check_token(req) then
+        return 'token'
+    end
+    return nil
+end
+
 -- "name" or "name:idx" → "name:idx" (default idx=1).
 local function resolve_rpc_target(name)
     name = tostring(name or '')
@@ -112,6 +163,154 @@ M.route = router.reg
 M.router = router
 
 router.reg_path(STATIC_DIR, { index = 'index.html', index_route = '/' })
+
+-- ---------------------------------------------------------------------------
+-- Auth / setup (public endpoints; gating is enforced in M.handle)
+-- ---------------------------------------------------------------------------
+
+-- Report whether the console has been configured and whether the caller is
+-- authenticated. The SPA uses this to pick which view to render.
+router.reg('get', '/api/session', function(req)
+    local cfg = store.load_db_config()
+    local resp = {
+        self           = ctx.self_name or '',
+        configured     = cfg.configured and true or false,
+        db_from_cfg    = cfg.db_from_cfg and true or false,
+        token_required = ctx.token_required and true or false,
+        authenticated  = false,
+        username       = nil,
+    }
+    if is_super(req) then
+        resp.authenticated = true
+        resp.username = 'super'
+    elseif cfg.configured then
+        local user = current_user(req, cfg)
+        if user then
+            resp.authenticated = true
+            resp.username = user
+        end
+    end
+    return json(200, resp)
+end)
+
+-- First-time setup: validate the DB credentials, create the schema and the
+-- default admin account, persist the connection settings, then log the caller
+-- in. Allowed only while unconfigured (enforced here and in M.handle).
+router.reg('post', '/api/setup', function(req)
+    local cfg = store.load_db_config()
+    if cfg.configured then
+        return json(409, { ok = false, error = 'already configured' })
+    end
+
+    local body = xutils.json_unpack(req.body or '')
+    if type(body) ~= 'table' then
+        return json(400, { ok = false, error = 'invalid json body' })
+    end
+
+    -- When xnet.cfg fully specifies the DB, use it and ignore any DB fields in
+    -- the form; otherwise take the connection settings from the setup form.
+    local db
+    if cfg.db_from_cfg then
+        db = store.normalize_db(cfg.db)
+    else
+        db = store.normalize_db({
+            host = body.host, port = body.port, user = body.user,
+            password = body.password, database = body.database,
+        })
+    end
+    local admin_user = tostring(body.admin_user or '')
+    local admin_pass = tostring(body.admin_pass or '')
+    if admin_user == '' or admin_pass == '' then
+        return json(400, { ok = false, error = 'admin username and password are required' })
+    end
+
+    -- Ask the main thread to (re)start the MySQL pool with these credentials.
+    local rok, rerr = xthread.rpc(xthread.MAIN, 'xadmin_db_apply', 8000,
+        db.host, db.port, db.user, db.password)
+    if not rok then
+        return json(502, { ok = false, error = 'mysql start failed: ' .. tostring(rerr) })
+    end
+
+    local ok, err = store.ensure_schema(db.database)
+    if not ok then
+        return json(502, { ok = false, error = 'cannot reach database: ' .. tostring(err) })
+    end
+
+    ok, err = store.upsert_account(db.database, admin_user, admin_pass)
+    if not ok then
+        return json(500, { ok = false, error = 'create admin failed: ' .. tostring(err) })
+    end
+
+    local saved, serr = store.save_db_config({ configured = true, db = db })
+    if not saved then
+        return json(500, { ok = false, error = 'save config failed: ' .. tostring(serr) })
+    end
+
+    local token = store.create_session(db.database, admin_user)
+    local headers = {
+        ['Content-Type'] = 'application/json; charset=utf-8',
+        ['Cache-Control'] = 'no-store',
+    }
+    if token then headers['Set-Cookie'] = session_cookie(token, SESSION_MAX_AGE) end
+    return {
+        status = 200,
+        body = xutils.json_pack({ ok = true, username = admin_user, database = db.database }),
+        headers = headers,
+    }
+end)
+
+router.reg('post', '/api/login', function(req)
+    local cfg = store.load_db_config()
+    if not cfg.configured then
+        return json(409, { ok = false, error = 'not configured', need = 'setup' })
+    end
+    local body = xutils.json_unpack(req.body or '')
+    if type(body) ~= 'table' then
+        return json(400, { ok = false, error = 'invalid json body' })
+    end
+    local username = tostring(body.username or '')
+    local password = tostring(body.password or '')
+    if username == '' or password == '' then
+        return json(400, { ok = false, error = 'username and password are required' })
+    end
+
+    local ok, who = store.verify_login(cfg.db.database, username, password)
+    if not ok then
+        return json(401, { ok = false, error = 'invalid username or password' })
+    end
+
+    local token, terr = store.create_session(cfg.db.database, who)
+    if not token then
+        return json(500, { ok = false, error = 'create session failed: ' .. tostring(terr) })
+    end
+    return {
+        status = 200,
+        body = xutils.json_pack({ ok = true, username = who }),
+        headers = {
+            ['Content-Type'] = 'application/json; charset=utf-8',
+            ['Cache-Control'] = 'no-store',
+            ['Set-Cookie'] = session_cookie(token, SESSION_MAX_AGE),
+        },
+    }
+end)
+
+router.reg('post', '/api/logout', function(req)
+    local cfg = store.load_db_config()
+    local token = get_cookie(req, SESSION_COOKIE)
+    if cfg.configured and token and token ~= '' then
+        store.destroy_session(cfg.db.database, token)
+    end
+    return {
+        status = 200,
+        body = xutils.json_pack({ ok = true }),
+        headers = {
+            ['Content-Type'] = 'application/json; charset=utf-8',
+            ['Cache-Control'] = 'no-store',
+            -- Expire the cookie immediately.
+            ['Set-Cookie'] = session_cookie('', 0),
+        },
+    }
+end)
 
 -- ---------------------------------------------------------------------------
 -- Pure local queries (no yielding RPC)
@@ -270,7 +469,42 @@ router.reg('post', '/api/reload', function(req)
     })
 end)
 
+-- Public endpoints that bypass the session gate.
+local PUBLIC_API = {
+    ['/api/session'] = true,
+    ['/api/setup']   = true,
+    ['/api/login']   = true,
+    ['/api/logout']  = true,
+}
+
 function M.handle(req)
+    local path = tostring(req.path or '')
+
+    -- Static assets and the SPA shell are always served; the front-end decides
+    -- which view (setup / login / console) to show from /api/session.
+    if not path:find('^/api/') or PUBLIC_API[path] then
+        return router.handle(req)
+    end
+
+    -- The master bypass token grants unconditional access, even before the
+    -- console has been configured (DB-backed endpoints will still fail if the
+    -- database is unreachable, but auth never blocks).
+    if is_super(req) then
+        req.xadmin_user = 'super'
+        return router.handle(req)
+    end
+
+    -- Everything else under /api/ requires the console to be configured and the
+    -- caller to be authenticated (session cookie or X-Xadmin-Token).
+    local cfg = store.load_db_config()
+    if not cfg.configured then
+        return json(403, { ok = false, error = 'console not configured', need = 'setup' })
+    end
+    local user = current_user(req, cfg)
+    if not user then
+        return json(401, { ok = false, error = 'login required', need = 'login' })
+    end
+    req.xadmin_user = user
     return router.handle(req)
 end
 

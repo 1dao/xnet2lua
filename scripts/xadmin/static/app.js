@@ -7,6 +7,9 @@
         stats: null,
         token: null,
         tokenRequired: false,
+        authed: false,
+        username: '',
+        pollTimer: null,
     };
 
     function $(sel) { return document.querySelector(sel); }
@@ -21,6 +24,201 @@
             .replace(/'/g, '&#39;');
     }
 
+    // -----------------------------------------------------------------------
+    // Auth gate (setup / login) vs. console
+    // -----------------------------------------------------------------------
+    function showView(which) {
+        // which: 'setup' | 'login' | 'console'
+        var gate = $('#auth-gate');
+        var consoleEl = $('#console');
+        var setupView = $('#setup-view');
+        var loginView = $('#login-view');
+        if (which === 'console') {
+            gate.hidden = true;
+            consoleEl.hidden = false;
+            return;
+        }
+        gate.hidden = false;
+        consoleEl.hidden = true;
+        setupView.hidden = (which !== 'setup');
+        loginView.hidden = (which !== 'login');
+    }
+
+    // Returns true (and re-shows the login view) if the response indicates the
+    // session is gone; callers should then bail out of rendering.
+    function handleAuthLoss(resp) {
+        if (resp && (resp.status === 401 || resp.status === 403)) {
+            stopPolling();
+            STATE.authed = false;
+            checkSession();
+            return true;
+        }
+        return false;
+    }
+
+    function fetchSession() {
+        return fetch('/api/session', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.json(); })
+            .catch(function () { return null; });
+    }
+
+    function checkSession() {
+        return fetchSession().then(function (s) {
+            s = s || {};
+            STATE.self = s.self || STATE.self || '';
+            STATE.tokenRequired = !!s.token_required;
+            if (!s.configured) {
+                applySetupMode(!!s.db_from_cfg);
+                showView('setup');
+                return;
+            }
+            if (!s.authenticated) {
+                showView('login');
+                return;
+            }
+            STATE.authed = true;
+            STATE.username = s.username || '';
+            enterConsole();
+        });
+    }
+
+    // When xnet.cfg already provides the DB, hide the DB form and only ask for
+    // the default admin account.
+    function applySetupMode(dbFromCfg) {
+        var dbFields = $('#su-db-fields');
+        if (dbFields) dbFields.hidden = !!dbFromCfg;
+        var sub = $('#setup-sub');
+        if (sub) {
+            sub.textContent = dbFromCfg
+                ? '数据库已由 xnet.cfg 配置，请设置默认管理员账户。'
+                : '尚未检测到数据库配置。请填写 MySQL 连接信息与默认管理员账户。';
+        }
+    }
+
+    function enterConsole() {
+        showView('console');
+        var cu = $('#current-user');
+        if (cu) cu.textContent = STATE.username ? ('👤 ' + STATE.username) : '';
+        var lo = $('#logout-btn');
+        if (lo) lo.hidden = false;
+        renderHeader();
+        showPage('shell');
+        Promise.all([fetchPeers(), fetchStats()]);
+        startPolling();
+    }
+
+    function startPolling() {
+        stopPolling();
+        STATE.pollTimer = setInterval(function () {
+            if (!STATE.authed) return;
+            fetchPeers();
+            fetchStats();
+        }, 5000);
+    }
+
+    function stopPolling() {
+        if (STATE.pollTimer) {
+            clearInterval(STATE.pollTimer);
+            STATE.pollTimer = null;
+        }
+    }
+
+    function setAuthMsg(id, text, cls) {
+        var el = $(id);
+        if (!el) return;
+        el.textContent = text || '';
+        el.className = 'auth-msg' + (cls ? ' ' + cls : '');
+    }
+
+    function doSetup(e) {
+        if (e) e.preventDefault();
+        var payload = {
+            host: $('#su-host').value.trim(),
+            port: $('#su-port').value.trim(),
+            user: $('#su-user').value.trim(),
+            password: $('#su-password').value,
+            database: $('#su-database').value.trim(),
+            admin_user: $('#su-admin-user').value.trim(),
+            admin_pass: $('#su-admin-pass').value,
+        };
+        if (!payload.admin_user || !payload.admin_pass) {
+            setAuthMsg('#setup-msg', '请填写管理员账户与密码', 'err');
+            return;
+        }
+        setAuthMsg('#setup-msg', '正在连接数据库并初始化...', '');
+        fetch('/api/setup', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        })
+            .then(function (r) { return r.json().then(function (d) { return [r, d]; }); })
+            .then(function (pair) {
+                var data = pair[1] || {};
+                if (data.ok) {
+                    setAuthMsg('#setup-msg', '初始化成功，正在进入控制台...', 'ok');
+                    STATE.authed = true;
+                    STATE.username = data.username || payload.admin_user;
+                    enterConsole();
+                } else {
+                    setAuthMsg('#setup-msg', '初始化失败: ' + (data.error || '未知错误'), 'err');
+                }
+            })
+            .catch(function (err) {
+                setAuthMsg('#setup-msg', '请求失败: ' + ((err && err.message) || err), 'err');
+            });
+    }
+
+    function doLogin(e) {
+        if (e) e.preventDefault();
+        var payload = {
+            username: $('#li-user').value.trim(),
+            password: $('#li-password').value,
+        };
+        if (!payload.username || !payload.password) {
+            setAuthMsg('#login-msg', '请输入账户与密码', 'err');
+            return;
+        }
+        setAuthMsg('#login-msg', '登录中...', '');
+        fetch('/api/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        })
+            .then(function (r) { return r.json().then(function (d) { return [r, d]; }); })
+            .then(function (pair) {
+                var data = pair[1] || {};
+                if (data.ok) {
+                    setAuthMsg('#login-msg', '', '');
+                    STATE.authed = true;
+                    STATE.username = data.username || payload.username;
+                    $('#li-password').value = '';
+                    enterConsole();
+                } else {
+                    setAuthMsg('#login-msg', data.error || '登录失败', 'err');
+                }
+            })
+            .catch(function (err) {
+                setAuthMsg('#login-msg', '请求失败: ' + ((err && err.message) || err), 'err');
+            });
+    }
+
+    function doLogout() {
+        fetch('/api/logout', { method: 'POST' })
+            .then(function () {})
+            .catch(function () {})
+            .then(function () {
+                stopPolling();
+                STATE.authed = false;
+                STATE.username = '';
+                var lo = $('#logout-btn');
+                if (lo) lo.hidden = true;
+                showView('login');
+            });
+    }
+
+    // -----------------------------------------------------------------------
+    // Console
+    // -----------------------------------------------------------------------
     function showPage(name) {
         $$('.menu-item').forEach(function (el) {
             el.classList.toggle('active', el.dataset.page === name);
@@ -61,8 +259,12 @@
 
     function fetchPeers() {
         return fetch('/api/peers')
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                if (handleAuthLoss(r)) return null;
+                return r.json();
+            })
             .then(function (data) {
+                if (!data) return;
                 STATE.self = data.self || '';
                 STATE.peers = data.peers || [];
                 STATE.tokenRequired = !!data.token_required;
@@ -77,8 +279,12 @@
 
     function fetchStats() {
         return fetch('/api/stats')
-            .then(function (r) { return r.json(); })
+            .then(function (r) {
+                if (handleAuthLoss(r)) return null;
+                return r.json();
+            })
             .then(function (data) {
+                if (!data) return;
                 STATE.stats = data || {};
                 renderStatsPanel();
             })
@@ -170,7 +376,7 @@
         var sn = $('#self-name');
         if (sn) sn.textContent = STATE.self || '(unknown)';
         var auth = $('#auth-state');
-        if (auth) auth.textContent = STATE.tokenRequired ? '需要 token' : '无认证';
+        if (auth) auth.textContent = STATE.tokenRequired ? '需要 token' : '会话登录';
     }
 
     function fmtLocalTime(ms) {
@@ -253,7 +459,7 @@
 
         send()
             .then(function (r) {
-                if (r.status === 401) {
+                if (r.status === 401 && STATE.tokenRequired) {
                     if (promptToken() != null) {
                         return send().then(function (rr) {
                             return rr.json().then(function (d) { return [rr, d]; });
@@ -261,6 +467,7 @@
                     }
                     return [r, { ok: false, error: 'cancelled' }];
                 }
+                if (handleAuthLoss(r)) return [r, { ok: false, error: '会话已失效，请重新登录' }];
                 return r.json().then(function (d) { return [r, d]; });
             })
             .then(function (pair) {
@@ -300,7 +507,7 @@
 
         send()
             .then(function (r) {
-                if (r.status === 401) {
+                if (r.status === 401 && STATE.tokenRequired) {
                     if (promptToken() != null) {
                         return send().then(function (rr) {
                             return rr.json().then(function (d) { return [rr, d]; });
@@ -308,6 +515,7 @@
                     }
                     return [r, { ok: false, error: 'cancelled' }];
                 }
+                if (handleAuthLoss(r)) return [r, { ok: false, error: '会话已失效，请重新登录' }];
                 return r.json().then(function (d) { return [r, d]; });
             })
             .then(function (pair) {
@@ -340,6 +548,9 @@
         }
     });
 
+    // -----------------------------------------------------------------------
+    // Wiring
+    // -----------------------------------------------------------------------
     $('#run-script').addEventListener('click', runScript);
     var reloadBtn = $('#reload-process');
     if (reloadBtn) reloadBtn.addEventListener('click', reloadProcess);
@@ -349,11 +560,13 @@
     var rs = $('#refresh-stats');
     if (rs) rs.addEventListener('click', fetchStats);
 
-    showPage('shell');
-    Promise.all([fetchPeers(), fetchStats()]);
+    var setupForm = $('#setup-view');
+    if (setupForm) setupForm.addEventListener('submit', doSetup);
+    var loginForm = $('#login-view');
+    if (loginForm) loginForm.addEventListener('submit', doLogin);
+    var logoutBtn = $('#logout-btn');
+    if (logoutBtn) logoutBtn.addEventListener('click', doLogout);
 
-    setInterval(function () {
-        fetchPeers();
-        fetchStats();
-    }, 5000);
+    // Decide the initial view from the server-side session/setup state.
+    checkSession();
 })();

@@ -169,3 +169,46 @@ code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size
         grid-template-columns: repeat(2, minmax(140px, 1fr));
     }
 }
+
+/* ---- auth gate (setup / login) ---- */
+.auth-gate {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: var(--bg);
+    padding: 24px;
+    z-index: 100;
+}
+.auth-card {
+    width: 100%; max-width: 460px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 28px 30px 30px;
+    box-shadow: 0 10px 40px rgba(25, 50, 74, 0.08);
+}
+.auth-brand {
+    font-size: 24px; font-weight: 700; letter-spacing: 1px;
+    color: var(--blue-d); margin-bottom: 16px;
+}
+.auth-view h2 { margin: 0 0 6px; font-size: 20px; }
+.auth-view h3.auth-section { margin: 18px 0 8px; font-size: 14px; color: var(--muted); }
+.auth-sub { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.auth-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.auth-grid label {
+    display: flex; flex-direction: column; gap: 5px;
+    font-size: 13px; color: var(--muted);
+}
+.auth-grid label:first-child { grid-column: 1 / -1; }
+.auth-grid input {
+    height: 34px; padding: 0 10px;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: #fff; color: var(--text); font: inherit;
+}
+.auth-grid input:focus { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+.auth-submit { width: 100%; height: 38px; margin-top: 18px; }
+.auth-msg { margin-top: 12px; font-size: 13px; min-height: 18px; }
+.auth-msg.err { color: var(--red); }
+.auth-msg.ok { color: var(--green); }
+
+.sidebar-user { margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.btn-sm { height: 26px; padding: 0 10px; line-height: 24px; font-size: 12px; }
