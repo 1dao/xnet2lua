@@ -160,7 +160,7 @@ static void timer_callback_bridge(void *ud) {
     JS_FreeValue(ctx, self);       /* last ref to t's JS object; finalizer may run now */
 }
 
-static JSValue timer_create(JSContext *ctx, const char *name, int interval_ms,
+static JSValue xjs_timer_create(JSContext *ctx, const char *name, int interval_ms,
                             JSValueConst callback, int repeat_num) {
     if (!JS_IsFunction(ctx, callback)) {
         return JS_ThrowTypeError(ctx, "%s: callback must be a function", name);
@@ -275,7 +275,7 @@ static JSValue js_xtimer_add(JSContext *ctx, JSValueConst this_val,
     }
     if (JS_ToInt32(ctx, &interval_ms, argv[0]) < 0) return JS_EXCEPTION;
     if (argc >= 3 && JS_ToInt32(ctx, &repeat_num, argv[2]) < 0) return JS_EXCEPTION;
-    return timer_create(ctx, "xtimer.add", interval_ms, argv[1], repeat_num);
+    return xjs_timer_create(ctx, "xtimer.add", interval_ms, argv[1], repeat_num);
 }
 
 static JSValue js_xtimer_delay(JSContext *ctx, JSValueConst this_val,
@@ -286,7 +286,7 @@ static JSValue js_xtimer_delay(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeError(ctx, "xtimer.delay: interval and callback expected");
     }
     if (JS_ToInt32(ctx, &interval_ms, argv[0]) < 0) return JS_EXCEPTION;
-    return timer_create(ctx, "xtimer.delay", interval_ms, argv[1], 1);
+    return xjs_timer_create(ctx, "xtimer.delay", interval_ms, argv[1], 1);
 }
 
 static JSValue js_xtimer_del(JSContext *ctx, JSValueConst this_val,
