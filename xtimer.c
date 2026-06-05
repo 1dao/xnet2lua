@@ -13,8 +13,16 @@
 #define TVN_MASK (TVN_SIZE - 1)
 #define TVR_MASK (TVR_SIZE - 1)
 
-// 时间轮最大容量：2^32 - 1 毫秒 ≈ 49.7天
-#define XTIMER_MAX_INTERVAL 0xFFFFFFFFULL
+// 时间轮单段最大可表示跨度：留足余量避开第4级 2^32 槽位回绕
+// delta 超过此值的定时器会被分段插入，到期时在 poll 中续期
+// （可在测试中通过 -DXTIMER_WHEEL_MAX_DELTA 调小以验证分段逻辑）
+#ifndef XTIMER_WHEEL_MAX_DELTA
+#define XTIMER_WHEEL_MAX_DELTA 0x7FFFFFFFULL  // ~24.8天
+#endif
+
+// 定时器间隔上限：expire 为 uint64_t，实际可表达数亿年，
+// 这里仅防御负值/异常输入，不再限制于单个时间轮跨度
+#define XTIMER_MAX_INTERVAL 0x7FFFFFFFFFFFFFFFLL  // int64_t 上限
 
 // 定时器节点状态
 #define TIMER_FREE 0
@@ -33,7 +41,7 @@ typedef struct xTimerNode {
     fnOnTime callback;
     void* user_data;
     int repeat_num;          /* remaining count; INT_MAX means practically infinite */
-    int repeat_interval;     /* milliseconds */
+    int64_t repeat_interval; /* milliseconds (支持超长间隔) */
     unsigned char cancelled;
     unsigned char firing;
     unsigned char in_free_list;
@@ -122,7 +130,12 @@ static void xtimer_calc_slot(xTimerSet* tm, uint64_t expire, uint32_t* slot, uin
     } else {
         delta = expire - tm->wheel.current_jiffies;
     }
-    
+
+    // 超长定时器：先按安全分段插入，到期时由 poll 判断 expire 是否真到、未到则续期
+    if (delta > XTIMER_WHEEL_MAX_DELTA) {
+        delta = XTIMER_WHEEL_MAX_DELTA;
+    }
+
     if (delta < TVR_SIZE) {
         *level = 0;
         *slot = (tm->wheel.current_jiffies + delta) & TVR_MASK;
@@ -265,7 +278,7 @@ static void xtimer_freelist_destroy(xTimerSet* tm) {
 static xTimerNode* xtimer_node_new(xTimerSet* tm,
                                    int id,
                                    uint64_t timeout,
-                                   int interval_ms,
+                                   int64_t interval_ms,
                                    fnOnTime callback,
                                    void* ud,
                                    int repeat_num) {
@@ -362,7 +375,7 @@ void xtimer_pool_destroy(xTimerSet* tm) {
 /* ------------------------------------------------------------------------- */
 /* create / destroy - 增加最大间隔限制和毒化检查 */
 xTimerNode* xtimer_create(xTimerSet* tm,
-                          int interval_ms,
+                          int64_t interval_ms,
                           fnOnTime callback,
                           void* ud,
                           int repeat_num) {
@@ -370,14 +383,14 @@ xTimerNode* xtimer_create(xTimerSet* tm,
     if (interval_ms < 0) {
         interval_ms = 0;
     }
-    
-    // 优化三：硬边界拦截，防止超长定时器导致的整数截断
-    if ((uint64_t)interval_ms > XTIMER_MAX_INTERVAL) {
-        fprintf(stderr, "[ERROR] xtimer_create: interval %dms exceeds maximum capacity (49.7 days)\n",
-                interval_ms);
+
+    // 防御 expire 累加溢出（理论上需数亿年才会触及，此处仅作健壮性兜底）
+    if (interval_ms > XTIMER_MAX_INTERVAL - (int64_t)tm->current_time) {
+        fprintf(stderr, "[ERROR] xtimer_create: interval %lldms would overflow timer clock\n",
+                (long long)interval_ms);
         return NULL;
     }
-    
+
     if (repeat_num == -1) {
         repeat_num = INT_MAX;
     } else if (repeat_num < 1) {
@@ -492,7 +505,15 @@ int xtimer_poll(xTimerSet* tm) {
             xTimerNode* next = node->next;
             xtimer_remove(node);
             tm->active_count--;
-            
+
+            // 超长定时器的中途唤醒：尚未真正到期，原样重新分段插入，
+            // 不触发回调、不递减 repeat_num（xtimer_insert 会重置为 PENDING）
+            if (!node->cancelled && node->expire > tm->current_time) {
+                xtimer_insert(tm, node);
+                node = next;
+                continue;
+            }
+
             node->firing = 1;
             
             if (!node->cancelled && node->callback) {
@@ -618,7 +639,7 @@ void xtimer_show() {
     xtimer_print(_cur);
 }
 
-xtimerHandler xtimer_add(int interval_ms,
+xtimerHandler xtimer_add(int64_t interval_ms,
                          fnOnTime callback,
                          void* ud,
                          int repeat_num) {
