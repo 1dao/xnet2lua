@@ -9,6 +9,8 @@
 
 local xnats = dofile('scripts/core/server/xnats.lua')
 local xhttp = dofile('scripts/core/server/xhttp.lua')
+local xmysql = dofile('scripts/core/server/xmysql.lua')
+local store = dofile('scripts/xadmin/xadmin_store.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('XADMIN-MAIN')
@@ -27,6 +29,7 @@ local NATS_PORT = tonumber(xutils.get_config('NATS_PORT', '4222')) or 4222
 local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local HEARTBEAT_MS = tonumber(xutils.get_config('XADMIN_HEARTBEAT_MS', '5000')) or 5000
 local TOKEN = xutils.get_config('XADMIN_TOKEN', '')
+local SUPER_TOKEN = xutils.get_config('XADMIN_SUPER_TOKEN', '')
 local HTTP_WORKER_COUNT = 10
 local HTTP_WORKER_BASE = xthread.WORKER_GRP3
 
@@ -59,6 +62,40 @@ xthread.register('xadmin_remote_exec', function(src)
     return h(tostring(src or ''))
 end)
 
+-- ---------------------------------------------------------------------------
+-- MySQL lifecycle (owned by the main thread)
+-- ---------------------------------------------------------------------------
+-- The pool connects WITHOUT a default database so the setup flow can create it;
+-- queries fully qualify table names with the configured database name.
+local function start_mysql(db)
+    return xmysql.start({
+        host = db.host,
+        port = db.port,
+        user = db.user,
+        password = db.password,
+        database = '',
+        pool_size = 2,
+        reconnect_ms = 1000,
+        max_reply_size = 4 * 1024 * 1024,
+    })
+end
+
+-- Worker setup flow calls this to (re)start the pool with the submitted creds.
+-- Restarting on every apply keeps the running pool in sync with new settings.
+xthread.register('xadmin_db_apply', function(host, port, user, password)
+    local db = { host = host, port = port, user = user, password = password }
+    if xmysql.running() then
+        xmysql.stop(true)
+    end
+    local ok, err = start_mysql(db)
+    if not ok then
+        return false, tostring(err)
+    end
+    xthread.log_system('[XADMIN-MAIN] mysql pool (re)started %s@%s:%s',
+        tostring(user), tostring(host), tostring(port))
+    return true
+end)
+
 local function __init()
     xthread.log_system('[XADMIN-MAIN] init server=%s http=%s://%s:%d nats=%s:%d prefix=%s',
         SERVER_NAME, HTTPS and 'https' or 'http', HTTP_HOST, HTTP_PORT,
@@ -67,6 +104,9 @@ local function __init()
         xthread.log_info('[XADMIN-MAIN] auth: X-Xadmin-Token required')
     else
         xthread.log_info('[XADMIN-MAIN] auth: open (set XADMIN_TOKEN to require a token)')
+    end
+    if SUPER_TOKEN ~= '' then
+        xthread.log_info('[XADMIN-MAIN] auth: master bypass token ENABLED (X-Xadmin-Super-Token)')
     end
 
     assert(xnet.init())
@@ -105,6 +145,24 @@ local function __init()
     })
     if not ok then error(err) end
 
+    -- Start the MySQL pool now if the console was configured in a prior run, or
+    -- if xnet.cfg already fully specifies the DB (so first-time setup can reach
+    -- it to create the admin). Otherwise it starts lazily via xadmin_db_apply.
+    local store_cfg = store.load_db_config()
+    local db = store_cfg.db or {}
+    if (store_cfg.configured or store_cfg.db_from_cfg) and db.host then
+        local mok, merr = start_mysql(db)
+        if mok then
+            xthread.log_system('[XADMIN-MAIN] mysql pool started %s@%s:%s db=%s (source=%s)',
+                tostring(db.user), tostring(db.host), tostring(db.port),
+                tostring(db.database), store_cfg.db_from_cfg and 'xnet.cfg' or 'xadmin_db.json')
+        else
+            xthread.log_error('[XADMIN-MAIN] mysql start failed: %s', tostring(merr))
+        end
+    else
+        xthread.log_info('[XADMIN-MAIN] not configured yet; open the web console to set up the database')
+    end
+
     -- Push caller-side routing info to HTTP workers so xnats.rpc(SELF, ...)
     -- on those threads short-circuits straight into the local business
     -- worker without bouncing through the NATS thread.
@@ -122,6 +180,9 @@ end
 local function __uninit()
     xhttp.stop()
     xnats.stop(true)
+    if xmysql.running() then
+        xmysql.stop(true)
+    end
     xnet.uninit()
     xthread.log_system('[XADMIN-MAIN] uninit')
 end
