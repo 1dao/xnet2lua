@@ -7,7 +7,47 @@
 <link rel="stylesheet" href="app.css" />
 </head>
 <body>
-<div class="layout">
+<div class="auth-gate" id="auth-gate" hidden>
+    <div class="auth-card">
+        <div class="auth-brand">xadmin</div>
+
+        <!-- 首次配置：数据库 + 默认管理员 -->
+        <form class="auth-view" id="setup-view" hidden autocomplete="off">
+            <h2>初始化配置</h2>
+            <p class="auth-sub" id="setup-sub">尚未检测到数据库配置。请填写 MySQL 连接信息与默认管理员账户。</p>
+            <div id="su-db-fields">
+                <div class="auth-grid">
+                    <label>数据库地址<input type="text" id="su-host" value="127.0.0.1" /></label>
+                    <label>端口<input type="text" id="su-port" value="3306" /></label>
+                    <label>数据库用户<input type="text" id="su-user" value="root" /></label>
+                    <label>数据库密码<input type="password" id="su-password" /></label>
+                    <label>数据库名<input type="text" id="su-database" value="xadmin" /></label>
+                </div>
+            </div>
+            <h3 class="auth-section">默认管理员</h3>
+            <div class="auth-grid">
+                <label>管理员账户<input type="text" id="su-admin-user" value="admin" /></label>
+                <label>管理员密码<input type="password" id="su-admin-pass" /></label>
+            </div>
+            <button type="submit" class="btn btn-primary auth-submit">保存并初始化</button>
+            <div class="auth-msg" id="setup-msg"></div>
+        </form>
+
+        <!-- 登录 -->
+        <form class="auth-view" id="login-view" hidden autocomplete="off">
+            <h2>登录 xadmin</h2>
+            <p class="auth-sub">请输入管理员账户与密码。</p>
+            <div class="auth-grid">
+                <label>账户<input type="text" id="li-user" /></label>
+                <label>密码<input type="password" id="li-password" /></label>
+            </div>
+            <button type="submit" class="btn btn-primary auth-submit">登录</button>
+            <div class="auth-msg" id="login-msg"></div>
+        </form>
+    </div>
+</div>
+
+<div class="layout" id="console" hidden>
     <aside class="sidebar">
         <div class="brand">
             <div class="brand-name">xadmin</div>
@@ -29,6 +69,10 @@
         </nav>
         <div class="sidebar-foot">
             <span id="auth-state">无认证</span>
+            <div class="sidebar-user">
+                <span id="current-user"></span>
+                <button type="button" id="logout-btn" class="btn btn-ghost btn-sm" hidden>退出登录</button>
+            </div>
         </div>
     </aside>
 
@@ -118,8 +162,10 @@ return 1 + 1"></textarea>
             <p>xadmin 是基于 xnet2lua 的轻量管理控制台，通过 NATS 在多个 <code>SERVER_NAME</code> 进程间路由脚本执行。</p>
             <ul>
                 <li>启动：<code>bin/xnet scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1</code></li>
-                <li>认证：在 <code>xnet.cfg</code> 设置 <code>XADMIN_TOKEN=...</code> 后所有 <code>/api/exec</code> 必须带 <code>X-Xadmin-Token</code> 头</li>
-                <li>禁止远程执行某节点：在该进程不启用 xadmin 即可（不会注册 <code>xadmin_remote_exec</code>）</li>
+                <li>账户登录：首次打开自动进入初始化页，配置 MySQL 连接与默认管理员；之后所有接口需登录会话。</li>
+                <li>数据库配置保存在 <code>xadmin_db.json</code>（可用 <code>XADMIN_DATA_FILE</code> 覆盖路径），账户与会话存于 MySQL。</li>
+                <li>也可在 <code>xnet.cfg</code> 用 <code>XADMIN_DB_HOST/PORT/USER/PASSWORD/DATABASE</code> 预置连接；有值即覆盖 JSON（按字段），五项齐全时初始化页只需设管理员账户。</li>
+                <li>兼容旧版 <code>XADMIN_TOKEN</code>：设置后也可用 <code>X-Xadmin-Token</code> 头免登录调用接口。</li>
             </ul>
         </section>
     </main>

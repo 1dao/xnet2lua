@@ -34,8 +34,8 @@ static void test_xargs_cli(xTestState* st) {
     char arg1[] = "-p";
     char arg2[] = "8080";
     char arg3[] = "--verbose";
-    char arg4[] = "--mode=prod";
-    char arg5[] = "loose";
+    char arg4[] = "loose";
+    char arg5[] = "--mode=prod";
     char arg6[] = "raw=1";
     char* argv[] = { arg0, arg1, arg2, arg3, arg4, arg5, arg6 };
 
@@ -46,7 +46,17 @@ static void test_xargs_cli(xTestState* st) {
     XTEST_EQ_STR(st, xargs_get("verbose"), "");
     XTEST_EQ_STR(st, xargs_get("mode"), "prod");
     XTEST_TRUE(st, strstr(xargs_get_other(), "loose") != NULL);
-    XTEST_TRUE(st, strstr(xargs_get_other(), "raw=1") != NULL);
+    /* bare key=value is now stored directly (no registration needed) rather
+    ** than dumped into _other_, so it is retrievable by key and typed getters */
+    XTEST_EQ_STR(st, xargs_get("raw"), "1");
+    XTEST_EQ_INT(st, xargs_get_int("raw"), 1);
+    /* dash-prefixed lookups resolve to the same stored key */
+    XTEST_EQ_STR(st, xargs_get("--raw"), "1");
+    XTEST_EQ_STR(st, xargs_get("--port"), "8080");
+    XTEST_EQ_STR(st, xargs_get("-p"), "8080");
+    XTEST_EQ_INT(st, xargs_get_int("port"), 8080);
+    XTEST_EQ_INT(st, xargs_get_bool("verbose"), 1);
+    XTEST_EQ_INT(st, xargs_get_int("missing"), 0);
 
     xargs_cleanup();
 }

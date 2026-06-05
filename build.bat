@@ -16,6 +16,7 @@ set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
 set "WITH_XDEBUG=0"
 set "WITH_RPMALLOC=1"
+set "WITH_ASAN=0"
 set "LUA_BACKEND=minilua"
 set "TARGET=all"
 set "RUN_SCRIPT="
@@ -30,6 +31,11 @@ for %%A in (%*) do (
     if /I "!ARG!"=="xdebug" set "WITH_XDEBUG=1"
     if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
     if /I "!ARG!"=="norpmalloc" set "WITH_RPMALLOC=0"
+    if /I "!ARG!"=="asan" (
+        set "WITH_ASAN=1"
+        set "BUILD_MODE=debug"
+        set "WITH_RPMALLOC=0"
+    )
     if /I "!ARG!"=="iouring" set "WITH_IO_URING=1"
     if /I "!ARG!"=="luajit" set "LUA_BACKEND=luajit"
     if /I "!ARG!"=="minilua" set "LUA_BACKEND=minilua"
@@ -64,7 +70,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% rpmalloc=%WITH_RPMALLOC%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -94,9 +100,11 @@ if /I not "%VSCMD_ARG_TGT_ARCH%"=="x64" (
 
 set "OBJDIR=.obj-msvc"
 set "BIN_DIR=bin"
-set "XNET_EXE=%BIN_DIR%\xnet.exe"
-set "THREAD_EXE=%BIN_DIR%\xthread_test.exe"
-set "UNIT_EXE=%BIN_DIR%\test_core.exe"
+set "PROGRAM_SUFFIX="
+if "%WITH_ASAN%"=="1" set "PROGRAM_SUFFIX=_asan"
+set "XNET_EXE=%BIN_DIR%\xnet%PROGRAM_SUFFIX%.exe"
+set "THREAD_EXE=%BIN_DIR%\xthread_test%PROGRAM_SUFFIX%.exe"
+set "UNIT_EXE=%BIN_DIR%\test_core%PROGRAM_SUFFIX%.exe"
 
 set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
@@ -169,6 +177,13 @@ if /I "%BUILD_MODE%"=="debug" (
     set "LDFLAGS="
 )
 
+if "%WITH_ASAN%"=="1" (
+    set "CFLAGS=%CFLAGS% /fsanitize=address /Zi /Oy-"
+    set "LDFLAGS=%LDFLAGS% /INCREMENTAL:NO"
+    set "ASAN_OPTIONS=halt_on_error=1:abort_on_error=1:strict_string_checks=1"
+    set "_NO_DEBUG_HEAP=1"
+)
+
 set "COMMON_OBJECTS="
 for %%F in (%COMMON_SOURCES%) do (
     set "COMMON_OBJECTS=!COMMON_OBJECTS! %OBJDIR%\%%~nF.obj"
@@ -207,9 +222,12 @@ if /I "%TARGET%"=="clean" (
         echo %GREEN%[INFO]%RESET% Cleaning %OBJDIR%...
         rmdir /S /Q "%OBJDIR%"
     )
-    if exist "%XNET_EXE%" del /Q "%XNET_EXE%"
-    if exist "%THREAD_EXE%" del /Q "%THREAD_EXE%"
-    if exist "%UNIT_EXE%" del /Q "%UNIT_EXE%"
+    if exist "%BIN_DIR%\xnet.exe" del /Q "%BIN_DIR%\xnet.exe"
+    if exist "%BIN_DIR%\xnet_asan.exe" del /Q "%BIN_DIR%\xnet_asan.exe"
+    if exist "%BIN_DIR%\xthread_test.exe" del /Q "%BIN_DIR%\xthread_test.exe"
+    if exist "%BIN_DIR%\xthread_test_asan.exe" del /Q "%BIN_DIR%\xthread_test_asan.exe"
+    if exist "%BIN_DIR%\test_core.exe" del /Q "%BIN_DIR%\test_core.exe"
+    if exist "%BIN_DIR%\test_core_asan.exe" del /Q "%BIN_DIR%\test_core_asan.exe"
     echo %GREEN%[INFO]%RESET% Clean complete.
     exit /b 0
 )
@@ -393,6 +411,7 @@ if "%NEED_BUILD_UNIT%"=="1" (
     ) else (
         set "UNIT_CFLAGS=!UNIT_CFLAGS! /O2 /MD /DNDEBUG"
     )
+    if "%WITH_ASAN%"=="1" set "UNIT_CFLAGS=!UNIT_CFLAGS! /fsanitize=address /Zi /Oy-"
 
     echo %GREEN%[INFO]%RESET% Compiling C unit sources...
     for %%F in (%C_UNIT_SOURCES%) do (

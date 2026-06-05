@@ -111,6 +111,7 @@ static inline size_t packet_consumed_return(lua_State* L, int idx, size_t max_le
 /* ── TLS entry points (implemented in lua_xnet_tls.c) ────────────────────── */
 #if XNET_WITH_HTTPS
 int l_xnet_attach_tls(lua_State* L);
+int l_xnet_connect_tls(lua_State* L);
 void lua_xnet_tls_register(lua_State* L);
 #endif
 

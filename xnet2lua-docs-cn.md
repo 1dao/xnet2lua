@@ -1176,6 +1176,46 @@ conn:close(reason)
 conn:set_handler(handlers)
 ```
 
+### 7.4 TLS 客户端（connect_tls）
+
+`xnet.connect_tls(host, port, handlers [, tls_config])` 发起一个非阻塞的出站
+TCP 连接，连接建立后以**客户端模式**完成 TLS 握手，再触发 `on_connect`。返回
+一个 TLS 连接对象（与 §7.3 相同）或 `nil, err`。与 `attach_tls` 不同，客户端
+无需提供证书与私钥——只对服务端做校验。
+
+```lua
+local conn, err = xnet.connect_tls("example.com", 443, {
+    on_connect = function(conn, host, port)
+        conn:send_raw("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+    end,
+    on_packet = function(conn, data)
+        accumulate(data)
+        return #data
+    end,
+    on_close = function(conn, reason)
+        print("已关闭:", reason)
+    end,
+}, {
+    verify      = true,          -- 校验服务端证书（默认 true）
+    -- ca_file  = "ca.pem",      -- 覆盖 CA；省略时使用 xlua/xnet_cacert.h 内置根证书
+    server_name = "example.com", -- SNI 及证书名校验（默认取 host）
+    -- max_packet / max_send     -- 与 attach_tls 相同的分帧参数
+})
+```
+
+`tls_config` 字段：
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| verify | bool | true | 是否校验服务端证书（`VERIFY_REQUIRED` 或 `VERIFY_NONE`） |
+| ca_file | string | （内置） | PEM CA 文件；省略且 `verify=true` 时使用内置 CA 根证书 |
+| server_name | string | host | SNI 主机名，同时用于证书名校验 |
+| max_packet | number | 16MB | 单次交给 `on_packet` 的最大入站数据 |
+| max_send | number | 10MB | 出站缓冲区上限 |
+
+对于常见的 HTTP 场景，建议直接使用 §8.7 的高层客户端，而不是手工拼装
+`connect_tls`。
+
 ---
 
 ## 8. HTTP 服务器
@@ -1410,6 +1450,68 @@ assert(xhttp.start({
 ```
 
 客户端发送 `Content-Encoding: gzip` 或 `deflate` 时，handler 默认直接读取解压后的 `req.body`，并可通过 `req.content_encoding` 判断是否由框架执行了解压。需要直接操作压缩字节流或计算校验和时，使用下方的 `xcompress` 模块。
+
+### 8.7 HTTP 客户端
+
+`scripts/core/share/xhttp_client.lua` 是一个异步、基于回调的 HTTP/HTTPS 客户端，
+运行在同一个 `xnet` 事件循环上。明文请求使用 `xnet.connect`，`https://` 请求使用
+`xnet.connect_tls`（§7.4），因此需要 `WITH_HTTPS=1` 的构建。响应通过
+`xhttp_codec.parse_response` 解析，因此 Content-Length、chunked 分块传输、
+gzip/deflate `Content-Encoding`、以及 `Connection: close` 框定都能自动处理，
+`3xx` 重定向也会自动跟随。
+
+```lua
+local httpc = dofile("scripts/core/share/xhttp_client.lua")
+
+-- GET
+httpc.get("https://example.com/", function(err, resp)
+    if err then return print("error:", err) end
+    print(resp.status, resp.headers["content-type"], #resp.body)
+end)
+
+-- 带选项的 POST
+httpc.post("http://127.0.0.1:8080/echo", '{"hi":1}', {
+    headers    = { ["Content-Type"] = "application/json" },
+    timeout_ms = 5000,
+}, function(err, resp)
+    if err then return print("error:", err) end
+    print(resp.body)
+end)
+
+-- 完整形式
+httpc.request({
+    url           = "https://api.example.com/v1/things",
+    method        = "PUT",
+    headers       = { ["Authorization"] = "Bearer ..." },
+    body          = payload,
+    timeout_ms    = 10000,
+    max_redirects = 5,
+    verify        = true,     -- TLS 证书校验（默认 true）
+    -- ca_file    = "ca.pem", -- 覆盖 CA；省略时使用内置根证书
+    decompress    = true,     -- 透明 gunzip/inflate（默认 true）
+}, function(err, resp)
+    -- ...
+end)
+```
+
+`opts` 字段（用于 `request`；`get`/`post` 为其薄封装）：
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| url | string | — | 绝对 URL；或改为提供 `scheme`/`host`/`port`/`path` |
+| method | string | "GET" | HTTP 方法 |
+| headers | table | nil | 额外请求头（缺省会自动补全 Host/User-Agent/Accept/Content-Length） |
+| body | string | nil | 请求体 |
+| timeout_ms | number | nil | 整体超时；仅在调用过 `xtimer.init()` 后生效 |
+| max_redirects | number | 5 | 最多跟随的 `3xx` 重定向次数（0 表示不跟随） |
+| verify | bool | true | TLS 证书校验（仅 https） |
+| ca_file | string | （内置） | 覆盖 CA PEM 路径（仅 https） |
+| decompress | bool | true | 发送 `Accept-Encoding` 并自动解码 gzip/deflate 响应 |
+
+回调**只会触发一次**：失败时为 `cb(err)`，成功时为 `cb(nil, resp)`，其中
+`resp = { status, version, headers, header_list, body }`，`headers` 的键为小写。
+端到端示例见 `demo/xhttp_client_main.lua`，覆盖 Content-Length、重定向、chunked
+与 gzip 响应。
 
 ---
 

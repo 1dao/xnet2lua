@@ -104,9 +104,11 @@ static int parse_arg(char* arg, int i, int argc, char* argv[], int is_long) {
         if (c) {
             set_config_value(c, eq + 1);
         } else {
-            *eq = '=';
-            add_to_other(arg);
+            /* Unregistered --key=value / -k=value: store directly so callers
+            ** can read it without adding an entry to the xArgsCFG table. */
+            hash_set(name_start, eq + 1);
         }
+        *eq = '=';
         return 0;
     }
 
@@ -131,7 +133,9 @@ static int parse_arg(char* arg, int i, int argc, char* argv[], int is_long) {
         }
 
         if (c) {
-            if (i + 1 < argc && argv[i + 1][0] != '-') {
+            if (c->is_flag) {
+                set_config_value(c, "");
+            } else if (i + 1 < argc && argv[i + 1][0] != '-') {
                 set_config_value(c, argv[i + 1]);
                 return 1;
             } else {
@@ -198,11 +202,12 @@ void xargs_init(xArgsCFG* configs, int count, int argc, char* argv[]) {
                 xArgsCFG* c = find_config(arg);
                 if (c) {
                     set_config_value(c, eq + 1);
-                    *eq = '=';
                 } else {
-                    *eq = '=';
-                    add_to_other(arg);
+                    /* Bare key=value: store directly. No registration needed —
+                    ** read it back with xargs_get()/xargs_get_int()/... */
+                    hash_set(arg, eq + 1);
                 }
+                *eq = '=';
             } else {
                 add_to_other(arg);
             }
@@ -276,7 +281,12 @@ static inline const char* xargs_search(const char* key) {
 }
 
 const char* xargs_get(const char* key) {
-    if (key == NULL || strlen(key)==0) return NULL;
+    if (key == NULL) return NULL;
+
+    /* Tolerate leading dashes so --key / -key / key all resolve to the same
+    ** stored key (the parser strips dashes before storing). */
+    while (*key == '-') key++;
+    if (*key == '\0') return NULL;
 
     const char* val = xargs_get_raw(key);
     if (val) return val;
@@ -290,6 +300,48 @@ const char* xargs_get(const char* key) {
 
     val = xargs_search(key);
     return val ? val : getenv(key);
+}
+
+/* ---------- typed accessors ----------
+ * These wrap xargs_get() and convert the raw string on read, so adding a new
+ * `key=value` parameter never requires touching the xArgsCFG table.
+ */
+const char* xargs_get_str(const char* key) {
+    return xargs_get(key);
+}
+
+int xargs_get_int(const char* key) {
+    const char* v = xargs_get(key);
+    if (!v || !*v) return 0;
+    return (int)strtol(v, NULL, 0);
+}
+
+double xargs_get_double(const char* key) {
+    const char* v = xargs_get(key);
+    if (!v || !*v) return 0.0;
+    return strtod(v, NULL);
+}
+
+int xargs_get_bool(const char* key) {
+    const char* v = xargs_get(key);
+    if (!v) return 0;
+    if (!*v) return 1;  /* key present with empty value → flag set */
+
+    char buf[16];
+    size_t n = strlen(v);
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    for (size_t i = 0; i < n; ++i) {
+        char c = v[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        buf[i] = c;
+    }
+    buf[n] = '\0';
+
+    return strcmp(buf, "1") == 0 ||
+           strcmp(buf, "true") == 0 ||
+           strcmp(buf, "yes") == 0 ||
+           strcmp(buf, "on") == 0 ||
+           strcmp(buf, "daemon") == 0;
 }
 
 /* ---------- config file parser ----------

@@ -1169,6 +1169,48 @@ conn:close(reason)
 conn:set_handler(handlers)
 ```
 
+### 7.4 TLS Client (connect_tls)
+
+`xnet.connect_tls(host, port, handlers [, tls_config])` opens a non-blocking
+outbound TCP connection and, once connected, performs a **client-mode** TLS
+handshake before invoking `on_connect`. It returns a TLS connection userdata
+(the same object as §7.3) or `nil, err`. Unlike `attach_tls`, no certificate or
+key is required — the client only verifies the server.
+
+```lua
+local conn, err = xnet.connect_tls("example.com", 443, {
+    on_connect = function(conn, host, port)
+        conn:send_raw("GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
+    end,
+    on_packet = function(conn, data)
+        accumulate(data)
+        return #data
+    end,
+    on_close = function(conn, reason)
+        print("closed:", reason)
+    end,
+}, {
+    verify      = true,        -- verify the server certificate (default true)
+    -- ca_file  = "ca.pem",    -- override CA bundle; defaults to the bundled
+    --                            Mozilla roots in xlua/xnet_cacert.h
+    server_name = "example.com", -- SNI + cert name check (defaults to host)
+    -- max_packet / max_send    -- same framing knobs as attach_tls
+})
+```
+
+`tls_config` fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| verify | bool | true | Verify the server certificate (`VERIFY_REQUIRED` vs `VERIFY_NONE`) |
+| ca_file | string | (bundled) | PEM CA file; when omitted and `verify` is true, the bundled CA roots are used |
+| server_name | string | host | SNI hostname and certificate name to verify against |
+| max_packet | number | 16MB | Max single inbound record handed to `on_packet` |
+| max_send | number | 10MB | Max buffered outbound bytes |
+
+For most HTTP use cases, prefer the higher-level client in §8.7 over wiring
+`connect_tls` by hand.
+
 ---
 
 ## 8. HTTP Server
@@ -1404,6 +1446,70 @@ assert(xhttp.start({
 ```
 
 When a client sends `Content-Encoding: gzip` or `deflate`, the handler reads the decoded bytes through `req.body` by default and can inspect `req.content_encoding` to see whether the framework decoded it. Use the `xcompress` module below when application code needs direct compressed-byte handling or checksums.
+
+### 8.7 HTTP Client
+
+`scripts/core/share/xhttp_client.lua` is an asynchronous, callback-based
+HTTP/HTTPS client that runs on the same `xnet` event loop. Plaintext requests
+use `xnet.connect`; `https://` requests use `xnet.connect_tls` (§7.4) and
+therefore require a `WITH_HTTPS=1` build. Responses are parsed with
+`xhttp_codec.parse_response`, so Content-Length, chunked transfer-encoding,
+gzip/deflate `Content-Encoding`, and `Connection: close` framing are all
+handled, and `3xx` redirects are followed automatically.
+
+```lua
+local httpc = dofile("scripts/core/share/xhttp_client.lua")
+
+-- GET
+httpc.get("https://example.com/", function(err, resp)
+    if err then return print("error:", err) end
+    print(resp.status, resp.headers["content-type"], #resp.body)
+end)
+
+-- POST with options
+httpc.post("http://127.0.0.1:8080/echo", '{"hi":1}', {
+    headers   = { ["Content-Type"] = "application/json" },
+    timeout_ms = 5000,
+}, function(err, resp)
+    if err then return print("error:", err) end
+    print(resp.body)
+end)
+
+-- Full form
+httpc.request({
+    url           = "https://api.example.com/v1/things",
+    method        = "PUT",
+    headers       = { ["Authorization"] = "Bearer ..." },
+    body          = payload,
+    timeout_ms    = 10000,
+    max_redirects = 5,
+    verify        = true,     -- TLS cert verification (default true)
+    -- ca_file    = "ca.pem", -- override CA; defaults to bundled roots
+    decompress    = true,     -- transparently gunzip/inflate (default true)
+}, function(err, resp)
+    -- ...
+end)
+```
+
+`opts` fields (for `request`; `get`/`post` are thin wrappers):
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| url | string | — | Absolute URL; or supply `scheme`/`host`/`port`/`path` instead |
+| method | string | "GET" | HTTP method |
+| headers | table | nil | Extra request headers (Host/User-Agent/Accept/Content-Length are filled in if absent) |
+| body | string | nil | Request body |
+| timeout_ms | number | nil | Overall request timeout; only active when `xtimer.init()` has run |
+| max_redirects | number | 5 | Maximum `3xx` redirects to follow (0 disables following) |
+| verify | bool | true | TLS certificate verification (https only) |
+| ca_file | string | (bundled) | Override CA PEM path (https only) |
+| decompress | bool | true | Send `Accept-Encoding` and decode gzip/deflate responses |
+
+The callback fires **exactly once**: `cb(err)` on failure, or `cb(nil, resp)`
+on success, where `resp = { status, version, headers, header_list, body }`.
+`headers` keys are lowercased. See `demo/xhttp_client_main.lua` for an
+end-to-end loopback example covering Content-Length, redirects, chunked and
+gzip responses.
 
 ---
 

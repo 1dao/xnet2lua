@@ -106,6 +106,7 @@ Useful build flags:
 - `WITH_HTTPS=0|1`
 - `WITH_RPMALLOC=0|1`
 - `WITH_XDEBUG=0|1`  (compile the Lua debugger into `bin/xnet`; runtime is opt-in)
+- `SANITIZE=none|asan`
 - `LUA_BACKEND=minilua|luajit`
 
 Build artifacts:
@@ -115,6 +116,28 @@ Build artifacts:
 - `tools/xdebug_dap` (`.exe`) — DAP adapter that fronts the in-process Lua debugger for VSCode
 - `bin/test_core` (`.exe`) — C unit binary (built by the test targets, not by `all`)
 - `bin/xthread_test` (`.exe`) — C threading regression binary (built by the test targets)
+
+### Linux daemon mode
+
+On Linux, `xnet` can detach into the background before Lua starts. Enable it
+from `xnet.cfg`:
+
+```ini
+DAEMON=1
+```
+
+or from the command line:
+
+```sh
+bin/xnet scripts/xadmin/xadmin_main.lua DAEMON=1
+bin/xnet scripts/xadmin/xadmin_main.lua -d
+bin/xnet scripts/xadmin/xadmin_main.lua --daemon
+```
+
+The runner preloads `xnet.cfg` before daemonizing so process-level settings can
+take effect early. Use `-c path/to/file.cfg` or `--config path/to/file.cfg` to
+load another config file before daemonizing. Daemon mode is Linux-only; other
+platforms return a startup error if it is requested.
 
 ## Test
 
@@ -152,6 +175,40 @@ build.bat unit
 build.bat test
 build.bat run-lua script=demo/xutils_main.lua
 ```
+
+### ASan / leak diagnostics
+
+Use the ASan targets when chasing native memory bugs:
+
+```sh
+make asan
+make asan-test
+make asan-run-lua SCRIPT=demo/xutils_main.lua
+```
+
+These targets expand to `BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0`. On Linux/macOS toolchains they export:
+
+```sh
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1:abort_on_error=1:strict_string_checks=1
+```
+
+On Windows the default omits `detect_leaks=1` because the MSVC ASan runtime does not support LeakSanitizer-style leak reports. It still catches native memory errors such as out-of-bounds accesses and use-after-free. For leak reports specifically, run the GNU target on Linux/WSL or another GCC/Clang runtime that ships LeakSanitizer.
+
+ASan builds write separate binaries such as `bin/xnet_asan`, `bin/test_core_asan`, and `bin/xthread_test_asan`, so they can live next to normal release/debug builds. You can also call the switch directly:
+
+```sh
+make -B test BUILD_MODE=debug SANITIZE=asan
+```
+
+On Windows with MSVC:
+
+```bat
+build.bat asan
+build.bat asan test
+build.bat asan run-lua script=demo/xutils_main.lua
+```
+
+`SANITIZE=asan` and `build.bat asan` both force `WITH_RPMALLOC=0` so allocations stay visible to the sanitizer runtime.
 
 ### CI matrix
 
@@ -222,14 +279,92 @@ make all WITH_HTTPS=0
 curl http://127.0.0.1:8080/hello?name=xnet2lua
 ```
 
+## Quick Start: HTTP/HTTPS client
+
+`scripts/core/share/xhttp_client.lua` is an asynchronous, callback-based client
+that runs on the same `xnet` event loop as everything else. Plaintext uses
+`xnet.connect`; HTTPS uses `xnet.connect_tls` (needs `WITH_HTTPS=1`). Responses
+are parsed with `xhttp_codec`, so Content-Length, chunked transfer-encoding,
+gzip/deflate and `Connection: close` framing are all handled, and 3xx redirects
+are followed automatically.
+
+```lua
+local httpc = dofile('scripts/core/share/xhttp_client.lua')
+
+local function __init()
+    assert(xnet.init())
+
+    httpc.get('https://example.com/', function(err, resp)
+        if err then return print('error: ' .. err) end
+        print(resp.status, #resp.body)        -- 200  528
+    end)
+
+    httpc.post('http://127.0.0.1:8080/echo', '{"hi":1}', {
+        headers = { ['Content-Type'] = 'application/json' },
+    }, function(err, resp)
+        if err then return print('error: ' .. err) end
+        print(resp.body)
+    end)
+end
+
+return { __init = __init }
+```
+
+`httpc.request(opts, cb)` is the full form. `opts` accepts: `url` (or
+`scheme`/`host`/`port`/`path`), `method`, `headers`, `body`, `timeout_ms`,
+`max_redirects` (default 5), `verify` (TLS cert verification, default `true`,
+using the bundled CA in `xlua/xnet_cacert.h`), `ca_file` (override CA path), and
+`decompress` (default `true`). The callback fires exactly once as `cb(err)` or
+`cb(nil, resp)`, where `resp = { status, version, headers, header_list, body }`.
+
+Run the end-to-end self-test (loopback server + client over HTTP):
+
+```bash
+make run-lua SCRIPT=demo/xhttp_client_main.lua
+```
+
 More entry points:
 
+- `demo/xhttp_client_main.lua` — async HTTP client self-test (content-length, echo, redirect, chunked, gzip)
 - `demo/xhttp_main.lua` — HTTP server + client smoke test
 - `demo/xhttp_compress_main.lua` — HTTP response compression and request decompression smoke test
 - `demo/xnet_main.lua`  — raw TCP + `xsession` RPC
 - `demo/xcompress_main.lua` — `xcompress` gzip/deflate/zlib/checksum smoke test
+- `demo/xraygui_main.lua` — interactive RayGUI controls demo (needs `tools/raygui.dll`)
 - `demo/xrouter_test.lua` / `demo/xhttp_router_test.lua` — router unit checks
 - `demo/xnats_main.lua` — cross-process RPC over NATS (needs a NATS server)
+
+### RayGUI demo
+
+`demo/xraygui_main.lua` shows the exported RayGUI controls in an interactive
+window:
+
+```sh
+bin/xnet demo/xraygui_main.lua
+```
+
+For automated checks, add a frame limit so the window exits by itself:
+
+```sh
+bin/xnet demo/xraygui_main.lua frames=120
+```
+
+### RayGUI smoke test
+
+`tools/raygui_smoke_test.lua` exercises the Lua 5.5 RayGUI module in
+`tools/raygui.dll`. Run it through the embedded xnet Lua runtime:
+
+```sh
+bin/xnet tools/raygui_smoke_test.lua frames=120
+```
+
+It can also run under a standalone Lua executable that matches the DLL ABI:
+
+```sh
+lua tools/raygui_smoke_test.lua frames=120
+# or: lua.exe tools/raygui_smoke_test.lua frames=120
+```
+**Source code & packaging repository**: https://github.com/1dao/xlua_raygui.git
 
 ## Lua Modules
 
@@ -251,6 +386,7 @@ Pure-Lua, loaded via `dofile`:
 | `scripts/core/share/xrouter.lua`                  | unified POST + RPC dispatch with coroutines   | docs §3.3   |
 | `scripts/core/share/xhttp_router.lua`             | HTTP path/method router with path params      | docs §8.5   |
 | `scripts/core/share/xhttp_codec.lua`              | HTTP request/response parsing                 | docs §8     |
+| `scripts/core/share/xhttp_client.lua`             | async HTTP/HTTPS client (get/post/request)    | docs §8     |
 | `scripts/core/share/xsession.lua`                 | request/reply session helper over raw `xnet`  | docs §5     |
 | `scripts/core/share/xtimerx.lua`                  | reload-safe application timers on top of xtimer | docs §3.5  |
 | `scripts/core/server/xhttp.lua` + `xhttp_worker.lua` | HTTP/HTTPS server boot + worker pool       | docs §8     |
