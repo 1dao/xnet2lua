@@ -219,6 +219,7 @@ static MainJSData *main_init(int argc, char **argv) {
     }
     set_runner_globals(data->ctx);
     xjs_xthread_set_thread_ctx(data->ctx);
+    xjs_xthread_set_thread_rt(data->rt);   /* enables xthread.spawn on the main thread */
 
     xlogs("[xjs] loading main script '%s'", g_main_file);
     JSValue def = JS_UNDEFINED;
@@ -321,11 +322,13 @@ static void main_uninit(MainJSData *data) {
     }
 
     if (data->ctx) {
+        xjs_xthread_free_spawned();   /* free actors id>=1 before the default ctx */
         free_main_values(data);
         xThread *thr = xthread_current();
         if (thr) xthread_set_userdata(thr, NULL);
-        xjs_xthread_set_thread_ctx(NULL);
         xjs_free_context(data->ctx);
+        xjs_xthread_set_thread_ctx(NULL);
+        xjs_xthread_set_thread_rt(NULL);
     }
     if (data->rt) {
         js_std_free_handlers(data->rt);

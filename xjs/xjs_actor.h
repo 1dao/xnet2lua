@@ -16,6 +16,7 @@ typedef struct XJSTimer       XJSTimer;
 ** these. Reached from any callback via the node's ->ctx field. */
 typedef struct XJSActor {
     JSContext      *ctx;
+    int             actor_id;   /* 0 = thread's default actor; >=1 = spawned (L3) */
     /* xnet */
     XJSNetConn     *conns;
     XJSNetListener *listeners;

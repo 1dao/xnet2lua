@@ -38,11 +38,112 @@ typedef struct XJSThreadData {
     int auto_xpoll;
 } XJSThreadData;
 
-/* The pool thread's active JS context. L1 routes cross-thread messages to this
-** single per-thread context (multi-actor routing is a later layer). */
-static XJS_TLS JSContext *g_thread_ctx = NULL;
+/* Per-OS-thread actor registry (L3). One JSRuntime hosts many actors, each its
+** own JSContext. Messages carry a destination actorId; the handler routes to
+** that actor's context. actorId 0 is the thread's default actor (the context
+** created by the runner / worker init). Spawned actors get ids >= 1. */
+typedef struct XJSActorSlot {
+    int id;
+    JSContext *ctx;
+    JSValue def;        /* spawned actor's lifecycle object (for __uninit); else UNDEFINED */
+    char *script;       /* spawned actor's script path (for restart); else NULL */
+    struct XJSActorSlot *next;
+} XJSActorSlot;
 
-void xjs_xthread_set_thread_ctx(JSContext *ctx) { g_thread_ctx = ctx; }
+static XJS_TLS JSContext   *g_thread_ctx = NULL;   /* default actor (id 0) */
+static XJS_TLS JSRuntime   *g_thread_rt = NULL;    /* runtime for spawning */
+static XJS_TLS XJSActorSlot *g_actor_slots = NULL; /* registry: id -> ctx */
+static XJS_TLS int          g_next_actor_id = 1;
+
+static XJSActorSlot *actor_slot(int id) {
+    for (XJSActorSlot *s = g_actor_slots; s; s = s->next) {
+        if (s->id == id) return s;
+    }
+    return NULL;
+}
+
+static JSContext *actor_lookup(int id) {
+    XJSActorSlot *s = actor_slot(id);
+    return s ? s->ctx : NULL;
+}
+
+static void actor_register(int id, JSContext *ctx) {
+    XJSActorSlot *s = actor_slot(id);
+    if (s) { s->ctx = ctx; return; }   /* replace */
+    s = (XJSActorSlot *)malloc(sizeof(*s));
+    if (!s) return;
+    s->id = id;
+    s->ctx = ctx;
+    s->def = JS_UNDEFINED;
+    s->script = NULL;
+    s->next = g_actor_slots;
+    g_actor_slots = s;
+}
+
+static void actor_unregister(int id) {
+    for (XJSActorSlot **pp = &g_actor_slots; *pp; pp = &(*pp)->next) {
+        if ((*pp)->id == id) {
+            XJSActorSlot *s = *pp;
+            *pp = s->next;
+            free(s);
+            return;
+        }
+    }
+}
+
+/* Run a spawned actor's __uninit (if any), then free its def, script and
+** context. The slot must already be unlinked from the registry. */
+static void actor_teardown(XJSActorSlot *s) {
+    JSContext *c = s->ctx;
+    if (c && JS_IsObject(s->def)) {
+        JSValue uninit = JS_GetPropertyStr(c, s->def, "__uninit");
+        if (JS_IsFunction(c, uninit)) {
+            JSValue r = JS_Call(c, uninit, s->def, 0, NULL);
+            if (JS_IsException(r)) xjs_dump_error_with_prefix(c, "xjs actor __uninit: ");
+            else JS_FreeValue(c, r);
+        }
+        JS_FreeValue(c, uninit);
+    }
+    if (c && !JS_IsUndefined(s->def)) JS_FreeValue(c, s->def);
+    free(s->script);
+    if (c) xjs_free_context(c);   /* unlinked first so release fns don't re-find it */
+    s->def = JS_UNDEFINED;
+    s->script = NULL;
+    s->ctx = NULL;
+}
+
+/* Free every spawned actor (id >= 1) and drop its slot. Called on thread
+** teardown before the default context is freed. */
+void xjs_xthread_free_spawned(void) {
+    XJSActorSlot **pp = &g_actor_slots;
+    while (*pp) {
+        XJSActorSlot *s = *pp;
+        if (s->id >= 1) {
+            *pp = s->next;
+            actor_teardown(s);
+            free(s);
+        } else {
+            pp = &s->next;
+        }
+    }
+}
+
+void xjs_xthread_set_thread_rt(JSRuntime *rt) { g_thread_rt = rt; }
+
+void xjs_xthread_set_thread_ctx(JSContext *ctx) {
+    g_thread_ctx = ctx;
+    if (ctx) {
+        XJSActor *a = xjs_actor(ctx);
+        if (a) a->actor_id = 0;
+        actor_register(0, ctx);
+        g_next_actor_id = 1;
+    } else {
+        /* teardown: drop any remaining slot nodes (contexts freed by callers) */
+        XJSActorSlot *s = g_actor_slots;
+        while (s) { XJSActorSlot *n = s->next; free(s); s = n; }
+        g_actor_slots = NULL;
+    }
+}
 
 static void xthread_message_handler(xThread *thr, void *arg, int arg_len);
 
@@ -118,13 +219,23 @@ static uint32_t array_length(JSContext *ctx, JSValueConst arr) {
     return len;
 }
 
+/* Wire frame: [int32 toActor][JSON array payload]. The 4-byte prefix lets us
+** pick the destination actor's context before parsing, so the payload is
+** parsed into (and stays isolated to) the receiving actor. */
 static void xthread_message_handler(xThread *thr, void *arg, int arg_len) {
     (void)thr;
-    JSContext *ctx = g_thread_ctx;
-    XJSActor *a = ctx ? xjs_actor(ctx) : NULL;
-    if (!a || !a->msg_handler_set || !arg || arg_len <= 0) return;
+    if (!arg || arg_len < (int)sizeof(int32_t)) return;
 
-    JSValue parsed = xjs_call_json_parse(ctx, (const char *)arg, (size_t)arg_len);
+    int32_t to_actor = 0;
+    memcpy(&to_actor, arg, sizeof(int32_t));
+    const char *json = (const char *)arg + sizeof(int32_t);
+    size_t json_len = (size_t)arg_len - sizeof(int32_t);
+
+    JSContext *ctx = actor_lookup(to_actor);
+    XJSActor *a = ctx ? xjs_actor(ctx) : NULL;
+    if (!a || !a->msg_handler_set) return;   /* unknown/dead actor: drop */
+
+    JSValue parsed = xjs_call_json_parse(ctx, json, json_len);
     if (JS_IsException(parsed)) {
         xjs_dump_error_with_prefix(ctx, "xthread message parse: ");
         return;
@@ -164,19 +275,14 @@ static JSValue js_xthread_init(JSContext *ctx, JSValueConst this_val,
     return JS_TRUE;
 }
 
-static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv) {
-    (void)this_val;
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "xthread.post: target_id and message expected");
-    }
-    int32_t target_id = 0;
-    if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
-
+/* Serialize argv[first..argc) into a JSON array, prefix the int32 destination
+** actor id, and post the frame to target_id's queue. */
+static JSValue post_frame(JSContext *ctx, int32_t target_id, int32_t to_actor,
+                          int first, int argc, JSValueConst *argv) {
     JSValue arr = JS_NewArray(ctx);
     if (JS_IsException(arr)) return arr;
-    for (int i = 1; i < argc; i++) {
-        if (JS_SetPropertyUint32(ctx, arr, (uint32_t)(i - 1),
+    for (int i = first; i < argc; i++) {
+        if (JS_SetPropertyUint32(ctx, arr, (uint32_t)(i - first),
                                  JS_DupValue(ctx, argv[i])) < 0) {
             JS_FreeValue(ctx, arr);
             return JS_EXCEPTION;
@@ -187,7 +293,7 @@ static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
     if (JS_IsException(json)) return json;
     if (JS_IsUndefined(json)) {
         JS_FreeValue(ctx, json);
-        return JS_ThrowTypeError(ctx, "xthread.post: message is not JSON serializable");
+        return JS_ThrowTypeError(ctx, "xthread: message is not JSON serializable");
     }
 
     size_t len = 0;
@@ -196,12 +302,148 @@ static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
         JS_FreeValue(ctx, json);
         return JS_EXCEPTION;
     }
-    int rc = xthread_post(target_id, xthread_message_handler, data, len);
+    size_t frame_len = sizeof(int32_t) + len;
+    char *frame = (char *)malloc(frame_len);
+    if (!frame) {
+        JS_FreeCString(ctx, data);
+        JS_FreeValue(ctx, json);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+    memcpy(frame, &to_actor, sizeof(int32_t));
+    memcpy(frame + sizeof(int32_t), data, len);
+    int rc = xthread_post(target_id, xthread_message_handler, frame, frame_len);
+    free(frame);
     JS_FreeCString(ctx, data);
     JS_FreeValue(ctx, json);
     if (rc == 0) return JS_TRUE;
     if (rc == -2) return JS_FALSE;
-    return JS_ThrowInternalError(ctx, "xthread.post failed: %d", rc);
+    return JS_ThrowInternalError(ctx, "xthread post failed: %d", rc);
+}
+
+/* post(target, ...msg): deliver to target thread's default actor (id 0). */
+static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "xthread.post: target_id and message expected");
+    }
+    int32_t target_id = 0;
+    if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
+    return post_frame(ctx, target_id, 0, 1, argc, argv);
+}
+
+/* send(target, toActor, ...msg): deliver to a specific actor on target thread. */
+static JSValue js_xthread_send(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "xthread.send: target_id and actor_id expected");
+    }
+    int32_t target_id = 0;
+    int32_t to_actor = 0;
+    if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &to_actor, argv[1]) < 0) return JS_EXCEPTION;
+    return post_frame(ctx, target_id, to_actor, 2, argc, argv);
+}
+
+/* selfActor(): the actor id of the context making the call. */
+static JSValue js_xthread_self_actor(JSContext *ctx, JSValueConst this_val,
+                                     int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    XJSActor *a = xjs_actor(ctx);
+    return JS_NewInt32(ctx, a ? a->actor_id : 0);
+}
+
+/* spawn(scriptPath): create a new actor (JSContext) on THIS thread, run its
+** script, register it, and return its actor id. The script exports a default
+** lifecycle object whose __thread_handle becomes the actor's message handler. */
+static JSValue js_xthread_spawn(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (!g_thread_rt) {
+        return JS_ThrowInternalError(ctx, "xthread.spawn: no runtime on this thread");
+    }
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "xthread.spawn: scriptPath expected");
+    }
+    const char *script = JS_ToCString(ctx, argv[0]);
+    if (!script) return JS_EXCEPTION;
+
+    char *av[2] = { (char *)"xjs-actor", (char *)script };
+    JSContext *nctx = xjs_new_context(g_thread_rt, 2, av);
+    if (!nctx) {
+        JS_FreeCString(ctx, script);
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    int id = g_next_actor_id++;
+    XJSActor *na = xjs_actor(nctx);
+    if (na) na->actor_id = id;
+    actor_register(id, nctx);
+
+    JSValue def = JS_UNDEFINED;
+    if (xjs_eval_file(nctx, script, &def) != 0 || !JS_IsObject(def)) {
+        JS_FreeValue(nctx, def);
+        actor_unregister(id);
+        xjs_free_context(nctx);
+        JSValue e = JS_ThrowInternalError(ctx,
+            "xthread.spawn: %s did not export a lifecycle object", script);
+        JS_FreeCString(ctx, script);
+        return e;
+    }
+
+    /* Retain def + script on the slot for __uninit on teardown / restart. */
+    XJSActorSlot *slot = actor_slot(id);
+    if (slot) {
+        slot->def = JS_DupValue(nctx, def);
+        size_t slen = strlen(script);
+        slot->script = (char *)malloc(slen + 1);
+        if (slot->script) memcpy(slot->script, script, slen + 1);
+    }
+    JS_FreeCString(ctx, script);
+
+    JSValue handler = JS_GetPropertyStr(nctx, def, "__thread_handle");
+    if (JS_IsUndefined(handler) || JS_IsNull(handler)) {
+        JS_FreeValue(nctx, handler);
+        handler = JS_GetPropertyStr(nctx, def, "threadHandle");
+    }
+    if (JS_IsFunction(nctx, handler) || JS_IsObject(handler)) {
+        xjs_xthread_set_handler(nctx, handler);
+    }
+    JS_FreeValue(nctx, handler);
+
+    JSValue init = JS_GetPropertyStr(nctx, def, "__init");
+    if (JS_IsFunction(nctx, init)) {
+        JSValue r = JS_Call(nctx, init, def, 0, NULL);
+        if (JS_IsException(r)) xjs_dump_error_with_prefix(nctx, "xjs actor __init: ");
+        else JS_FreeValue(nctx, r);
+    }
+    JS_FreeValue(nctx, init);
+    JS_FreeValue(nctx, def);
+
+    return JS_NewInt32(ctx, id);
+}
+
+/* disposeActor(actorId): run a spawned actor's __uninit and free it. Local to
+** the calling thread; default actor (id 0) cannot be disposed this way. */
+static JSValue js_xthread_dispose_actor(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "xthread.disposeActor: actor_id expected");
+    int32_t id = 0;
+    if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
+    if (id < 1) return JS_FALSE;   /* never dispose the default actor */
+
+    for (XJSActorSlot **pp = &g_actor_slots; *pp; pp = &(*pp)->next) {
+        if ((*pp)->id == id) {
+            XJSActorSlot *s = *pp;
+            *pp = s->next;          /* unlink before teardown */
+            actor_teardown(s);
+            free(s);
+            return JS_TRUE;
+        }
+    }
+    return JS_FALSE;
 }
 
 static JSValue js_xthread_set_queue_max(JSContext *ctx, JSValueConst this_val,
@@ -306,7 +548,8 @@ static void xjs_thread_on_init(xThread *thr) {
         xloge("xjs thread %d: create JS context failed", xthread_get_id(thr));
         return;
     }
-    g_thread_ctx = td->ctx;
+    xjs_xthread_set_thread_ctx(td->ctx);   /* registers default actor (id 0) */
+    xjs_xthread_set_thread_rt(td->rt);      /* enables xthread.spawn on this thread */
     td_init_values(td);
 
     JSValue def = JS_UNDEFINED;
@@ -390,9 +633,11 @@ static void xjs_thread_on_cleanup(xThread *thr) {
     }
 
     if (td->ctx) {
+        xjs_xthread_free_spawned();          /* free actors id>=1 before default */
         td_free_values(td);
-        g_thread_ctx = NULL;
         xjs_free_context(td->ctx);
+        xjs_xthread_set_thread_ctx(NULL);    /* clears registry node 0 */
+        xjs_xthread_set_thread_rt(NULL);
         td->ctx = NULL;
     }
     if (td->rt) {
@@ -565,6 +810,12 @@ static JSValue js_xthread_rpc(JSContext *ctx, JSValueConst this_val,
 static const JSCFunctionListEntry xthread_funcs[] = {
     JS_CFUNC_DEF("init", 1, js_xthread_init),
     JS_CFUNC_DEF("post", 2, js_xthread_post),
+    JS_CFUNC_DEF("send", 2, js_xthread_send),
+    JS_CFUNC_DEF("spawn", 1, js_xthread_spawn),
+    JS_CFUNC_DEF("disposeActor", 1, js_xthread_dispose_actor),
+    JS_CFUNC_DEF("dispose_actor", 1, js_xthread_dispose_actor),
+    JS_CFUNC_DEF("selfActor", 0, js_xthread_self_actor),
+    JS_CFUNC_DEF("self_actor", 0, js_xthread_self_actor),
     JS_CFUNC_DEF("rpc", 3, js_xthread_rpc),
     JS_CFUNC_DEF("setQueueMax", 2, js_xthread_set_queue_max),
     JS_CFUNC_DEF("set_queue_max", 2, js_xthread_set_queue_max),

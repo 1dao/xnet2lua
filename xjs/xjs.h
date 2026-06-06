@@ -53,6 +53,8 @@ void xjs_xtimer_release_context(JSContext *ctx);
 void xjs_xnet_release_context(JSContext *ctx);
 void xjs_xthread_release_context(JSContext *ctx);
 void xjs_xthread_set_thread_ctx(JSContext *ctx);
+void xjs_xthread_set_thread_rt(JSRuntime *rt);
+void xjs_xthread_free_spawned(void);
 
 extern JSClassID g_xjs_conn_class_id;
 extern JSClassID g_xjs_listener_class_id;
