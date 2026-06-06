@@ -10,7 +10,7 @@ A small C networking runtime with an embedded Lua scripting layer. The C core ha
 - Embedded Lua via `minilua` by default; LuaJIT optional via `LUA_BACKEND=luajit`.
 - Lua bindings: `xnet` (sockets / TLS / runtime stats), `xthread` (threads / RPC / queue stats), `xtimer` (timer wheel), `xutils` (JSON via yyjson, config, filesystem), `xcompress` (gzip/deflate/checksums), `cmsgpack` (MessagePack), `xdebug` (optional VSCode debug adapter).
 - Lua share modules: `xhttp` (HTTP/1.x server with router), `xrouter` (unified POST/RPC dispatch), `xredis` / `xmysql` / `xnats` worker stacks, `xsession` (HTTP session helper).
-- Hot reload protocol, cross-process RPC over NATS, and an `xadmin` console for remote exec/reload.
+- Hot reload protocol, cross-process RPC over NATS, and an `xadmin` console for remote exec/reload with enterprise auth (password, JWT/HS256, OAuth2+PKCE, mTLS) and an admin/viewer role model.
 - In-tree regression tests with a CI matrix that covers both stripped and full-featured build flags.
 
 ## Architecture
@@ -427,6 +427,7 @@ Task-oriented index:
 | Make a module hot-reload safe                        | docs §19                               |
 | Debug Lua from VSCode                                | docs §20                               |
 | Operate the xadmin console (remote exec / reload)    | docs §17                               |
+| Secure the xadmin console (login, JWT, OAuth2, mTLS, roles) | docs §17.9–17.17                 |
 
 ## Contributing
 

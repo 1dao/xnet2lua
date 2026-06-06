@@ -2284,12 +2284,18 @@ Nodes discover each other through the NATS broadcast subject (5s heartbeat, 15s 
 
 | Path | Method | Auth | Purpose |
 |---|---|---|---|
-| `/api/peers` | GET | no | This node + peers discovered via heartbeat |
-| `/api/stats` | GET | no | Per-thread runtime stats (queue depth, etc.) |
-| `/api/exec` | POST | optional | Run a Lua chunk on the given node (see 17.6) |
-| `/api/reload` | POST | optional | Hot-reload self / a specific node / all nodes (see 17.7) |
+| `/api/session` | GET | public | Reports configured/auth state, username, role, available auth methods |
+| `/api/setup` | POST | only while unconfigured | First-time init: create DB + default admin (see 17.10) |
+| `/api/login` · `/api/logout` | POST | public | Password login / logout |
+| `/api/auth/jwt` | POST | public | Exchange a JWT for a session cookie (see 17.12) |
+| `/api/auth/oauth/:p/{start,callback}` | GET | public | OAuth2 login (see 17.14) |
+| `/api/peers` | GET | login required | This node + peers discovered via heartbeat |
+| `/api/stats` | GET | login required | Per-thread runtime stats (queue depth, etc.) |
+| `/api/tokens` | POST | admin only | Issue an access token (see 17.13) |
+| `/api/exec` | POST | admin only | Run a Lua chunk on the given node (see 17.6) |
+| `/api/reload` | POST | admin only | Hot-reload self / a specific node / all nodes (see 17.7) |
 
-When `XADMIN_TOKEN=...` is set, `/api/exec` and `/api/reload` require `X-Xadmin-Token: <token>`. `/api/peers` and `/api/stats` are always public.
+See 17.9 for the auth/authz model. In short: while unconfigured, non-public endpoints return 403; once configured they require a login, and `/api/exec`, `/api/reload`, `/api/tokens` require the `admin` role. `XADMIN_TOKEN` (legacy) still works — sending `X-Xadmin-Token` is treated as admin, handy for scripts/automation without a login.
 
 ### 17.6 Remote exec — `/api/exec`
 
@@ -2356,6 +2362,121 @@ The `current` / `notified` / `deferred` counts are explained in §19.4. Reload n
 ```
 
 No xnet process is restarted at any point.
+
+### 17.9 Authentication & authorization overview
+
+xadmin separates "who you are" (authentication) from "what you may do" (authorization). **Authentication** supports several methods, **each enabled by configuring it**; **authorization** has just two roles: `admin` (may call `/api/exec`, `/api/reload`, issue tokens) and `viewer` (read-only: `/api/peers`, `/api/stats`).
+
+| Method | Enabled by | Resulting role |
+|---|---|---|
+| Username/password | Completing setup (17.10) | The initial admin and names in `XADMIN_ADMINS` → admin, others viewer |
+| JWT (HS256) | `XADMIN_JWT_HS256_SECRET` (17.12) | The token's `role` claim, falling back to the allowlist |
+| OAuth2 / OIDC | `XADMIN_OAUTH_*` (17.14) | Allowlist; viewer by default |
+| mTLS | `XADMIN_HTTPS=1` + `XADMIN_TLS_CA_FILE` (17.15) | Allowlist; viewer by default |
+| `XADMIN_TOKEN` | Setting it | `X-Xadmin-Token` → admin (no login; good for scripts) |
+| `XADMIN_SUPER_TOKEN` | Setting it | Master bypass, unconditional admin (skips even setup) |
+| `XADMIN_DEV_NO_AUTH` | Set to 1 | Disables all auth/authz, everyone is admin (local only, 17.16) |
+
+Sessions: a successful password/JWT/OAuth login sets an `xadmin_sid` HttpOnly cookie (7 days by default); the role is stored on the session.
+
+> Security: the HS256 secret, `XADMIN_TOKEN`, and `XADMIN_SUPER_TOKEN` are symmetric secrets/shared passwords — hand them only to trusted parties, never to a browser or end user. Use `XADMIN_HTTPS=1` in production.
+
+### 17.10 Account setup & password login
+
+The console's first screen is a setup page: enter the MySQL connection + a default admin account; on submit it creates the DB/tables, the admin, and logs you in. Accounts and sessions live in MySQL; the connection settings live in `xadmin_db.json` (override the path with `XADMIN_DATA_FILE`), decoupled from the DB.
+
+You can also pre-seed the connection via `XADMIN_DB_*` in `xnet.cfg` / the CLI (overrides the JSON per field); when host+user+database are all set, the setup page only asks for the admin account:
+
+```
+XADMIN_DB_HOST=127.0.0.1
+XADMIN_DB_PORT=3306
+XADMIN_DB_USER=chib
+XADMIN_DB_PASSWORD=...
+XADMIN_DB_DATABASE=xadmin
+```
+
+Endpoints: `POST /api/setup` (only while unconfigured), `POST /api/login {username,password}` → `{ok,username,role}` + Set-Cookie, `POST /api/logout`, `GET /api/session` (the SPA uses it to pick setup / login / console). No manual DB creation needed — a correct account auto-runs `CREATE DATABASE IF NOT EXISTS`.
+
+### 17.11 Roles & authorization
+
+- Default admin: the **initial admin** (created at setup, recorded in `xadmin_db.json`).
+- Extra admins: `XADMIN_ADMINS=alice,ci-bot` (comma-separated local names). Matches → admin, others → viewer.
+- `/api/exec`, `/api/reload`, `/api/tokens` require admin; `/api/peers`, `/api/stats` allow any logged-in role. The console disables Run/Reload and hides the "Access tokens" page for viewers.
+
+> Migration: this version adds a `role` column to the sessions table; an existing DB **self-heals (adds the column) on the next login** — no manual migration. If your console was set up before this version and `xadmin_db.json` has no recorded admin name, startup warns — add that name to `XADMIN_ADMINS`.
+
+### 17.12 JWT (HS256)
+
+Set `XADMIN_JWT_HS256_SECRET=<shared secret>` to enable. A trusted upstream (gateway / internal auth service / automation) signs an HS256 JWT with the same secret; xadmin verifies and admits it — ideal for "already authenticated elsewhere, forward a token to xadmin." Signatures are standard RFC 7515 base64url.
+
+Validated claims: `aud` (default `xadmin`, override with `XADMIN_JWT_AUDIENCE`, `*` = no check), `iss` (optional `XADMIN_JWT_ISSUER`), `exp`/`nbf` (30s leeway). `sub` becomes the username. A token may carry a `role` claim (`admin`/`viewer`) — trusted (signature = authorization), falling back to the allowlist when absent.
+
+```bash
+# API / machine: use it as a Bearer token on any endpoint
+curl -H "Authorization: Bearer <jwt>" -X POST .../api/exec -d '{"target":"self","script":"return 1"}'
+# Browser: exchange for a session cookie (role persists on the session)
+curl -X POST .../api/auth/jwt -H 'Content-Type: application/json' -d '{"token":"<jwt>"}'
+```
+
+> RS256 (common for real IdPs) is not supported. For full OIDC use OAuth (17.14), or front xadmin with a gateway that verifies RS256 and forwards an HS256 token to xadmin.
+
+### 17.13 Issuing access tokens
+
+Logged in as admin, the console shows an **"Access tokens"** page: pick a role (read-only / operate), an expiry, an optional label (sub), click Generate to get a copyable JWT. Equivalent endpoint:
+
+```
+POST /api/tokens            # admin only; requires XADMIN_JWT_HS256_SECRET
+{ "role": "viewer"|"admin", "ttl_seconds": 3600, "sub": "ci-bot" }
+→ { "ok":true, "token":"...", "role":"...", "sub":"...", "exp":1780..., "expires_in":3600 }
+```
+
+`ttl_seconds` ranges 60s–30 days; `sub` must match `[A-Za-z0-9_.@-]`, ≤64 chars, auto-generated if empty. Use the token per 17.12. **A token is a password and cannot be revoked before expiry (short of rotating the secret, which invalidates all of them) — prefer short TTLs.**
+
+### 17.14 OAuth2 / OIDC (Auth Code + PKCE)
+
+Have xadmin drive an interactive login against an external IdP (Google/Okta/…).
+
+```
+XADMIN_OAUTH_PROVIDERS=google
+XADMIN_OAUTH_GOOGLE_CLIENT_ID=...
+XADMIN_OAUTH_GOOGLE_CLIENT_SECRET=...
+XADMIN_OAUTH_GOOGLE_ISSUER=https://accounts.google.com   # endpoints via OIDC discovery
+# or set explicitly: _AUTH_URL / _TOKEN_URL / _USERINFO_URL
+# optional: _SCOPE (default openid profile email), _REDIRECT_URI, _USERNAME_FIELD (default sub), _LABEL
+```
+
+The login page shows a "Sign in with google" button → `/api/auth/oauth/google/start` → IdP → `/callback`. Uses Auth Code + PKCE(S256); state is HMAC-signed server-side (no server-side state store), and the PKCE verifier travels in an HttpOnly cookie (never leaves via the IdP). The callback fetches userinfo with the access_token, auto-provisions a shadow account on first login, role viewer by default (for admin, add the mapped local name to `XADMIN_ADMINS`). Default redirect URI is `<scheme>://<host>/api/auth/oauth/<provider>/callback`; behind a reverse proxy set `_REDIRECT_URI` explicitly (the return URL depends on Host / `X-Forwarded-Proto`).
+
+### 17.15 mTLS (mutual TLS)
+
+```
+XADMIN_HTTPS=1
+HTTPS_CERT=demo/certs/server.crt
+HTTPS_KEY=demo/certs/server.key
+XADMIN_TLS_CA_FILE=ca.pem          # trusted CA for verifying client certs
+```
+
+xadmin then runs over HTTPS and **requests but does not require** a client cert at handshake (`VERIFY_OPTIONAL`) — so a browser without a cert can still log in via password/JWT/OAuth. When the client presents a cert signed by that CA **and it verifies**, its subject DN becomes the identity (`mtls:<DN>`, mappable to a local account via the `oauth_links` table); role viewer by default.
+
+> `XADMIN_TLS_CA_FILE` must be paired with `XADMIN_HTTPS=1`, otherwise startup **errors out** (so you never think mTLS is on when it isn't). Requires a binary built with `WITH_HTTPS=1`.
+
+### 17.16 Local testing & bypass switches
+
+| Switch | Effect | Note |
+|---|---|---|
+| `XADMIN_DEV_NO_AUTH=1` | Disables **all** auth/authz: every request is admin, setup/login skipped, no DB needed | Local only; logs an ERROR warning at startup |
+| `XADMIN_SUPER_TOKEN=<v>` | `X-Xadmin-Super-Token` (or `X-Xadmin-Token`) → unconditional admin, skips even setup | Equivalent to root; keep secret |
+
+```bash
+bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_DEV_NO_AUTH=1
+# → browser goes straight to the console; curl any endpoint with no auth
+```
+
+### 17.17 MySQL note (caching_sha2)
+
+xadmin's built-in pure-Lua MySQL client does **not** support `caching_sha2_password` first-time "full authentication" (the MySQL 8 default, including `root`). With a cold auth cache (the account hasn't logged in since the server started) the connection is closed and setup reports `cannot reach database: ... caching_sha2_password ...` (a clear, fast failure — no longer a misleading `rpc timeout`).
+
+Fix: use a `mysql_native_password` account (`ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'`), or warm the cache by logging in once with the mysql CLI.
 
 ---
 

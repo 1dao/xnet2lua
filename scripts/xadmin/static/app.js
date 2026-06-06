@@ -9,7 +9,9 @@
         tokenRequired: false,
         authed: false,
         username: '',
+        role: '',
         pollTimer: null,
+        authMethods: {},
     };
 
     function $(sel) { return document.querySelector(sel); }
@@ -47,7 +49,10 @@
     // Returns true (and re-shows the login view) if the response indicates the
     // session is gone; callers should then bail out of rendering.
     function handleAuthLoss(resp) {
-        if (resp && (resp.status === 401 || resp.status === 403)) {
+        // Only 401 means "not authenticated" -> re-login. A 403 means the caller
+        // IS authenticated but lacks the role (e.g. a viewer hitting /api/exec);
+        // those are handled inline so the user isn't bounced to the login page.
+        if (resp && resp.status === 401) {
             stopPolling();
             STATE.authed = false;
             checkSession();
@@ -67,19 +72,109 @@
             s = s || {};
             STATE.self = s.self || STATE.self || '';
             STATE.tokenRequired = !!s.token_required;
+            STATE.authMethods = s.auth_methods || {};
             if (!s.configured) {
                 applySetupMode(!!s.db_from_cfg);
                 showView('setup');
                 return;
             }
             if (!s.authenticated) {
+                renderAuthMethods(STATE.authMethods);
                 showView('login');
                 return;
             }
             STATE.authed = true;
             STATE.username = s.username || '';
+            STATE.role = s.role || '';
             enterConsole();
+        }).catch(function () {
+            // Server unreachable / proxy issue. Show login so the user can
+            // retry; federated methods cannot be enumerated, but a password
+            // attempt will surface the real failure.
+            renderAuthMethods(STATE.authMethods || {});
+            showView('login');
         });
+    }
+
+    // Populate the federated-login section (OAuth buttons, JWT form, mTLS
+    // hint) based on what the server reports as available.
+    function renderAuthMethods(methods) {
+        methods = methods || {};
+        var box = $('#auth-federated');
+        var buttons = $('#auth-buttons');
+        var jwtBox = $('#auth-jwt');
+        var mtlsHint = $('#auth-mtls-hint');
+        if (!box || !buttons) return;
+
+        buttons.innerHTML = '';
+        var oauthList = methods.oauth || [];
+        var hasAny = oauthList.length > 0 || methods.jwt || methods.mtls || false;
+        box.hidden = !hasAny;
+        if (!hasAny) {
+            jwtBox.hidden = true;
+            mtlsHint.hidden = true;
+            return;
+        }
+
+        oauthList.forEach(function (name) {
+            var a = document.createElement('a');
+            a.className = 'btn btn-secondary auth-oauth-btn';
+            a.href = '/api/auth/oauth/' + encodeURIComponent(name) + '/start?next=' +
+                encodeURIComponent(window.location.pathname || '/');
+            a.textContent = '使用 ' + name + ' 登录';
+            buttons.appendChild(a);
+        });
+        jwtBox.hidden = !methods.jwt;
+        // mTLS is always informational here: if the cert were already
+        // presented, the server would have authenticated the request and
+        // we'd have gone straight into the console.
+        mtlsHint.hidden = !methods.mtls;
+    }
+
+    // Exchange an HS256 JWT for a session cookie.
+    function doJwtLogin(e) {
+        if (e) e.preventDefault();
+        var tok = ($('#li-jwt-token').value || '').trim();
+        if (!tok) {
+            setAuthMsg('#jwt-msg', '请输入 JWT', 'err');
+            return;
+        }
+        setAuthMsg('#jwt-msg', '验证中...', '');
+        fetch('/api/auth/jwt', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: tok }),
+        })
+            .then(function (r) { return r.json().then(function (d) { return [r, d]; }); })
+            .then(function (pair) {
+                var data = pair[1] || {};
+                if (data.ok) {
+                    setAuthMsg('#jwt-msg', '', '');
+                    STATE.authed = true;
+                    STATE.username = data.username || '';
+                    STATE.role = data.role || '';
+                    $('#li-jwt-token').value = '';
+                    enterConsole();
+                } else {
+                    setAuthMsg('#jwt-msg', data.error || '验证失败', 'err');
+                }
+            })
+            .catch(function (err) {
+                setAuthMsg('#jwt-msg', '请求失败: ' + ((err && err.message) || err), 'err');
+            });
+    }
+
+    // Surface ?auth_error=... that the OAuth callback route appends on failure.
+    function consumeAuthError() {
+        try {
+            var u = new URL(window.location.href);
+            var e = u.searchParams.get('auth_error');
+            if (e) {
+                setAuthMsg('#login-msg', 'SSO 登录失败: ' + e, 'err');
+                u.searchParams.delete('auth_error');
+                window.history.replaceState({}, '', u.pathname + (u.search ? u.search : '') + u.hash);
+            }
+        } catch (_) { /* old browser: ignore */ }
     }
 
     // When xnet.cfg already provides the DB, hide the DB form and only ask for
@@ -97,14 +192,82 @@
 
     function enterConsole() {
         showView('console');
+        var isAdmin = STATE.role === 'admin';
         var cu = $('#current-user');
-        if (cu) cu.textContent = STATE.username ? ('👤 ' + STATE.username) : '';
+        if (cu) cu.textContent = STATE.username
+            ? ('👤 ' + STATE.username + (isAdmin ? '' : ' · 只读'))
+            : '';
         var lo = $('#logout-btn');
         if (lo) lo.hidden = false;
+        applyRoleUI();
         renderHeader();
         showPage('shell');
         Promise.all([fetchPeers(), fetchStats()]);
         startPolling();
+    }
+
+    // Reflect the principal's role: a non-admin (viewer / federated identity not
+    // in XADMIN_ADMINS) can browse peers/stats but cannot run scripts or reload,
+    // so disable those controls instead of letting the click bounce off the 403.
+    function applyRoleUI() {
+        var isAdmin = STATE.role === 'admin';
+        ['#run-script', '#reload-process'].forEach(function (sel) {
+            var el = $(sel);
+            if (!el) return;
+            el.disabled = !isAdmin;
+            el.title = isAdmin ? '' : '需要管理员权限（当前为 viewer 只读）';
+        });
+        var script = $('#script');
+        if (script) script.readOnly = !isAdmin;
+        // Token issuance is admin-only -- hide the menu entry for viewers.
+        var mt = $('#menu-tokens');
+        if (mt) mt.hidden = !isAdmin;
+        if (!isAdmin) setMeta('当前账户为 viewer（只读）：可查看节点/统计，不能执行脚本或 reload', 'err');
+    }
+
+    // Mint a scoped access token via POST /api/tokens (admin only).
+    function generateToken() {
+        var role = ($('#tk-role') || {}).value || 'viewer';
+        var ttl = parseInt(($('#tk-ttl') || {}).value, 10) || 3600;
+        var sub = (($('#tk-sub') || {}).value || '').trim();
+        var meta = $('#tk-meta');
+        function setTkMeta(t, cls) { if (meta) { meta.textContent = t || ''; meta.className = 'output-meta' + (cls ? ' ' + cls : ''); } }
+        setTkMeta('生成中...', '');
+        fetch('/api/tokens', {
+            method: 'POST',
+            headers: authHeaders(),
+            body: JSON.stringify({ role: role, ttl_seconds: ttl, sub: sub }),
+        })
+            .then(function (r) { return r.json().then(function (d) { return [r, d]; }); })
+            .then(function (pair) {
+                var data = pair[1] || {};
+                if (!data.ok) {
+                    setTkMeta('生成失败: ' + (data.error || pair[0].status), 'err');
+                    return;
+                }
+                var box = $('#tk-output-box');
+                if (box) box.hidden = false;
+                var out = $('#tk-output');
+                if (out) out.textContent = data.token || '';
+                var when = data.exp ? new Date(data.exp * 1000).toLocaleString() : '';
+                setTkMeta('已生成 · 角色=' + data.role + ' · sub=' + data.sub + ' · 到期 ' + when, 'ok');
+            })
+            .catch(function (err) {
+                setTkMeta('请求失败: ' + ((err && err.message) || err), 'err');
+            });
+    }
+
+    function copyToken() {
+        var out = $('#tk-output');
+        if (!out || !out.textContent) return;
+        var done = function () { var m = $('#tk-meta'); if (m) m.textContent = '已复制到剪贴板'; };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(out.textContent).then(done, function () {});
+        } else {
+            var sel = window.getSelection(), range = document.createRange();
+            range.selectNodeContents(out); sel.removeAllRanges(); sel.addRange(range);
+            try { document.execCommand('copy'); done(); } catch (e) {}
+        }
     }
 
     function startPolling() {
@@ -158,6 +321,7 @@
                     setAuthMsg('#setup-msg', '初始化成功，正在进入控制台...', 'ok');
                     STATE.authed = true;
                     STATE.username = data.username || payload.admin_user;
+                    STATE.role = data.role || 'admin';
                     enterConsole();
                 } else {
                     setAuthMsg('#setup-msg', '初始化失败: ' + (data.error || '未知错误'), 'err');
@@ -191,6 +355,7 @@
                     setAuthMsg('#login-msg', '', '');
                     STATE.authed = true;
                     STATE.username = data.username || payload.username;
+                    STATE.role = data.role || '';
                     $('#li-password').value = '';
                     enterConsole();
                 } else {
@@ -210,6 +375,7 @@
                 stopPolling();
                 STATE.authed = false;
                 STATE.username = '';
+                STATE.authMethods = {};
                 var lo = $('#logout-btn');
                 if (lo) lo.hidden = true;
                 showView('login');
@@ -233,6 +399,13 @@
     $$('.menu-item').forEach(function (el) {
         el.addEventListener('click', function () { showPage(el.dataset.page); });
     });
+
+    // Wire up the JWT submit button (uses type=button so the parent form's
+    // submit handler -- which is doLogin -- isn't triggered). consumeAuthError
+    // runs once on load to surface any auth_error=... from the URL.
+    var jwtBtn = document.getElementById('li-jwt-submit');
+    if (jwtBtn) jwtBtn.addEventListener('click', doJwtLogin);
+    consumeAuthError();
 
     function getToken() {
         if (STATE.token !== null) return STATE.token;
@@ -436,6 +609,10 @@
     }
 
     function runScript() {
+        if (STATE.role !== 'admin') {
+            setMeta('当前为 viewer（只读），无法执行脚本', 'err');
+            return;
+        }
         var targetEl = $('#target');
         var scriptEl = $('#script');
         var target = targetEl ? (targetEl.value || 'self') : 'self';
@@ -492,6 +669,10 @@
     }
 
     function reloadProcess() {
+        if (STATE.role !== 'admin') {
+            setMeta('当前为 viewer（只读），无法 reload', 'err');
+            return;
+        }
         var targetEl = $('#reload-target');
         var target = targetEl ? (targetEl.value || 'all') : 'all';
         setMeta('reload running...', '');
@@ -566,6 +747,11 @@
     if (loginForm) loginForm.addEventListener('submit', doLogin);
     var logoutBtn = $('#logout-btn');
     if (logoutBtn) logoutBtn.addEventListener('click', doLogout);
+
+    var tkGen = $('#tk-generate');
+    if (tkGen) tkGen.addEventListener('click', generateToken);
+    var tkCopy = $('#tk-copy');
+    if (tkCopy) tkCopy.addEventListener('click', copyToken);
 
     // Decide the initial view from the server-side session/setup state.
     checkSession();

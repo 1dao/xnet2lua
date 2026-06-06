@@ -21,6 +21,13 @@ local conns = {}
 local waitq = {}
 local rr = 1
 local stopping = false
+-- Set when a connection fails for a reason that retrying cannot fix (bad
+-- credentials, an unsupported auth plugin, or caching_sha2_password full
+-- authentication which this client can't perform). We then fail queued/new
+-- requests immediately with this reason instead of letting them hang until the
+-- caller's RPC timeout fires and reports a misleading "rpc timeout". Cleared on
+-- every (re)start of the pool so corrected credentials get a fresh attempt.
+local fatal_auth_error = nil
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local function resume_request(req, ...)
@@ -731,6 +738,13 @@ local function mark_ready(c)
     flush_waiting()
 end
 
+local function fail_auth(c, reason)
+    -- Non-retryable auth failure: remember it so queued/new requests fail fast
+    -- with this reason rather than hanging until the caller's RPC timeout.
+    fatal_auth_error = reason
+    close_conn(c, reason)
+end
+
 local function handle_auth_packet(c, pkt)
     local payload = pkt.payload
     local tag = byte_at(payload, 1)
@@ -739,7 +753,7 @@ local function handle_auth_packet(c, pkt)
         return
     end
     if tag == 0xff then
-        close_conn(c, parse_err(payload))
+        fail_auth(c, parse_err(payload))
         return
     end
     if tag == 0xfe then
@@ -750,7 +764,7 @@ local function handle_auth_packet(c, pkt)
         end
         local token, err = auth_token(plugin, config.password, seed)
         if not token then
-            close_conn(c, err)
+            fail_auth(c, err)
             return
         end
         c.auth_plugin = plugin
@@ -769,11 +783,15 @@ local function handle_auth_packet(c, pkt)
                 c.conn:send_raw(pack_packet('', pkt.seq + 1))
                 return
             end
-            close_conn(c, 'caching_sha2 full auth requires TLS/RSA and is not implemented')
+            fail_auth(c, "MySQL account uses caching_sha2_password and requires "
+                .. "first-time full authentication, which this client does not "
+                .. "support. Use an account with mysql_native_password "
+                .. "(ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'), "
+                .. "or pre-authenticate once with the mysql CLI to warm the cache.")
             return
         end
     end
-    close_conn(c, 'unexpected auth packet')
+    fail_auth(c, 'unexpected auth packet')
 end
 
 local function handle_query_packet(c, pkt)
@@ -897,7 +915,16 @@ local function connect_one(c)
         c.conn = nil
         c.phase = 'closed'
         fail_conn_pending(c, reason or 'mysql connection closed')
-        if not stopping then
+        if fatal_auth_error then
+            -- Don't leave queued requests hanging until the caller times out;
+            -- surface the real reason now. Also stop retrying -- reconnecting
+            -- would just hit the same auth failure in a 1s loop.
+            local q = waitq
+            waitq = {}
+            for _, req in ipairs(q) do
+                fail_request(req, fatal_auth_error)
+            end
+        elseif not stopping then
             c.retry_at = os.time() + math.max(1, math.floor(config.reconnect_ms / 1000))
         end
         print(string.format('[XMYSQL-WORKER] close[%d]: %s', c.index, tostring(reason)))
@@ -924,6 +951,7 @@ local function start_pool(host, port, user, password, database, pool_size, recon
     config.max_packet = tonumber(max_packet) or config.max_packet
     config.charset = tonumber(charset) or config.charset
     stopping = false
+    fatal_auth_error = nil   -- fresh credentials get a fresh attempt
 
     for i = 1, config.pool_size do
         local c = {
@@ -975,10 +1003,27 @@ xthread.register('xmysql_stop', function(silent)
     stop_pool(silent)
 end)
 
+-- In-place pool reconfigure: close the current connections and reconnect with
+-- new credentials WITHOUT destroying this thread (see xmysql.reconfigure). Used
+-- by the xadmin setup flow so changing DB settings at runtime doesn't require a
+-- thread shutdown (which corrupts other threads' poll state).
+xthread.register('xmysql_restart', function(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
+    print(string.format('[XMYSQL-WORKER] restart (in-place) %s:%s user=%s db=%s',
+        tostring(host), tostring(port), tostring(user),
+        database ~= '' and tostring(database) or '(none)'))
+    stop_pool(true)
+    start_pool(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
+end)
+
 xthread.register('xmysql_query', function(sql)
     local req = router.current_request()
     if not req then
         return false, 'xmysql rpc context missing'
+    end
+    if fatal_auth_error then
+        -- Pool can't authenticate; fail fast with the real reason instead of
+        -- queueing forever (and reporting a misleading rpc timeout).
+        return false, fatal_auth_error
     end
     req.sql = tostring(sql)
     req.payload = int1(0x03) .. req.sql
@@ -997,7 +1042,7 @@ local function __update()
     -- callback only handles Lua-side reconnect timers.
     local now = os.time()
     for _, c in ipairs(conns) do
-        if not stopping and not c.connected and not c.connecting and c.retry_at > 0 and now >= c.retry_at then
+        if not stopping and not fatal_auth_error and not c.connected and not c.connecting and c.retry_at > 0 and now >= c.retry_at then
             c.retry_at = 0
             connect_one(c)
         end

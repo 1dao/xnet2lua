@@ -66,6 +66,7 @@ local function normalize_config(cfg)
         cert_file = cfg.cert_file or cfg.cert or '',
         key_file = cfg.key_file or cfg.key or '',
         key_password = cfg.key_password or cfg.password or '',
+        ca_file = cfg.ca_file or '',
         max_request_size = tonumber(cfg.max_request_size) or 16 * 1024 * 1024,
         compress_enabled  = to_bool(compr.enabled, true),
         compress_min_size = tonumber(compr.min_size) or 256,
@@ -135,7 +136,8 @@ function M.start(cfg)
             conf.app_script, conf.max_request_size, conf.server_name,
             conf.https, conf.cert_file, conf.key_file, conf.key_password,
             conf.compress_enabled, conf.compress_min_size, conf.compress_level,
-            conf.decompress_requests, conf.max_decompressed_size)
+            conf.decompress_requests, conf.max_decompressed_size,
+            conf.ca_file)
         if not ok then
             shutdown_workers()
             return false, err

@@ -79,6 +79,25 @@ function M.post(cb, sql)
     return true
 end
 
+-- Re-point the *running* pool at new credentials without tearing down the
+-- worker thread. Calling xthread.shutdown_thread on the live MySQL thread
+-- corrupts the shared poll state of other threads (they spin on closed fds), so
+-- code that changes DB settings at runtime (e.g. the xadmin setup flow) MUST
+-- use this rather than stop() + start(). Falls back to start() if not running.
+function M.reconfigure(cfg)
+    if not running then
+        return M.start(cfg)
+    end
+    local conf = normalize_config(cfg)
+    local ok, err = xthread.post(MYSQL_ID, 'xmysql_restart',
+        conf.host, conf.port, conf.user, conf.password, conf.database,
+        conf.pool_size, conf.reconnect_ms, conf.max_packet, conf.charset)
+    if not ok then
+        return false, err
+    end
+    return true
+end
+
 function M.stop(silent)
     if not running then
         return true
