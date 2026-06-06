@@ -19,7 +19,7 @@ int  xtimer_count();    // number of active timers in this thread's pool
 int  xtimer_update();   // drives expiries; returns ms until next expiry (0 if none / due)
 int  xtimer_last();
 void xtimer_show();
-xtimerHandler xtimer_add(int interval_ms,
+xtimerHandler xtimer_add(int64_t interval_ms,
                          fnOnTime callback,
                          void* ud,
                          int repeat_num);
