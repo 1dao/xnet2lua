@@ -337,7 +337,20 @@ More entry points:
 ### RayGUI demo
 
 `demo/xraygui_main.lua` shows the exported RayGUI controls in an interactive
-window:
+window — button, checkbox, slider, progress bar, single/multi-line textboxes,
+dropdown, list view — plus the features added in this round:
+
+- **UI themes** — 5 presets under `tools/styles/` (`dark` / `soft` / `nord` /
+  `candy` / `cyber`); apply via `require("styles.dark").apply(raygui)`.
+- **Built-in icons** — embed raygui icons in any control's text with `#iconID#`
+  (e.g. `"#131# Play"`); `set_icon_scale(n)` controls their size.
+- **Color emoji** — baked into a texture atlas (`tools/emoji_atlas.png`) and drawn
+  via `draw_texture_ex`, referenced by name through an inlined index table.
+- **Emoji + text buttons** — `emoji_button()` overlays a color emoji on a button.
+- **Modal confirm dialog** — `messagebox(...)` (e.g. the Delete button).
+- **Texture API** — `load_texture` / `draw_texture` / `draw_texture_ex`.
+- Correct dropdown/dialog z-order via `lock()` / `unlock()`; the multi-line
+  textbox now clips & scrolls to the cursor; Backspace/arrows auto-repeat on hold.
 
 ```sh
 bin/xnet demo/xraygui_main.lua
@@ -348,6 +361,20 @@ For automated checks, add a frame limit so the window exits by itself:
 ```sh
 bin/xnet demo/xraygui_main.lua frames=120
 ```
+
+> **⚠️ Platform & Lua version**
+>
+> The bundled `tools/raygui.dll` is built **for Windows x64 and Lua 5.5 only** —
+> it links `lua55.dll` and uses the Lua 5.4/5.5 C API. It therefore will **not**
+> load under **LuaJIT** or other Lua versions (incompatible ABI), and **no
+> Linux/macOS binary** ships in this repo.
+>
+> To run the UI on **another platform (Linux / macOS)** or with a **different Lua
+> version / LuaJIT**, build the matching `raygui.dll` / `raygui.so` yourself from
+> the source & packaging repo — **https://github.com/1dao/xlua_raygui.git** — and
+> drop it into `tools/`. Its `Makefile` already handles Windows / Linux / macOS;
+> for a non-5.5 runtime, point the linked Lua lib (and headers) at your target
+> (e.g. LuaJIT's `lua51` import lib) before building.
 
 ### RayGUI smoke test
 
