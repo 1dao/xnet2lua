@@ -2,6 +2,7 @@
 
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
 local router = dofile('scripts/core/share/xhttp_router.lua')
+local xws    = dofile('scripts/core/share/xwebsocket.lua')
 
 local M = {}
 
@@ -87,6 +88,37 @@ end)
 -- Wildcard demo: GET /static/*path  -> echoes the captured tail.
 router.reg('get', '/static/*path', function(req)
     return text(200, 'static=' .. tostring(req.params.path) .. '\n')
+end)
+
+-- WebSocket echo endpoint. Returning a table with a `websocket` field tells the
+-- xhttp worker to complete the RFC 6455 handshake and hand the fd over to the
+-- frame dispatcher. Non-upgrade GETs to /ws get a 426 hint instead.
+router.reg('get', '/ws', function(req)
+    if not xws.is_upgrade(req) then
+        return {
+            status = 426,
+            body = 'this endpoint speaks WebSocket\n',
+            headers = { ['Upgrade'] = 'websocket', ['Connection'] = 'Upgrade' },
+        }
+    end
+    return {
+        protocol = 'echo',           -- negotiated subprotocol echoed in the 101
+        websocket = {
+            on_open = function(ws)
+                ws:send_text('welcome')
+            end,
+            on_message = function(ws, msg, opcode)
+                if opcode == xws.OP_BIN then
+                    ws:send_binary(msg)              -- echo binary as-is
+                else
+                    ws:send_text('echo:' .. msg)
+                end
+            end,
+            on_close = function(_, reason)
+                print('[XHTTP-APP] ws closed: ' .. tostring(reason))
+            end,
+        },
+    }
 end)
 
 function M.handle(req)

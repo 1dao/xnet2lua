@@ -1511,6 +1511,130 @@ on success, where `resp = { status, version, headers, header_list, body }`.
 end-to-end loopback example covering Content-Length, redirects, chunked and
 gzip responses.
 
+### 8.8 HTTP → HTTPS Upgrade (force-HTTPS + HSTS)
+
+"Upgrading" a plaintext HTTP service to HTTPS, in practice, means two things:
+**redirect** every plaintext request to its `https://` URL, and emit **HSTS**
+(`Strict-Transport-Security`) so compliant clients remember to use TLS. (RFC
+2817 `Upgrade: TLS` — an in-band protocol switch — is intentionally *not*
+implemented: no browser supports it. The redirect + HSTS pair is the real-world
+mechanism.)
+
+Both are driven from `xhttp.start` config:
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `force_https` | bool | false | On a plaintext (`https=false`) worker, redirect every request to HTTPS before reaching the app |
+| `redirect_port` | number | 443 | Target HTTPS port for the redirect (omitted from the URL when 443) |
+| `redirect_status` | number | 301 | Redirect status: 301 / 302 / 307 / 308 (use 307/308 to preserve non-GET methods) |
+| `hsts` | bool / number / string / table | nil | `Strict-Transport-Security` value; added to HTTPS responses and to the redirect |
+
+The `hsts` value is flexible: `true` → `max-age=31536000`; a number → `max-age=<n>`;
+a string → used verbatim; a table → `{ max_age=, include_subdomains=, preload= }`.
+
+```lua
+-- Edge HTTP listener that bounces everything to HTTPS:
+xhttp.start({
+    host = "0.0.0.0", port = 80,
+    worker_name = "edge", app_script = "app.lua",
+    force_https = true, redirect_port = 443, redirect_status = 308,
+    hsts = { max_age = 31536000, include_subdomains = true },
+})
+
+-- The HTTPS listener: pass hsts so every secure response advertises it.
+xhttp.start({
+    host = "0.0.0.0", port = 443, https = true,
+    cert_file = "server.crt", key_file = "server.key",
+    worker_name = "secure", app_script = "app.lua",
+    hsts = { max_age = 31536000 },
+})
+```
+
+The same primitives are exposed on `xhttp_codec` for manual use inside a
+handler:
+
+- `codec.https_redirect(req, opts)` → a redirect response table (`opts`:
+  `status`, `https_port`, `host`, `hsts`).
+- `codec.https_url(req, opts)` → the `https://` URL string for `req`.
+- `codec.hsts_value(spec)` → a `Strict-Transport-Security` header value.
+
+These helpers are covered by `tests/lua/websocket_spec.lua`.
+
+### 8.9 WebSocket (RFC 6455)
+
+`scripts/core/share/xwebsocket.lua` adds WebSocket on top of the HTTP server.
+Any app route can hand a connection over: return a table with a `websocket`
+field and the worker completes the `101 Switching Protocols` handshake, then
+swaps the fd to a frame dispatcher (`conn:set_handler`) — from that point the
+socket speaks WebSocket frames, not HTTP. The module handles the
+`Sec-WebSocket-Accept` key (SHA-1 + base64, bundled), client-frame unmasking,
+message reassembly across fragments, and control frames (ping → automatic
+pong, and the close handshake).
+
+```lua
+local router = dofile("scripts/core/share/xhttp_router.lua")
+local xws    = dofile("scripts/core/share/xwebsocket.lua")
+
+router.get("/ws", function(req)
+    if not xws.is_upgrade(req) then
+        return { status = 426, body = "WebSocket only\n",
+                 headers = { Upgrade = "websocket", Connection = "Upgrade" } }
+    end
+    return {
+        protocol  = "echo",          -- negotiated subprotocol echoed in the 101 (optional)
+        -- protocols = { "echo", "chat" },  -- or let the server pick from the client's list
+        -- max_message_size = 1048576,      -- assembled-message cap (default 4 MiB)
+        websocket = {
+            on_open    = function(ws) ws:send_text("welcome") end,
+            on_message = function(ws, msg, opcode)
+                if opcode == xws.OP_BIN then ws:send_binary(msg)
+                else ws:send_text("echo:" .. msg) end
+            end,
+            on_ping    = function(ws, payload) end,   -- auto-pong already sent
+            on_pong    = function(ws, payload) end,
+            on_close   = function(ws, reason) end,
+        },
+    }
+end)
+```
+
+**The `ws` object** passed to the callbacks:
+
+| Method | Effect |
+| --- | --- |
+| `ws:send_text(s)` / `ws:send(s)` | send a text frame |
+| `ws:send_binary(s)` | send a binary frame |
+| `ws:send_ping(p)` / `ws:send_pong(p)` | send a control frame |
+| `ws:close(code, reason)` | send a close frame and close the socket |
+| `ws:is_open()` | still connected? |
+| `ws:fd()` | underlying fd |
+| `ws.protocol` | negotiated subprotocol (or nil) |
+
+**Codec layer** (usable standalone — to drive a client, or in tests):
+
+- `xws.is_upgrade(req)` → bool — does `req` look like a WebSocket handshake?
+- `xws.accept_key(key)` → the `Sec-WebSocket-Accept` value for a client key.
+- `xws.encode(opcode, payload, opts)` → frame bytes (`opts.fin`, `opts.mask`,
+  `opts.mask_key`). Server frames are unmasked; pass `mask=true` for client
+  frames.
+- `xws.decode(buf, pos, opts)` → `frame, next_pos` | `nil, pos, 'incomplete'` |
+  `nil, nil, err`. `frame = { fin, opcode, payload, masked, rsv }`. `opts.max_frame_size`
+  caps the declared length before buffering.
+- `xws.text_frame` / `binary_frame` / `ping_frame` / `pong_frame` /
+  `close_frame(code, reason)` — convenience builders.
+- `xws.parse_close(payload)` → `code, reason`.
+- Opcodes: `xws.OP_TEXT`, `OP_BIN`, `OP_CLOSE`, `OP_PING`, `OP_PONG`, `OP_CONT`.
+- Close codes: `xws.CLOSE_NORMAL` (1000), `CLOSE_GOING_AWAY`, `CLOSE_PROTOCOL_ERROR`,
+  `CLOSE_TOO_LARGE`, `CLOSE_POLICY`, `CLOSE_INTERNAL`.
+
+**`wss://` (WebSocket over TLS) needs no extra code.** The upgrade rides on top
+of whatever transport the worker attached, so starting the same server with
+`https = true` (plus `cert_file` / `key_file`) makes the identical `/ws` route
+speak WebSocket inside the TLS tunnel.
+
+Self-tests: `demo/xhttp_ws_main.lua` (worker pool) and `demo/xhttp_wss_main.lua`
+(over TLS); the frame codec itself is covered by `tests/lua/websocket_spec.lua`.
+
 ---
 
 ## 9. cmsgpack Module — MessagePack Serialization

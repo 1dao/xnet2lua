@@ -1513,6 +1513,123 @@ end)
 端到端示例见 `demo/xhttp_client_main.lua`，覆盖 Content-Length、重定向、chunked
 与 gzip 响应。
 
+### 8.8 HTTP 升级到 HTTPS（强制 HTTPS + HSTS）
+
+把明文 HTTP 服务「升级」到 HTTPS，实际做两件事：把每个明文请求**重定向**到对应
+的 `https://` URL，并下发 **HSTS**（`Strict-Transport-Security`）让合规客户端记住
+以后只走 TLS。（RFC 2817 的 `Upgrade: TLS`——同连接内协议切换——刻意**不**实现：
+没有任何浏览器支持它。重定向 + HSTS 才是业界真正可用的做法。）
+
+两者都由 `xhttp.start` 配置驱动：
+
+| 配置项 | 类型 | 默认 | 含义 |
+| --- | --- | --- | --- |
+| `force_https` | bool | false | 在明文（`https=false`）worker 上，所有请求在进入应用前先重定向到 HTTPS |
+| `redirect_port` | number | 443 | 重定向目标 HTTPS 端口（为 443 时 URL 中省略） |
+| `redirect_status` | number | 301 | 重定向状态码：301 / 302 / 307 / 308（用 307/308 可保留非 GET 方法） |
+| `hsts` | bool / number / string / table | nil | `Strict-Transport-Security` 的值；会加到 HTTPS 响应与重定向上 |
+
+`hsts` 取值灵活：`true` → `max-age=31536000`；数字 → `max-age=<n>`；字符串 → 原样
+使用；表 → `{ max_age=, include_subdomains=, preload= }`。
+
+```lua
+-- 边缘 HTTP 监听：把所有请求弹到 HTTPS
+xhttp.start({
+    host = "0.0.0.0", port = 80,
+    worker_name = "edge", app_script = "app.lua",
+    force_https = true, redirect_port = 443, redirect_status = 308,
+    hsts = { max_age = 31536000, include_subdomains = true },
+})
+
+-- HTTPS 监听：传入 hsts，让每个安全响应都带上该头
+xhttp.start({
+    host = "0.0.0.0", port = 443, https = true,
+    cert_file = "server.crt", key_file = "server.key",
+    worker_name = "secure", app_script = "app.lua",
+    hsts = { max_age = 31536000 },
+})
+```
+
+`xhttp_codec` 也暴露了同样的原语，便于在处理器里手动使用：
+
+- `codec.https_redirect(req, opts)` → 重定向响应表（`opts`：`status`、`https_port`、
+  `host`、`hsts`）。
+- `codec.https_url(req, opts)` → `req` 对应的 `https://` URL 字符串。
+- `codec.hsts_value(spec)` → `Strict-Transport-Security` 头的值。
+
+这些辅助函数由 `tests/lua/websocket_spec.lua` 覆盖。
+
+### 8.9 WebSocket（RFC 6455）
+
+`scripts/core/share/xwebsocket.lua` 在 HTTP 服务之上提供 WebSocket。任意应用路由都可
+把连接「移交」给 WebSocket：返回一个带 `websocket` 字段的表，worker 就会完成
+`101 Switching Protocols` 握手，并通过 `conn:set_handler` 把该 fd 切换到帧分发器——
+此后这条连接讲 WebSocket 帧，而不再是 HTTP。该模块自带握手所需的
+`Sec-WebSocket-Accept` 计算（内置 SHA-1 + base64），并处理客户端帧解掩码、跨分片的
+消息重组，以及控制帧（ping → 自动 pong、close 挥手）。
+
+```lua
+local router = dofile("scripts/core/share/xhttp_router.lua")
+local xws    = dofile("scripts/core/share/xwebsocket.lua")
+
+router.get("/ws", function(req)
+    if not xws.is_upgrade(req) then
+        return { status = 426, body = "WebSocket only\n",
+                 headers = { Upgrade = "websocket", Connection = "Upgrade" } }
+    end
+    return {
+        protocol  = "echo",          -- 在 101 中回显的协商子协议（可选）
+        -- protocols = { "echo", "chat" },  -- 或让服务端从客户端列表里挑
+        -- max_message_size = 1048576,      -- 重组后消息上限（默认 4 MiB）
+        websocket = {
+            on_open    = function(ws) ws:send_text("welcome") end,
+            on_message = function(ws, msg, opcode)
+                if opcode == xws.OP_BIN then ws:send_binary(msg)
+                else ws:send_text("echo:" .. msg) end
+            end,
+            on_ping    = function(ws, payload) end,   -- 自动 pong 已发送
+            on_pong    = function(ws, payload) end,
+            on_close   = function(ws, reason) end,
+        },
+    }
+end)
+```
+
+**回调里拿到的 `ws` 对象**：
+
+| 方法 | 作用 |
+| --- | --- |
+| `ws:send_text(s)` / `ws:send(s)` | 发送文本帧 |
+| `ws:send_binary(s)` | 发送二进制帧 |
+| `ws:send_ping(p)` / `ws:send_pong(p)` | 发送控制帧 |
+| `ws:close(code, reason)` | 发送 close 帧并关闭连接 |
+| `ws:is_open()` | 是否仍连接 |
+| `ws:fd()` | 底层 fd |
+| `ws.protocol` | 协商的子协议（或 nil） |
+
+**编解码层**（可独立使用——驱动客户端或写测试）：
+
+- `xws.is_upgrade(req)` → bool —— `req` 是否像一次 WebSocket 握手。
+- `xws.accept_key(key)` → 客户端 key 对应的 `Sec-WebSocket-Accept` 值。
+- `xws.encode(opcode, payload, opts)` → 帧字节（`opts.fin`、`opts.mask`、
+  `opts.mask_key`）。服务端帧不加掩码；客户端帧传 `mask=true`。
+- `xws.decode(buf, pos, opts)` → `frame, next_pos` | `nil, pos, 'incomplete'` |
+  `nil, nil, err`。`frame = { fin, opcode, payload, masked, rsv }`；`opts.max_frame_size`
+  在缓冲负载前先对声明长度设上限。
+- `xws.text_frame` / `binary_frame` / `ping_frame` / `pong_frame` /
+  `close_frame(code, reason)` —— 便捷构造器。
+- `xws.parse_close(payload)` → `code, reason`。
+- 操作码：`xws.OP_TEXT`、`OP_BIN`、`OP_CLOSE`、`OP_PING`、`OP_PONG`、`OP_CONT`。
+- 关闭码：`xws.CLOSE_NORMAL`（1000）、`CLOSE_GOING_AWAY`、`CLOSE_PROTOCOL_ERROR`、
+  `CLOSE_TOO_LARGE`、`CLOSE_POLICY`、`CLOSE_INTERNAL`。
+
+**`wss://`（TLS 上的 WebSocket）无需额外代码。** 升级是叠加在 worker 已建立的传输之上
+的，所以把同一个服务以 `https = true`（外加 `cert_file` / `key_file`）启动，完全相同的
+`/ws` 路由就会在 TLS 隧道内讲 WebSocket。
+
+自测：`demo/xhttp_ws_main.lua`（worker 线程池)、`demo/xhttp_wss_main.lua`（TLS 之上）;
+帧编解码本身由 `tests/lua/websocket_spec.lua` 覆盖。
+
 ---
 
 ## 9. cmsgpack 模块——MessagePack 序列化
