@@ -3,19 +3,11 @@
 
 local router = dofile('scripts/core/share/xhttp_router.lua')
 local xutils = require('xutils')
+local xmisc  = dofile('scripts/core/share/xmisc.lua')
 
 local M = {}
 
-local function to_bool(v, default)
-    if v == nil then return default end
-    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then
-        return true
-    end
-    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then
-        return false
-    end
-    return default
-end
+local to_bool = xmisc.to_bool
 
 local PAC_FILE = xutils.get_config('PAC_FILE', 'proxy.pac')
 local STATIC_DIR = xutils.get_config('PAC_STATIC_DIR', 'scripts/xpac/static')
@@ -47,13 +39,8 @@ local function file_response(path, content_type)
     }
 end
 
-local function trim(s)
-    return tostring(s or ''):gsub('^%s+', ''):gsub('%s+$', '')
-end
-
-local function lower(s)
-    return string.lower(tostring(s or ''))
-end
+local trim  = xmisc.trim
+local lower = xmisc.lower
 
 local function uri_decode(s)
     s = tostring(s or ''):gsub('+', ' ')

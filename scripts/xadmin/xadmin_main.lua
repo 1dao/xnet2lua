@@ -13,6 +13,7 @@ local xmysql = dofile('scripts/core/server/xmysql.lua')
 local store = dofile('scripts/xadmin/xadmin_store.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
+local to_bool = dofile('scripts/core/share/xmisc.lua').to_bool
 router.set_log_prefix('XADMIN-MAIN')
 
 local CONFIG_FILE = 'xnet.cfg'
@@ -37,13 +38,6 @@ local SUPER_TOKEN = xutils.get_config('XADMIN_SUPER_TOKEN', '')
 local TLS_CA_FILE = xutils.get_config('XADMIN_TLS_CA_FILE', '')
 local HTTP_WORKER_COUNT = 10
 local HTTP_WORKER_BASE = xthread.WORKER_GRP3
-
-local function to_bool(v, default)
-    if v == nil then return default end
-    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then return true end
-    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then return false end
-    return default
-end
 
 local HTTPS = to_bool(xutils.get_config('XADMIN_HTTPS', '0'), false)
 local CERT = xutils.get_config('HTTPS_CERT', 'demo/certs/server.crt')

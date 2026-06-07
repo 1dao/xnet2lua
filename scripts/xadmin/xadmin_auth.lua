@@ -24,12 +24,23 @@
 -- xadmin with an API gateway that does RS256 verification and forwards
 -- HS256-signed assertions to /api/auth/jwt.
 
-local xsha2  = dofile('scripts/core/share/xsha2.lua')
-local xutils = require('xutils')
+local xutils = require('xutils')   -- C-backed sha256 / hmac_sha256 / hex / base64
 
 local M = {}
 
 local schar = string.char
+local sbyte = string.byte
+
+-- Constant-time-ish comparison for equal-length strings (HMAC/signature check).
+local function ct_equal(a, b)
+    a, b = tostring(a or ''), tostring(b or '')
+    if #a ~= #b then return false end
+    local diff = 0
+    for i = 1, #a do
+        diff = diff | (sbyte(a, i) ~ sbyte(b, i))
+    end
+    return diff == 0
+end
 
 -- ---------------------------------------------------------------------------
 -- Randomness (use the OS CSPRNG, fall back to /dev/urandom, then math.random)
@@ -58,7 +69,7 @@ local function random_bytes(n)
 end
 
 function M.random_bytes(n) return random_bytes(n) end
-function M.random_hex(n)   return xsha2.tohex(random_bytes(n or 16)) end
+function M.random_hex(n)   return xutils.hex_encode(random_bytes(n or 16)) end
 
 -- URL-safe random string (A-Z a-z 0-9 - _ . ~) suitable for state, nonce,
 -- code_verifier. Encodes random bytes with the standard base64url alphabet
@@ -75,65 +86,17 @@ end
 
 -- ---------------------------------------------------------------------------
 -- base64url (no padding) -- JWS / JWT / PKCE standard
+--
+-- Backed by the C xutils module (always linked). xutils.base64url_encode emits
+-- the url-safe alphabet without padding; the decoder tolerates both alphabets
+-- and missing padding, which is exactly the JWS/JWT requirement.
 -- ---------------------------------------------------------------------------
-local B64URL = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-local _b64_rev = nil
-local function b64_reverse_map()
-    if _b64_rev then return _b64_rev end
-    local m = {}
-    for i = 1, #B64URL do m[B64URL:sub(i, i)] = i - 1 end
-    -- Tolerate standard alphabet too (RFC 7515 implementations vary).
-    for i = 0, 25 do m[schar(65 + i)] = i end
-    for i = 0, 25 do m[schar(97 + i)] = 26 + i end
-    for i = 0, 9  do m[tostring(i)]   = 52 + i end
-    m['+'] = 62; m['/'] = 63
-    _b64_rev = m
-    return m
-end
-
 function M.b64url_encode(s)
-    s = tostring(s or '')
-    if s == '' then return '' end
-    local out = {}
-    local n = #s
-    local i = 1
-    while i <= n do
-        local b1 = s:byte(i)     or 0
-        local b2 = s:byte(i + 1) or 0
-        local b3 = s:byte(i + 2) or 0
-        local c1 = b1 >> 2
-        local c2 = ((b1 & 3) << 4) | (b2 >> 4)
-        local c3 = ((b2 & 15) << 2) | (b3 >> 6)
-        local c4 = b3 & 63
-        out[#out + 1] = B64URL:sub(c1 + 1, c1 + 1)
-        out[#out + 1] = B64URL:sub(c2 + 1, c2 + 1)
-        out[#out + 1] = (i + 1 <= n) and B64URL:sub(c3 + 1, c3 + 1) or ''
-        out[#out + 1] = (i + 2 <= n) and B64URL:sub(c4 + 1, c4 + 1) or ''
-        i = i + 3
-    end
-    return table.concat(out)
+    return xutils.base64url_encode(tostring(s or ''))
 end
 
 function M.b64url_decode(s)
-    s = tostring(s or ''):gsub('=', '')  -- tolerate padding
-    if s == '' then return '' end
-    local rev = b64_reverse_map()
-    local out = {}
-    local n = #s
-    local i = 1
-    while i <= n do
-        local v1 = rev[s:sub(i,     i    )] or 0
-        local v2 = rev[s:sub(i + 1, i + 1)] or 0
-        local have3 = (i + 2) <= n
-        local have4 = (i + 3) <= n
-        local v3 = have3 and (rev[s:sub(i + 2, i + 2)] or 0) or nil
-        local v4 = have4 and (rev[s:sub(i + 3, i + 3)] or 0) or nil
-        out[#out + 1] = schar((v1 << 2) | (v2 >> 4))
-        if v3 then out[#out + 1] = schar(((v2 & 15) << 4) | (v3 >> 2)) end
-        if v4 then out[#out + 1] = schar(((v3 & 3)  << 6) | v4)       end
-        i = i + 4
-    end
-    return table.concat(out)
+    return (xutils.base64url_decode(tostring(s or '')))
 end
 
 -- ---------------------------------------------------------------------------
@@ -156,7 +119,7 @@ function M.jwt_sign_hs256(secret, claims, header_extra)
     -- here would be non-interoperable with every standard JWT library (both
     -- directions), which is the whole point of the "gateway forwards an
     -- HS256 assertion" use case.
-    local sig = M.b64url_encode(xsha2.hmac_sha256(secret, signing_input))
+    local sig = M.b64url_encode(xutils.hmac_sha256(secret, signing_input))
     return signing_input .. '.' .. sig
 end
 
@@ -171,8 +134,8 @@ function M.jwt_verify_hs256(secret, token, opts)
     for p in token:gmatch('[^.]+') do parts[#parts + 1] = p end
     if #parts ~= 3 then return nil, 'malformed' end
     local signing_input = parts[1] .. '.' .. parts[2]
-    local expected = M.b64url_encode(xsha2.hmac_sha256(secret, signing_input))
-    if not xsha2.equal(parts[3], expected) then return nil, 'bad signature' end
+    local expected = M.b64url_encode(xutils.hmac_sha256(secret, signing_input))
+    if not ct_equal(parts[3], expected) then return nil, 'bad signature' end
 
     local header_bytes = M.b64url_decode(parts[1])
     local payload_bytes = M.b64url_decode(parts[2])
@@ -225,7 +188,7 @@ end
 -- ---------------------------------------------------------------------------
 function M.pkce_pair()
     local verifier = M.random_urlsafe(64)   -- 64 chars, 384 bits of entropy
-    local challenge = M.b64url_encode(xsha2.sha256(verifier))
+    local challenge = M.b64url_encode(xutils.sha256(verifier))
     return verifier, challenge
 end
 
@@ -244,7 +207,7 @@ function M.sign_state(secret, claims)
     local payload = xutils.json_pack(claims or {})
     if not payload then return nil, 'json pack failed' end
     local p64 = M.b64url_encode(payload)
-    local sig = M.b64url_encode(xsha2.hmac_sha256(secret, p64))
+    local sig = M.b64url_encode(xutils.hmac_sha256(secret, p64))
     return p64 .. '.' .. sig
 end
 
@@ -253,8 +216,8 @@ function M.verify_state(secret, token)
     token = tostring(token or '')
     local p64, sig = token:match('^(.+)%.(.+)$')
     if not p64 then return nil, 'malformed' end
-    local expected = M.b64url_encode(xsha2.hmac_sha256(secret, p64))
-    if not xsha2.equal(sig, expected) then return nil, 'bad signature' end
+    local expected = M.b64url_encode(xutils.hmac_sha256(secret, p64))
+    if not ct_equal(sig, expected) then return nil, 'bad signature' end
     local payload = M.b64url_decode(p64)
     local claims = xutils.json_unpack(payload)
     if type(claims) ~= 'table' then return nil, 'bad json' end
