@@ -125,10 +125,9 @@ if "%WITH_RPMALLOC%"=="1" (
 ) else (
     set "DEFS=%DEFS% /DXMACRO_USE_RPMALLOC=0"
 )
-set "INCS=/I. /I3rd\libdeflate"
-if "%WITH_HTTPS%"=="1" (
-    set "INCS=%INCS% /I3rd\mbedtls3\include"
-)
+REM mbedTLS include is always needed: xutils exports the self-contained hash
+REM primitives (sha1/sha256/sha512/md5) on every build, HTTPS or not.
+set "INCS=/I. /I3rd\libdeflate /I3rd\mbedtls3\include"
 if /I "%LUA_BACKEND%"=="luajit" (
     set "DEFS=%DEFS% /DXLUA_USE_LUAJIT=1"
     set "INCS=%INCS% /I%LUAJIT_INC%"
@@ -204,9 +203,16 @@ for %%F in (%C_UNIT_SOURCES%) do (
     set "UNIT_OBJECTS=!UNIT_OBJECTS! %OBJDIR%\unit_%%~nF.obj"
 )
 
+REM WITH_HTTPS=1 builds the whole mbedTLS library; WITH_HTTPS=0 still needs the
+REM self-contained hash subset for xutils. Compile each exactly once.
+set "MBEDTLS_CRYPTO_SRC=sha1.c sha256.c sha512.c md5.c platform_util.c"
 set "MBEDTLS_OBJECTS="
 if "%WITH_HTTPS%"=="1" (
     for %%F in ("3rd\mbedtls3\library\*.c") do (
+        set "MBEDTLS_OBJECTS=!MBEDTLS_OBJECTS! %OBJDIR%\mbedtls\%%~nF.obj"
+    )
+) else (
+    for %%F in (%MBEDTLS_CRYPTO_SRC%) do (
         set "MBEDTLS_OBJECTS=!MBEDTLS_OBJECTS! %OBJDIR%\mbedtls\%%~nF.obj"
     )
 )
@@ -295,7 +301,7 @@ if /I "%TARGET%"=="run-lua" (
 
 if exist "%OBJDIR%" rmdir /S /Q "%OBJDIR%"
 mkdir "%OBJDIR%"
-if "%WITH_HTTPS%"=="1" mkdir "%OBJDIR%\mbedtls"
+mkdir "%OBJDIR%\mbedtls"
 mkdir "%OBJDIR%\libdeflate"
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
@@ -325,6 +331,16 @@ if "%NEED_BUILD_XNET%"=="1" (
         for %%F in ("3rd\mbedtls3\library\*.c") do (
             echo %GREEN%[INFO]%RESET% cl %%~nxF
             cl %CFLAGS% /c "%%~F" /Fo"%OBJDIR%\mbedtls\%%~nF.obj"
+            if errorlevel 1 (
+                echo %RED%[ERROR]%RESET% Failed to compile %%F
+                exit /b 1
+            )
+        )
+    ) else (
+        echo %GREEN%[INFO]%RESET% Compiling mbedTLS hash subset for xutils...
+        for %%F in (%MBEDTLS_CRYPTO_SRC%) do (
+            echo %GREEN%[INFO]%RESET% cl %%F
+            cl %CFLAGS% /c "3rd\mbedtls3\library\%%F" /Fo"%OBJDIR%\mbedtls\%%~nF.obj"
             if errorlevel 1 (
                 echo %RED%[ERROR]%RESET% Failed to compile %%F
                 exit /b 1
