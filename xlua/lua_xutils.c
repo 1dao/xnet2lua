@@ -26,6 +26,14 @@
 #else
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/attr.h>
+#include <sys/vnode.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 #if defined(LUA_EMBEDDED)
@@ -519,101 +527,295 @@ static void scan_dir_push_file(lua_State *L, int table_idx, int *count,
 
 static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
                               const char *dir, const char *rel,
-                              char *errbuf, size_t errcap) {
-#ifdef _WIN32
-    char *pattern = path_join_dup(dir, "*");
-    if (!pattern) {
+                              char *errbuf, size_t errcap);
+
+/* Build the child paths, then recurse into directories or record regular
+** files. Shared by every platform backend so the path/Lua-table bookkeeping
+** lives in exactly one place. */
+static int scan_dir_handle_entry(lua_State *L, int table_idx, int *count,
+                                 const char *dir, const char *rel,
+                                 const char *name, int is_dir, int is_reg,
+                                 char *errbuf, size_t errcap) {
+    if (!is_dir && !is_reg) return 0;
+
+    char *full = path_join_dup(dir, name);
+    char *child_rel = rel_join_dup(rel, name);
+    if (!full || !child_rel) {
+        free(full);
+        free(child_rel);
         snprintf(errbuf, errcap, "out of memory");
         return -1;
     }
 
-    WIN32_FIND_DATAA data;
-    HANDLE h = FindFirstFileA(pattern, &data);
-    free(pattern);
+    int rc = 0;
+    if (is_dir) {
+        rc = scan_dir_recursive(L, table_idx, count, full, child_rel,
+                                errbuf, errcap);
+    } else {
+        scan_dir_push_file(L, table_idx, count, full, child_rel);
+    }
+    free(full);
+    free(child_rel);
+    return rc;
+}
+
+#define SCAN_DIR_NAME_DOTS(n) \
+    ((n)[0] == '.' && ((n)[1] == '\0' || ((n)[1] == '.' && (n)[2] == '\0')))
+#define SCAN_DIR_BUF (64 * 1024)
+
+/* Each backend below enumerates `dir` with the fastest documented bulk API for
+** its platform, classifies every child as directory / regular / other, and
+** defers the recurse-or-record decision to scan_dir_handle_entry. Symlinks are
+** followed so behaviour matches the historical stat()-based scan. */
+
+#if defined(_WIN32)
+/* Windows: GetFileInformationByHandleEx fills a whole buffer of entries per
+** call (vs FindFirstFile's one-at-a-time) and FILE_ID_BOTH_DIR_INFO carries
+** the attributes inline, so there is no extra stat/GetFileAttributes per child.
+** Names stay in the system ANSI code page to match the narrow fopen() that
+** ultimately serves these paths (xchannel_send_file_raw). */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    HANDLE h = CreateFileA(dir, FILE_LIST_DIRECTORY,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         snprintf(errbuf, errcap, "cannot open directory: %s", dir);
         return -1;
     }
 
-    do {
-        const char *name = data.cFileName;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+    void *buf = malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        CloseHandle(h);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
+    }
 
-        char *full = path_join_dup(dir, name);
-        char *child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            FindClose(h);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                FindClose(h);
-                return -1;
+    int rc = 0;
+    while (GetFileInformationByHandleEx(h, FileIdBothDirectoryInfo,
+                                        buf, SCAN_DIR_BUF)) {
+        FILE_ID_BOTH_DIR_INFO *info = (FILE_ID_BOTH_DIR_INFO *)buf;
+        for (;;) {
+            char name[1024];
+            int wlen = (int)(info->FileNameLength / sizeof(WCHAR));
+            int nlen = WideCharToMultiByte(CP_ACP, 0, info->FileName, wlen,
+                                           name, (int)sizeof(name) - 1,
+                                           NULL, NULL);
+            if (nlen > 0) {
+                name[nlen] = '\0';
+                if (!SCAN_DIR_NAME_DOTS(name)) {
+                    int is_dir = (info->FileAttributes &
+                                  FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                               name, is_dir, !is_dir,
+                                               errbuf, errcap);
+                }
             }
-        } else {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
+            if (rc != 0 || info->NextEntryOffset == 0) break;
+            info = (FILE_ID_BOTH_DIR_INFO *)((char *)info +
+                                             info->NextEntryOffset);
         }
-        free(full);
-        free(child_rel);
-    } while (FindNextFileA(h, &data));
+        if (rc != 0) break;
+    }
 
-    FindClose(h);
-    return 0;
-#else
-    DIR *d = opendir(dir);
-    if (!d) {
+    if (rc == 0 && GetLastError() != ERROR_NO_MORE_FILES) {
+        snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+        rc = -1;
+    }
+
+    free(buf);
+    CloseHandle(h);
+    return rc;
+}
+
+#elif defined(__APPLE__)
+/* macOS: getattrlistbulk returns a bufferful of entries with name + object
+** type inline, replacing readdir + per-entry stat/getattrlist. */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    int fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         snprintf(errbuf, errcap, "cannot open directory: %s", dir);
         return -1;
     }
 
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        const char *name = ent->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-        char *full = path_join_dup(dir, name);
-        char *child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            closedir(d);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        struct stat st;
-        if (stat(full, &st) != 0) {
-            free(full);
-            free(child_rel);
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                closedir(d);
-                return -1;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
-        }
-        free(full);
-        free(child_rel);
+    char *buf = (char *)malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        close(fd);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
     }
 
-    closedir(d);
-    return 0;
-#endif
+    struct attrlist al;
+    memset(&al, 0, sizeof(al));
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr  = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+
+    int rc = 0;
+    for (;;) {
+        int n = getattrlistbulk(fd, &al, buf, SCAN_DIR_BUF, 0);
+        if (n < 0) {
+            snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+            rc = -1;
+            break;
+        }
+        if (n == 0) break;
+
+        char *entry = buf;
+        for (int i = 0; i < n && rc == 0; i++) {
+            char *field = entry;
+            uint32_t length;
+            memcpy(&length, field, sizeof(length));
+            char *next = entry + length;
+            field += sizeof(uint32_t);
+
+            /* Attributes follow in bitmap order, RETURNED_ATTRS always first. */
+            attribute_set_t returned;
+            memcpy(&returned, field, sizeof(returned));
+            field += sizeof(returned);
+
+            const char *name = NULL;
+            if (returned.commonattr & ATTR_CMN_NAME) {
+                attrreference_t ref;
+                memcpy(&ref, field, sizeof(ref));
+                name = field + ref.attr_dataoffset;
+                field += sizeof(ref);
+            }
+            fsobj_type_t objtype = VNON;
+            if (returned.commonattr & ATTR_CMN_OBJTYPE) {
+                memcpy(&objtype, field, sizeof(objtype));
+                field += sizeof(objtype);
+            }
+
+            entry = next;
+            if (!name || SCAN_DIR_NAME_DOTS(name)) continue;
+
+            int is_dir = (objtype == VDIR);
+            int is_reg = (objtype == VREG);
+            if (objtype == VLNK) {
+                struct stat st;
+                if (fstatat(fd, name, &st, 0) != 0) continue;
+                is_dir = S_ISDIR(st.st_mode);
+                is_reg = S_ISREG(st.st_mode);
+            }
+            rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                       name, is_dir, is_reg, errbuf, errcap);
+        }
+        if (rc != 0) break;
+    }
+
+    free(buf);
+    close(fd);
+    return rc;
 }
+
+#elif defined(__linux__)
+/* Linux/Android: getdents64 returns many entries per syscall and d_type gives
+** the kind without a stat. Only DT_UNKNOWN / DT_LNK fall back to fstatat, which
+** follows the link to match the previous stat()-based behaviour. */
+struct scan_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
+        return -1;
+    }
+
+    char *buf = (char *)malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        close(fd);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
+    }
+
+    int rc = 0;
+    for (;;) {
+        long n = syscall(SYS_getdents64, fd, buf, SCAN_DIR_BUF);
+        if (n < 0) {
+            snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+            rc = -1;
+            break;
+        }
+        if (n == 0) break;
+
+        for (long off = 0; off < n && rc == 0; ) {
+            struct scan_dirent64 *d = (struct scan_dirent64 *)(buf + off);
+            const char *name = d->d_name;
+            unsigned char type = d->d_type;
+            off += d->d_reclen;
+
+            if (SCAN_DIR_NAME_DOTS(name)) continue;
+
+            int is_dir, is_reg;
+            if (type == DT_DIR) { is_dir = 1; is_reg = 0; }
+            else if (type == DT_REG) { is_dir = 0; is_reg = 1; }
+            else {
+                struct stat st;
+                if (fstatat(fd, name, &st, 0) != 0) continue;
+                is_dir = S_ISDIR(st.st_mode);
+                is_reg = S_ISREG(st.st_mode);
+            }
+            rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                       name, is_dir, is_reg, errbuf, errcap);
+        }
+        if (rc != 0) break;
+    }
+
+    free(buf);
+    close(fd);
+    return rc;
+}
+
+#else
+/* Generic POSIX (BSD, etc.): readdir with d_type when the filesystem provides
+** it, fstatat otherwise -- still avoids the per-entry stat in the common case. */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    DIR *dp = opendir(dir);
+    if (!dp) {
+        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
+        return -1;
+    }
+    int dfd = dirfd(dp);
+
+    int rc = 0;
+    struct dirent *ent;
+    while (rc == 0 && (ent = readdir(dp)) != NULL) {
+        const char *name = ent->d_name;
+        if (SCAN_DIR_NAME_DOTS(name)) continue;
+
+        int is_dir = 0, is_reg = 0;
+#ifdef DT_DIR
+        if (ent->d_type == DT_DIR)      { is_dir = 1; }
+        else if (ent->d_type == DT_REG) { is_reg = 1; }
+        else
+#endif
+        {
+            struct stat st;
+            if (fstatat(dfd, name, &st, 0) != 0) continue;
+            is_dir = S_ISDIR(st.st_mode);
+            is_reg = S_ISREG(st.st_mode);
+        }
+        rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                   name, is_dir, is_reg, errbuf, errcap);
+    }
+
+    closedir(dp);
+    return rc;
+}
+#endif
 
 static int l_util_scan_dir(lua_State *L) {
     const char *root = luaL_checkstring(L, 1);

@@ -90,6 +90,32 @@ local nx, nx_err = xutils.scan_dir('scripts/core/share/this_dir_does_not_exist_z
 ok('scan_dir missing => nil',     nx == nil)
 ok('scan_dir missing has err',    type(nx_err) == 'string')
 
+-- Recursion: scan a nested tree (the per-platform backends must descend into
+-- subdirs, join rel with '/', and record only regular files -- never dirs).
+local nested, nested_err = xutils.scan_dir('scripts')
+ok('scan_dir nested returns table', type(nested) == 'table', tostring(nested_err))
+
+local by_rel = {}
+local saw_slash, saw_backslash, saw_dir_entry = false, false, false
+for _, f in ipairs(nested) do
+    if type(f.path) ~= 'string' or type(f.rel) ~= 'string' then
+        ok('nested entry shape', false, 'bad entry')
+        break
+    end
+    by_rel[f.rel] = f.path
+    if f.rel:find('/', 1, true)  then saw_slash = true end
+    if f.rel:find('\\', 1, true) then saw_backslash = true end
+    -- these are directories under scripts/, must NOT appear as entries
+    if f.rel == 'core' or f.rel == 'core/share' or f.rel == 'xpac' then
+        saw_dir_entry = true
+    end
+end
+ok('scan_dir recurses into subdirs (nested rel)', saw_slash)
+ok('scan_dir rel uses forward slashes only',      not saw_backslash)
+ok('scan_dir excludes directory entries',         not saw_dir_entry)
+ok('scan_dir finds known nested file',
+   by_rel['core/share/xhttp_router.lua'] ~= nil)
+
 -- ============================================================================
 -- 3. json_pack basic types
 -- ============================================================================
