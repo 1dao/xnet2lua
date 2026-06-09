@@ -3,6 +3,7 @@
 local xhttp = dofile('scripts/core/server/xhttp.lua')
 local router = dofile('scripts/core/share/xrouter.lua')
 local xutils = require('xutils')
+local to_bool = dofile('scripts/core/share/xmisc.lua').to_bool
 router.set_log_prefix('XPAC-MAIN')
 router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
     local _ = reply_router
@@ -28,17 +29,6 @@ local HTTPS = nil
 local CERT = xutils.get_config('HTTPS_CERT', 'demo/certs/server.crt')
 local KEY = xutils.get_config('HTTPS_KEY', 'demo/certs/server.key')
 local KEY_PASSWORD = xutils.get_config('HTTPS_KEY_PASSWORD', '')
-
-local function to_bool(v, default)
-    if v == nil then return default end
-    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then
-        return true
-    end
-    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then
-        return false
-    end
-    return default
-end
 
 HTTPS = to_bool(xutils.get_config('HTTPS_ENABLE', '1'), true)
 

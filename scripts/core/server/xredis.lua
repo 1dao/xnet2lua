@@ -47,6 +47,13 @@ function M.start(cfg)
     return true
 end
 
+-- xthread.rpc yields back three values: (channel_ok, app_ok, reply).
+--   channel_ok == false -> the RPC itself failed; app_ok holds the reason.
+--   channel_ok == true  -> the xredis_call handler returned (app_ok, reply),
+--                          where reply is the decoded Redis reply or an error.
+-- Collapse that to the documented (ok, reply) so callers don't accidentally
+-- read the channel flag as the reply (which surfaced as every command
+-- returning boolean `true`).
 function M.call(cmd, ...)
     -- The RPC reply is (transport_ok, redis_ok, value): xrouter prepends its own
     -- transport_ok, and the worker's xredis_call handler returns (redis_ok, value).

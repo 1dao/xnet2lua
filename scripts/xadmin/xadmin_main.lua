@@ -13,6 +13,7 @@ local xmysql = dofile('scripts/core/server/xmysql.lua')
 local store = dofile('scripts/xadmin/xadmin_store.lua')
 local xutils = require('xutils')
 local router = dofile('scripts/core/share/xrouter.lua')
+local to_bool = dofile('scripts/core/share/xmisc.lua').to_bool
 router.set_log_prefix('XADMIN-MAIN')
 
 local CONFIG_FILE = 'xnet.cfg'
@@ -30,15 +31,13 @@ local NATS_PREFIX = xutils.get_config('NATS_PREFIX', 'xnet.test')
 local HEARTBEAT_MS = tonumber(xutils.get_config('XADMIN_HEARTBEAT_MS', '5000')) or 5000
 local TOKEN = xutils.get_config('XADMIN_TOKEN', '')
 local SUPER_TOKEN = xutils.get_config('XADMIN_SUPER_TOKEN', '')
+-- mTLS: PEM file with the CA bundle that signs accepted client certs. When
+-- non-empty, xhttp runs in mTLS mode and every /api/ request must present a
+-- cert verifiable against this CA. The peer cert's subject DN is exposed on
+-- req.peer_cert_subject.
+local TLS_CA_FILE = xutils.get_config('XADMIN_TLS_CA_FILE', '')
 local HTTP_WORKER_COUNT = 10
 local HTTP_WORKER_BASE = xthread.WORKER_GRP3
-
-local function to_bool(v, default)
-    if v == nil then return default end
-    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then return true end
-    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then return false end
-    return default
-end
 
 local HTTPS = to_bool(xutils.get_config('XADMIN_HTTPS', '0'), false)
 local CERT = xutils.get_config('HTTPS_CERT', 'demo/certs/server.crt')
@@ -63,12 +62,36 @@ xthread.register('xadmin_remote_exec', function(src)
 end)
 
 -- ---------------------------------------------------------------------------
+-- Outbound HTTP bridge for OAuth2 / OIDC discovery (called by workers via
+-- xthread.post(MAIN, 'xadmin_oauth_http', request_id, opts)). Runs
+-- xhttp_client.request asynchronously and posts the result back to the
+-- originating worker thread, which resumes a session coroutine that was
+-- yielded on async_http_call. This lives on MAIN because MAIN has its own
+-- xnet event loop and can drive xhttp_client without blocking the workers.
+-- ---------------------------------------------------------------------------
+local httpc = dofile('scripts/core/share/xhttp_client.lua')
+xthread.register('xadmin_oauth_http', function(request_id, opts)
+    local worker_id = xthread.current_id and xthread.current_id() or 0
+    -- Note: opts may have come from a worker (untrusted by definition, but
+    -- the only sender is our own worker so we accept the trust assumption).
+    -- xhttp_client uses xnet.connect(_tls) which requires this thread to
+    -- have called xnet.init(); MAIN does so in __init.
+    httpc.request(opts or {}, function(err, resp)
+        -- Fire-and-forget reply: target the worker that originated the call
+        -- (re-derived from request_id so we don't have to trust opts).
+        local target = request_id:match('^(%d+):') and tonumber(request_id:match('^(%d+):')) or worker_id
+        xthread.post(target, '@xadmin_oauth_reply', request_id, err, resp)
+    end)
+    return true   -- handler returns immediately; the callback delivers the real result
+end)
+
+-- ---------------------------------------------------------------------------
 -- MySQL lifecycle (owned by the main thread)
 -- ---------------------------------------------------------------------------
 -- The pool connects WITHOUT a default database so the setup flow can create it;
 -- queries fully qualify table names with the configured database name.
-local function start_mysql(db)
-    return xmysql.start({
+local function mysql_config(db)
+    return {
         host = db.host,
         port = db.port,
         user = db.user,
@@ -77,17 +100,27 @@ local function start_mysql(db)
         pool_size = 2,
         reconnect_ms = 1000,
         max_reply_size = 4 * 1024 * 1024,
-    })
+    }
 end
 
--- Worker setup flow calls this to (re)start the pool with the submitted creds.
--- Restarting on every apply keeps the running pool in sync with new settings.
+local function start_mysql(db)
+    return xmysql.start(mysql_config(db))
+end
+
+-- Worker setup flow calls this to (re)point the pool at the submitted creds.
 xthread.register('xadmin_db_apply', function(host, port, user, password)
     local db = { host = host, port = port, user = user, password = password }
+    local ok, err
     if xmysql.running() then
-        xmysql.stop(true)
+        -- Reconfigure the EXISTING pool in place (close sockets + reconnect on
+        -- the same thread). Do NOT shutdown_thread here: tearing the live MySQL
+        -- thread down mid-process corrupts other threads' poll state and sends
+        -- the process into an error spin. This path is hit on every setup retry
+        -- (e.g. after a first attempt with wrong credentials).
+        ok, err = xmysql.reconfigure(mysql_config(db))
+    else
+        ok, err = start_mysql(db)
     end
-    local ok, err = start_mysql(db)
     if not ok then
         return false, tostring(err)
     end
@@ -107,6 +140,46 @@ local function __init()
     end
     if SUPER_TOKEN ~= '' then
         xthread.log_info('[XADMIN-MAIN] auth: master bypass token ENABLED (X-Xadmin-Super-Token)')
+    end
+    if to_bool(xutils.get_config('XADMIN_DEV_NO_AUTH', '0'), false) then
+        xthread.log_error('[XADMIN-MAIN] auth: DEV_NO_AUTH ENABLED -- ALL '
+            .. 'authentication AND authorization are DISABLED (every request is '
+            .. 'admin). LOCAL TESTING ONLY; never use in production.')
+    end
+    if TLS_CA_FILE ~= '' then
+        -- mTLS requires TLS. Without XADMIN_HTTPS=1 the worker never builds a
+        -- TLS config, so the CA file is silently ignored and NO client-cert
+        -- check happens -- while we'd otherwise log "mTLS ENABLED". Fail loud
+        -- instead of advertising a security control that isn't active.
+        if not HTTPS then
+            error('[XADMIN-MAIN] XADMIN_TLS_CA_FILE is set but XADMIN_HTTPS is not '
+                .. 'enabled; mTLS needs TLS. Set XADMIN_HTTPS=1 (with HTTPS_CERT/'
+                .. 'HTTPS_KEY), or unset XADMIN_TLS_CA_FILE.')
+        end
+        xthread.log_info('[XADMIN-MAIN] auth: mTLS ENABLED (CA=%s)', TLS_CA_FILE)
+    end
+    -- OAuth2 / JWT providers are listed in the log so misconfiguration is
+    -- obvious at startup. Providers are configured via XADMIN_OAUTH_<NAME>_{CLIENT_ID,CLIENT_SECRET,AUTH_URL,TOKEN_URL,USERINFO_URL,SCOPE}.
+    local oauth_providers = xutils.get_config('XADMIN_OAUTH_PROVIDERS', '')
+    if oauth_providers and oauth_providers ~= '' then
+        xthread.log_info('[XADMIN-MAIN] auth: OAuth2 providers=%s', oauth_providers)
+    end
+    local jwt_secret = xutils.get_config('XADMIN_JWT_HS256_SECRET', '')
+    if jwt_secret ~= '' then
+        xthread.log_info('[XADMIN-MAIN] auth: JWT HS256 ENABLED (aud=%s iss=%s)',
+            tostring(xutils.get_config('XADMIN_JWT_AUDIENCE', 'xadmin')),
+            tostring(xutils.get_config('XADMIN_JWT_ISSUER', '*')))
+    end
+    -- Pre-generate + persist the OAuth state-signing secret here on MAIN, before
+    -- any worker serves a request, so the HTTP workers don't race to each
+    -- generate and overwrite a *different* secret (which would make in-flight
+    -- OAuth round-trips fail state verification). Only needed when OAuth is used.
+    if oauth_providers and oauth_providers ~= '' then
+        local auth = dofile('scripts/xadmin/xadmin_auth.lua')
+        local secret, serr = auth.get_state_secret()
+        if not secret then
+            xthread.log_error('[XADMIN-MAIN] oauth state secret: %s', tostring(serr))
+        end
     end
 
     assert(xnet.init())
@@ -135,6 +208,7 @@ local function __init()
         cert_file = CERT,
         key_file = KEY,
         key_password = KEY_PASSWORD,
+        ca_file = TLS_CA_FILE,
         worker_count = HTTP_WORKER_COUNT,
         worker_base = HTTP_WORKER_BASE,
         worker_name = 'xadmin-worker',
@@ -150,6 +224,16 @@ local function __init()
     -- it to create the admin). Otherwise it starts lazily via xadmin_db_apply.
     local store_cfg = store.load_db_config()
     local db = store_cfg.db or {}
+    -- Authorization: admin endpoints (/api/exec, /api/reload) require the
+    -- 'admin' role, granted to the setup admin (persisted as admin_user) plus
+    -- XADMIN_ADMINS. A console configured before admin_user was persisted has
+    -- no admin unless XADMIN_ADMINS is set -- warn so it isn't a silent lockout.
+    if store_cfg.configured and (not store_cfg.admin_user or store_cfg.admin_user == '')
+        and xutils.get_config('XADMIN_ADMINS', '') == '' then
+        xthread.log_error('[XADMIN-MAIN] auth: no admin principal defined '
+            .. '(legacy config has no admin_user); set XADMIN_ADMINS=<user> or '
+            .. 're-run setup, else /api/exec and /api/reload are denied to everyone')
+    end
     if (store_cfg.configured or store_cfg.db_from_cfg) and db.host then
         local mok, merr = start_mysql(db)
         if mok then

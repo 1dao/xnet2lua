@@ -170,7 +170,7 @@ static int l_xtimer_show(lua_State* L) {
 /* Build the LuaTimer userdata, register it in the C heap, and leave it on
 ** top of the Lua stack. callback_idx is the absolute stack index of the Lua
 ** callback function; the caller is responsible for type-checking it. */
-static int xtimer_create_lua(lua_State* L, const char* fname, int interval_ms,
+static int xtimer_create_lua(lua_State* L, const char* fname, int64_t interval_ms,
                              int callback_idx, int repeat_num) {
     LuaTimer* t = (LuaTimer*)lua_newuserdata(L, sizeof(*t));
     t->L = L;
@@ -196,7 +196,7 @@ static int xtimer_create_lua(lua_State* L, const char* fname, int interval_ms,
 }
 
 static int l_xtimer_add(lua_State* L) {
-    int interval_ms = (int)luaL_checkinteger(L, 1);
+    int64_t interval_ms = (int64_t)luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
     int repeat_num = (int)luaL_optinteger(L, 3, 1);
 
@@ -212,7 +212,7 @@ static int l_xtimer_add(lua_State* L) {
 ** Convenience for a one-shot timer (repeat_num = 1). The returned handle
 ** can be used to cancel before it fires. */
 static int l_xtimer_delay(lua_State* L) {
-    int interval_ms = (int)luaL_checkinteger(L, 1);
+    int64_t interval_ms = (int64_t)luaL_checkinteger(L, 1);
     luaL_checktype(L, 2, LUA_TFUNCTION);
     if (interval_ms < 0)
         return luaL_error(L, "xtimer.delay: interval_ms must be >= 0");

@@ -36,13 +36,31 @@
         <!-- 登录 -->
         <form class="auth-view" id="login-view" hidden autocomplete="off">
             <h2>登录 xadmin</h2>
-            <p class="auth-sub">请输入管理员账户与密码。</p>
-            <div class="auth-grid">
+            <p class="auth-sub" id="login-sub">请输入管理员账户与密码。</p>
+            <div class="auth-grid" id="li-pw-fields">
                 <label>账户<input type="text" id="li-user" /></label>
                 <label>密码<input type="password" id="li-password" /></label>
             </div>
             <button type="submit" class="btn btn-primary auth-submit">登录</button>
             <div class="auth-msg" id="login-msg"></div>
+
+            <!-- 联邦登录：动态填充（OAuth providers / JWT 凭据 / mTLS 提示） -->
+            <div class="auth-federated" id="auth-federated" hidden>
+                <div class="auth-divider"><span>或</span></div>
+                <div class="auth-buttons" id="auth-buttons"></div>
+                <div class="auth-jwt" id="auth-jwt" hidden>
+                    <label>JWT (HS256)
+                        <textarea id="li-jwt-token" rows="3" spellcheck="false"
+                            placeholder="eyJhbGciOi...（粘贴完整 token）"></textarea>
+                    </label>
+                    <button type="button" class="btn btn-secondary auth-submit" id="li-jwt-submit">使用 JWT 登录</button>
+                    <div class="auth-msg" id="jwt-msg"></div>
+                </div>
+                <div class="auth-mtls-hint" id="auth-mtls-hint" hidden>
+                    <span class="auth-mtls-badge">🔒 mTLS</span>
+                    本服务已启用 mTLS 认证。当前请求未携带已签发的客户端证书。
+                </div>
+            </div>
         </form>
     </div>
 </div>
@@ -62,6 +80,9 @@
             </button>
             <button type="button" class="menu-item" data-page="stats">
                 <span class="menu-dot"></span>Thread Stats
+            </button>
+            <button type="button" class="menu-item" data-page="tokens" id="menu-tokens" hidden>
+                <span class="menu-dot"></span>访问令牌
             </button>
             <button type="button" class="menu-item" data-page="about">
                 <span class="menu-dot"></span>关于
@@ -155,6 +176,44 @@ return 1 + 1"></textarea>
             </table>
         </section>
 
+        <section class="page" data-page="tokens" hidden>
+            <header class="page-head">
+                <h1>签发访问令牌</h1>
+                <div class="page-sub">生成一张带角色与有效期的 JWT。持有者可作 <code>Authorization: Bearer</code> 调 API，或粘到登录页的"使用 JWT 登录"框换取会话。<strong>仅管理员可签发；令牌等同密码，请妥善保管。</strong></div>
+            </header>
+            <div class="token-form">
+                <div class="auth-grid">
+                    <label>角色
+                        <select id="tk-role" class="toolbar-select">
+                            <option value="viewer">只读 (viewer) — 仅查看</option>
+                            <option value="admin">可操作 (admin) — 可执行/Reload</option>
+                        </select>
+                    </label>
+                    <label>有效期
+                        <select id="tk-ttl" class="toolbar-select">
+                            <option value="3600">1 小时</option>
+                            <option value="28800">8 小时</option>
+                            <option value="86400" selected>1 天</option>
+                            <option value="604800">7 天</option>
+                            <option value="2592000">30 天</option>
+                        </select>
+                    </label>
+                    <label>标识 (sub，可选)
+                        <input type="text" id="tk-sub" placeholder="如 ci-bot / alice（留空自动生成）" />
+                    </label>
+                </div>
+                <button type="button" id="tk-generate" class="btn btn-primary">生成令牌</button>
+                <span id="tk-meta" class="output-meta"></span>
+            </div>
+            <div class="output" id="tk-output-box" hidden>
+                <div class="output-head">
+                    <span>令牌（点下方复制）</span>
+                    <button type="button" id="tk-copy" class="btn btn-ghost btn-sm">复制</button>
+                </div>
+                <pre id="tk-output" class="output-body" style="white-space:pre-wrap;word-break:break-all;"></pre>
+            </div>
+        </section>
+
         <section class="page" data-page="about" hidden>
             <header class="page-head">
                 <h1>关于 xadmin</h1>
@@ -166,6 +225,11 @@ return 1 + 1"></textarea>
                 <li>数据库配置保存在 <code>xadmin_db.json</code>（可用 <code>XADMIN_DATA_FILE</code> 覆盖路径），账户与会话存于 MySQL。</li>
                 <li>也可在 <code>xnet.cfg</code> 用 <code>XADMIN_DB_HOST/PORT/USER/PASSWORD/DATABASE</code> 预置连接；有值即覆盖 JSON（按字段），五项齐全时初始化页只需设管理员账户。</li>
                 <li>兼容旧版 <code>XADMIN_TOKEN</code>：设置后也可用 <code>X-Xadmin-Token</code> 头免登录调用接口。</li>
+                <li><strong>mTLS</strong>：设置 <code>XADMIN_HTTPS=1</code> + <code>XADMIN_TLS_CA_FILE=&lt;ca.pem&gt;</code> 后，访问控制台须出示由该 CA 签发的客户端证书；可在 <code>oauth_links</code> 表把 subject DN 映射到本地账户。</li>
+                <li><strong>OAuth2</strong>：<code>XADMIN_OAUTH_PROVIDERS=google,github</code> + <code>XADMIN_OAUTH_GOOGLE_{CLIENT_ID,CLIENT_SECRET,AUTH_URL,TOKEN_URL,USERINFO_URL}</code> 启用 Auth Code + PKCE 登录。</li>
+                <li><strong>JWT (HS256)</strong>：设 <code>XADMIN_JWT_HS256_SECRET=&lt;共享密钥&gt;</code> 启用（标准 RFC 7515 base64url 签名，可与上游网关共用同一密钥）；不设则禁用。可选 <code>XADMIN_JWT_ISSUER</code> / <code>XADMIN_JWT_AUDIENCE</code> 锁定来源。</li>
+                <li><strong>授权（角色）</strong>：口令会话、<code>XADMIN_SUPER_TOKEN</code>、<code>XADMIN_TOKEN</code> 为 <code>admin</code>；OAuth/JWT/mTLS 等联邦身份默认 <code>viewer</code>（只读），仅当其本地名出现在 <code>XADMIN_ADMINS=user1,user2</code> 或等于初始化管理员时才是 admin。<code>/api/exec</code>、<code>/api/reload</code> 仅限 admin。</li>
+                <li><strong>本地测试开关</strong>：<code>XADMIN_DEV_NO_AUTH=1</code> 一键关闭<strong>全部</strong>认证与授权——任何请求都按 admin 放行，跳过登录/JWT/OAuth/mTLS/角色门，无需配置数据库即可进控制台执行脚本。<strong>仅限本地，切勿用于生产。</strong></li>
             </ul>
         </section>
     </main>

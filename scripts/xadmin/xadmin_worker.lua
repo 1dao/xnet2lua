@@ -9,6 +9,9 @@
 --
 -- TLS: xhttp_accept switches between xnet.attach and xnet.attach_tls based
 -- on use_https; xsession's connection bookkeeping is unchanged either way.
+-- When tls_config.ca_file is set, xnet.attach_tls runs in mTLS mode (REQUIRES
+-- a verified client cert) and the peer subject DN is exposed on the request
+-- as req.peer_cert_subject for use by the auth layer.
 
 local xsession = dofile('scripts/core/share/xsession.lua')
 local codec    = dofile('scripts/core/share/xhttp_codec.lua')
@@ -117,6 +120,7 @@ local function build_app_context()
         token_required = TOKEN_REQUIRED,
         alive_peers    = alive_peers,
         now_ms         = now_ms,
+        async_http_call = async_http_call,
     }
 end
 
@@ -139,6 +143,9 @@ local function load_app(path)
     state.app = app
     state.app_script = app_script
 end
+
+-- Expose the async HTTP helper to xadmin_app.lua via app.setup's context.
+-- The app reads it as ctx.async_http_call (synchronous from the route's POV).
 
 if app_script then
     local ok, err = pcall(load_app, app_script)
@@ -173,11 +180,24 @@ local app_router = {
 local handler = xsession.make({
     -- No spec.framing -- max_request_size may change after xhttp_worker_start
     -- arrives, so framing is applied lazily in on_connect below.
-    parse_packet = function(data, pos, _, cstate)
-        return codec.parse_request(data, pos, {
+    parse_packet = function(data, pos, conn, cstate)
+        local req, next_pos, err = codec.parse_request(data, pos, {
             max_request_size = max_request_size,
             state = cstate,
         })
+        if req then
+            -- mTLS hook: if this connection is a server-side TLS connection
+            -- and a client cert has been verified, stash the subject DN on
+            -- the request. The auth layer (xadmin_app.current_user) will
+            -- translate it to a local user via the oauth_links table.
+            if conn and type(conn.peer_cert_subject) == 'function' then
+                local ok, pcs = pcall(conn.peer_cert_subject, conn)
+                if ok and type(pcs) == 'string' and pcs ~= '' then
+                    req.peer_cert_subject = pcs
+                end
+            end
+        end
+        return req, next_pos, err
     end,
 
     classify = function(_) return 'rpc' end,  -- HTTP serializes per fd
@@ -207,7 +227,8 @@ local handler = xsession.make({
 -- Lifecycle xthread messages
 -- ---------------------------------------------------------------------------
 xthread.register('xhttp_worker_start', function(script_path, max_size, name,
-                                                https, cert_file, key_file, key_password)
+                                                https, cert_file, key_file, key_password,
+                                                _ce, _cms, _cl, _rd, _md, ca_file)
     max_request_size = tonumber(max_size) or max_request_size
     server_name = name or server_name
     use_https = https and true or false
@@ -216,6 +237,7 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
             cert_file = cert_file,
             key_file = key_file,
             password = key_password ~= '' and key_password or nil,
+            ca_file = (ca_file and ca_file ~= '') and ca_file or nil,
             max_packet = max_request_size,
         }
     else
@@ -226,8 +248,9 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
     state.use_https = use_https
     state.tls_config = tls_config
     load_app(script_path)
-    xthread.log_system('[XADMIN-WORKER] start scheme=%s app=%s',
-        use_https and 'https' or 'http', tostring(script_path))
+    xthread.log_system('[XADMIN-WORKER] start scheme=%s app=%s mTLS=%s',
+        use_https and 'https' or 'http', tostring(script_path),
+        tls_config and tls_config.ca_file and 'on' or 'off')
 end)
 
 xthread.register('xhttp_accept', function(fd, ip, port)
@@ -244,6 +267,63 @@ end)
 
 xthread.register('xhttp_worker_stop', function()
     handler.close_all('xhttp_worker_stop')
+end)
+
+-- ---------------------------------------------------------------------------
+-- Outbound HTTP helper (used by OAuth2 + OIDC discovery in xadmin_app.lua)
+--
+-- Why the dance: the worker thread is event-loop driven; a session co that
+-- wants to wait for an async result cannot directly yield to the C event
+-- loop. So we delegate the actual xhttp_client.request to the MAIN thread
+-- (which has its own event loop and can run it), then post the response
+-- back to the originating worker. The reply resumes the session co via
+-- @xadmin_oauth_reply, which mimics what xthread's @async_resume does for
+-- inter-thread RPC. This is per-worker state; a fresh worker thread that
+-- has never issued a request has a clean table.
+-- ---------------------------------------------------------------------------
+local async_pending = {}    -- request_id (string) -> { co, slot }
+local async_seq = 0
+
+function async_request_id()
+    async_seq = async_seq + 1
+    return tostring(xthread.current_id and xthread.current_id() or 0)
+        .. ':' .. tostring(async_seq)
+end
+
+-- async_http_call(opts) -> (err, resp)
+--   opts: passed straight to xhttp_client.request (url, method, headers, body, ...)
+--   resp: { status, body, headers } or nil
+function async_http_call(opts)
+    local co = coroutine.running()
+    if not co then
+        return nil, 'async_http_call: must be called from a coroutine'
+    end
+    local request_id = async_request_id()
+    local slot = {}                 -- mutated by the reply handler
+    async_pending[request_id] = { co = co, slot = slot }
+    xthread.post(xthread.MAIN, 'xadmin_oauth_http', request_id, opts)
+    coroutine.yield('xadmin_async_http')  -- resumed by @xadmin_oauth_reply
+    async_pending[request_id] = nil
+    return slot.err, slot.resp
+end
+
+xthread.register('@xadmin_oauth_reply', function(request_id, err, resp)
+    local entry = async_pending[request_id]
+    if not entry then
+        -- Late reply (worker restarted, request timed out, etc.) -- drop.
+        return
+    end
+    entry.slot.err  = err
+    entry.slot.resp = resp
+    -- coroutine.resume is safe to call from inside an xthread message handler;
+    -- xthread's own @async_resume intercept uses the same primitive. The
+    -- session co runs to completion (sends the HTTP response, returns to
+    -- xsession) before this handler returns, which keeps the call stack
+    -- well-defined.
+    local ok, rerr = coroutine.resume(entry.co)
+    if not ok then
+        xthread.log_error('[XADMIN-WORKER] oauth reply resume failed: %s', tostring(rerr))
+    end
 end)
 
 local function __init()

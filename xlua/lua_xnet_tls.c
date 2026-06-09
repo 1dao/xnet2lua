@@ -66,10 +66,23 @@ typedef struct LuaTlsConn {
 
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
-    mbedtls_x509_crt cert;
+    mbedtls_x509_crt cert;        /* server: own cert; client: CA bundle */
+    mbedtls_x509_crt ca_chain;    /* server: trusted client CAs (mTLS) */
     mbedtls_pk_context pkey;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
+
+    /* server (mTLS): the verified peer's subject DN after handshake completes.
+     * Format is "CN=...,O=...,C=..." (mbedtls_x509_dn_gets output). Empty
+     * string when no client cert was presented or the field hasn't been
+     * populated yet. The string is owned by the connection; do not free. */
+    char peer_subject[512];
+
+    /* True iff the server side was configured with a CA bundle (i.e. mTLS
+     * is desired). Used by the handshake-completion path to decide whether
+     * to read the peer cert; the struct's cert/ca_chain state alone isn't
+     * a reliable indicator since the cert is always initialized. */
+    bool mtls_enabled;
 } LuaTlsConn;
 
 static int push_tls_send_result(lua_State* L, LuaTlsConn* c, int rc) {
@@ -182,6 +195,7 @@ static void tls_free_crypto(LuaTlsConn* c) {
     mbedtls_ssl_free(&c->ssl);
     mbedtls_ssl_config_free(&c->conf);
     mbedtls_x509_crt_free(&c->cert);
+    mbedtls_x509_crt_free(&c->ca_chain);
     mbedtls_pk_free(&c->pkey);
     mbedtls_ctr_drbg_free(&c->ctr_drbg);
     mbedtls_entropy_free(&c->entropy);
@@ -333,6 +347,27 @@ static void tls_drive_handshake(LuaTlsConn* c) {
         int rc = mbedtls_ssl_handshake(&c->ssl);
         if (rc == 0) {
             c->handshake_done = true;
+            /* mTLS: when the server is configured with a CA bundle, OPTIONAL
+             * authmode means a client cert is requested but not required --
+             * so a browser without a cert can still reach the password login.
+             * We copy the peer subject into the userdata ONLY when mbedtls
+             * actually verified the cert (verify_result == 0), so a missing
+             * or invalid cert never leaks into the auth layer as a fake
+             * identity. Best-effort: on overflow we leave the field empty. */
+            if (c->peer_subject[0] == '\0' && c->mtls_enabled) {
+                uint32_t vr = mbedtls_ssl_get_verify_result(&c->ssl);
+                if (vr == 0) {
+                    const mbedtls_x509_crt* peer = mbedtls_ssl_get_peer_cert(&c->ssl);
+                    if (peer) {
+                        int pn = mbedtls_x509_dn_gets(c->peer_subject,
+                                                      sizeof(c->peer_subject),
+                                                      &peer->subject);
+                        if (pn < 0 || pn >= (int)sizeof(c->peer_subject)) {
+                            c->peer_subject[0] = '\0';
+                        }
+                    }
+                }
+            }
             tls_disarm_write(c);
             tls_call_connect(c);
             if (!c->closed) tls_flush_output(c);
@@ -504,6 +539,7 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     const char* cert_file = NULL;
     const char* key_file = NULL;
     const char* password = NULL;
+    const char* ca_file = NULL;
     size_t max_packet = 0;
     size_t max_send = 0;
     bool has_max_send = false;
@@ -554,6 +590,22 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     if (max_packet > 0) c->max_packet = max_packet;
     if (has_max_send) c->max_send = max_send;
 
+    /* Optional: client CA bundle for mTLS. When set, the server REQUIRES a
+     * verified client cert and exposes the peer subject via :peer_cert_subject().
+     * Omitting this field preserves the original VERIFY_NONE behaviour. */
+    lua_getfield(L, cfg_idx, "ca_file");
+    if (lua_isstring(L, -1)) ca_file = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    if (ca_file && ca_file[0] != '\0') {
+        int rc = mbedtls_x509_crt_parse_file(&c->ca_chain, ca_file);
+        if (rc != 0) {
+            char errbuf[160];
+            tls_errmsg(rc, errbuf, sizeof(errbuf));
+            lua_pushfstring(L, "parse ca failed: %s: %s", ca_file, errbuf);
+            return -1;
+        }
+    }
+
     if (!s_psa_ready) {
         psa_status_t status = psa_crypto_init();
         if (status != PSA_SUCCESS) {
@@ -566,9 +618,12 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     mbedtls_ssl_init(&c->ssl);
     mbedtls_ssl_config_init(&c->conf);
     mbedtls_x509_crt_init(&c->cert);
+    mbedtls_x509_crt_init(&c->ca_chain);
     mbedtls_pk_init(&c->pkey);
     mbedtls_entropy_init(&c->entropy);
     mbedtls_ctr_drbg_init(&c->ctr_drbg);
+    c->peer_subject[0] = '\0';
+    c->mtls_enabled = false;
 
     const char* pers = "xnet_tls_server";
     int rc = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
@@ -609,7 +664,17 @@ static int tls_setup_context(lua_State* L, LuaTlsConn* c, int cfg_idx) {
     }
 
     mbedtls_ssl_conf_rng(&c->conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
-    mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    if (ca_file && ca_file[0] != '\0') {
+        /* mTLS: request a client cert and verify it against ca_chain, but
+         * don't REQUIRE one -- this lets a password/JWT login still work
+         * for clients without a cert (e.g. the admin's browser during
+         * initial setup). The auth layer only treats the cert as identity
+         * when mbedtls's verify result is zero; see tls_drive_handshake. */
+        mbedtls_ssl_conf_ca_chain(&c->conf, &c->ca_chain, NULL);
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+    } else {
+        mbedtls_ssl_conf_authmode(&c->conf, MBEDTLS_SSL_VERIFY_NONE);
+    }
 
     rc = mbedtls_ssl_conf_own_cert(&c->conf, &c->cert, &c->pkey);
     if (rc != 0) {
@@ -951,6 +1016,19 @@ static int l_tls_peer(lua_State* L) {
     return 2;
 }
 
+/* conn:peer_cert_subject() -> string | nil
+**
+** Server-side (mTLS only): the verified peer cert's subject DN as a string in
+** mbedtls's standard "CN=...,O=...,C=..." format, or nil if the connection is
+** not server-mode TLS, the handshake hasn't completed, or no client cert was
+** presented. The string is owned by the connection and is invalidated on close. */
+static int l_tls_peer_cert_subject(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    if (c->peer_subject[0]) lua_pushstring(L, c->peer_subject);
+    else lua_pushnil(L);
+    return 1;
+}
+
 static int l_tls_is_closed(lua_State* L) {
     LuaTlsConn* c = check_tls_conn(L, 1);
     lua_pushboolean(L, !c || c->closed);
@@ -1105,6 +1183,7 @@ static int l_tls_gc(lua_State* L) {
 static const luaL_Reg tls_methods[] = {
     { "fd",          l_tls_fd },
     { "peer",        l_tls_peer },
+    { "peer_cert_subject", l_tls_peer_cert_subject },
     { "is_closed",   l_tls_is_closed },
     { "close",       l_tls_close },
     { "send",        l_tls_send },

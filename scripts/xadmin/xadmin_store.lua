@@ -149,6 +149,11 @@ function M.load_db_config()
         configured  = file_cfg.configured and true or false,
         db          = db,
         db_from_cfg = db_from_cfg,
+        -- The username chosen during /api/setup. Persisted so the auth layer
+        -- can grant it the 'admin' role without a DB schema change (see
+        -- xadmin_app admin_names). Absent on consoles configured before this
+        -- field existed -- those must list the admin in XADMIN_ADMINS.
+        admin_user  = file_cfg.admin_user,
         error       = file_cfg.error,
     }
 end
@@ -235,11 +240,29 @@ function M.ensure_schema(database)
         'CREATE TABLE IF NOT EXISTS ' .. q .. '.`sessions` (' ..
         'token CHAR(64) NOT NULL PRIMARY KEY,' ..
         'username VARCHAR(64) NOT NULL,' ..
+        "role VARCHAR(16) NOT NULL DEFAULT 'viewer'," ..
         'created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,' ..
         'expires_at DATETIME NOT NULL,' ..
         'KEY idx_expires (expires_at)' ..
         ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
     if not ok then return false, 'create sessions: ' .. tostring(r) end
+    -- Migrate a pre-existing sessions table that predates the role column.
+    -- Best-effort: a duplicate-column error just means it's already migrated.
+    M.query('ALTER TABLE ' .. q .. ".`sessions` ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'viewer'")
+
+    -- Maps an external identity (OAuth2 provider + subject, or mTLS cert CN)
+    -- to a local xadmin account. Lets the admin link a Google SSO identity to
+    -- a specific local user, or pin a mTLS client cert to a service account.
+    ok, r = M.query(
+        'CREATE TABLE IF NOT EXISTS ' .. q .. '.`oauth_links` (' ..
+        'provider VARCHAR(32) NOT NULL,' ..
+        'subject VARCHAR(255) NOT NULL,' ..
+        'local_user VARCHAR(64) NOT NULL,' ..
+        'created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,' ..
+        'PRIMARY KEY (provider, subject),' ..
+        'KEY idx_local (local_user)' ..
+        ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+    if not ok then return false, 'create oauth_links: ' .. tostring(r) end
 
     return true
 end
@@ -274,30 +297,45 @@ function M.verify_login(database, username, password)
     return true, row.username
 end
 
--- Create a login session row and return its opaque token.
-function M.create_session(database, username)
+-- Create a login session row and return its opaque token. `role` is stored on
+-- the session ('admin' or 'viewer') so it survives independent of the runtime
+-- allowlist (needed for admin-issued scoped tokens). Self-heals a sessions
+-- table that predates the role column by adding it and retrying once.
+function M.create_session(database, username, role)
     local db = safe_ident(database, 'xadmin')
+    role = (role == 'admin') and 'admin' or 'viewer'
     local token = random_hex(32)  -- 64 hex chars
-    local sql = 'INSERT INTO `' .. db .. '`.`sessions` (token, username, expires_at) VALUES (' ..
-        M.sql_quote(token) .. ', ' .. M.sql_quote(username) ..
+    local sql = 'INSERT INTO `' .. db .. '`.`sessions` (token, username, role, expires_at) VALUES (' ..
+        M.sql_quote(token) .. ', ' .. M.sql_quote(username) .. ', ' .. M.sql_quote(role) ..
         ', DATE_ADD(NOW(), INTERVAL ' .. tostring(SESSION_TTL_SEC) .. ' SECOND))'
     local ok, r = M.query(sql)
+    if not ok and tostring(r):find('Unknown column') then
+        M.query('ALTER TABLE `' .. db .. "`.`sessions` ADD COLUMN role VARCHAR(16) NOT NULL DEFAULT 'viewer'")
+        ok, r = M.query(sql)
+    end
     if not ok then return nil, tostring(r) end
     return token
 end
 
--- Returns username for a live (non-expired) session token, else nil.
+-- Returns (username, role) for a live (non-expired) session token, else nil.
+-- Tolerates a pre-role sessions table (returns role='viewer' until migrated).
 function M.validate_session(database, token)
     token = tostring(token or '')
     if not token:match('^%x+$') or #token ~= 64 then return nil end
     local db = safe_ident(database, 'xadmin')
-    local sql = 'SELECT username FROM `' .. db .. '`.`sessions` WHERE token = ' ..
-        M.sql_quote(token) .. ' AND expires_at > NOW() LIMIT 1'
-    local ok, r = M.query(sql)
+    local where = ' WHERE token = ' .. M.sql_quote(token) .. ' AND expires_at > NOW() LIMIT 1'
+    local ok, r = M.query('SELECT username, role FROM `' .. db .. '`.`sessions`' .. where)
+    if not ok and tostring(r):find('Unknown column') then
+        ok, r = M.query('SELECT username FROM `' .. db .. '`.`sessions`' .. where)
+        if not ok then return nil, tostring(r) end
+        local row = r and r.rows and r.rows[1]
+        if not row then return nil end
+        return row.username, 'viewer'
+    end
     if not ok then return nil, tostring(r) end
     local row = r and r.rows and r.rows[1]
     if not row then return nil end
-    return row.username
+    return row.username, (row.role == 'admin') and 'admin' or 'viewer'
 end
 
 function M.destroy_session(database, token)
@@ -312,6 +350,69 @@ end
 function M.gc_sessions(database)
     local db = safe_ident(database, 'xadmin')
     return M.query('DELETE FROM `' .. db .. '`.`sessions` WHERE expires_at <= NOW()')
+end
+
+-- ---------------------------------------------------------------------------
+-- OAuth2 / mTLS identity links
+--
+-- A "subject" is the IdP-side identifier (e.g. Google "sub" claim, or a
+-- mTLS cert's CN). It is matched verbatim -- we don't try to be clever about
+-- the format, since each IdP has its own conventions. For mTLS, the caller
+-- should pass the full subject DN as `subject` to avoid CN collisions
+-- (e.g. "CN=client1,O=My Org" rather than just "client1").
+-- ---------------------------------------------------------------------------
+
+-- Returns the local username for a linked (provider, subject) pair, or nil.
+function M.lookup_oauth_link(database, provider, subject)
+    local db = safe_ident(database, 'xadmin')
+    provider = M.sql_quote(tostring(provider or ''))
+    subject  = M.sql_quote(tostring(subject or ''))
+    local sql = 'SELECT local_user FROM `' .. db .. '`.`oauth_links` ' ..
+        'WHERE provider = ' .. provider .. ' AND subject = ' .. subject .. ' LIMIT 1'
+    local ok, r = M.query(sql)
+    if not ok then return nil end
+    local row = r and r.rows and r.rows[1]
+    return row and row.local_user or nil
+end
+
+-- Insert or update the link. Returns true on success, or false + reason.
+function M.upsert_oauth_link(database, provider, subject, local_user)
+    local db = safe_ident(database, 'xadmin')
+    provider  = M.sql_quote(tostring(provider  or ''))
+    subject   = M.sql_quote(tostring(subject   or ''))
+    local_user = M.sql_quote(tostring(local_user or ''))
+    if provider == "''" or subject == "''" or local_user == "''" then
+        return false, 'empty field'
+    end
+    local sql = 'INSERT INTO `' .. db .. '`.`oauth_links` (provider, subject, local_user) VALUES (' ..
+        provider .. ', ' .. subject .. ', ' .. local_user .. ') ' ..
+        'ON DUPLICATE KEY UPDATE local_user = VALUES(local_user)'
+    local ok, r = M.query(sql)
+    if not ok then return false, tostring(r) end
+    return true
+end
+
+-- Remove a link (admin tool, not currently exposed via the UI).
+function M.delete_oauth_link(database, provider, subject)
+    local db = safe_ident(database, 'xadmin')
+    provider = M.sql_quote(tostring(provider or ''))
+    subject  = M.sql_quote(tostring(subject  or ''))
+    local ok = M.query('DELETE FROM `' .. db .. '`.`oauth_links` WHERE provider = ' .. provider ..
+        ' AND subject = ' .. subject)
+    return ok and true or false
+end
+
+-- Returns a list of configured OAuth2 providers from XADMIN_OAUTH_PROVIDERS
+-- (comma-separated). Empty list when unset.
+function M.list_oauth_providers()
+    local raw = xutils.get_config('XADMIN_OAUTH_PROVIDERS', '') or ''
+    if raw == '' then return {} end
+    local out = {}
+    for n in tostring(raw):gmatch('[^,]+') do
+        local name = n:match('^%s*(.-)%s*$')
+        if name and name ~= '' then out[#out + 1] = name end
+    end
+    return out
 end
 
 return M

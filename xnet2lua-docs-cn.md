@@ -1513,6 +1513,123 @@ end)
 端到端示例见 `demo/xhttp_client_main.lua`，覆盖 Content-Length、重定向、chunked
 与 gzip 响应。
 
+### 8.8 HTTP 升级到 HTTPS（强制 HTTPS + HSTS）
+
+把明文 HTTP 服务「升级」到 HTTPS，实际做两件事：把每个明文请求**重定向**到对应
+的 `https://` URL，并下发 **HSTS**（`Strict-Transport-Security`）让合规客户端记住
+以后只走 TLS。（RFC 2817 的 `Upgrade: TLS`——同连接内协议切换——刻意**不**实现：
+没有任何浏览器支持它。重定向 + HSTS 才是业界真正可用的做法。）
+
+两者都由 `xhttp.start` 配置驱动：
+
+| 配置项 | 类型 | 默认 | 含义 |
+| --- | --- | --- | --- |
+| `force_https` | bool | false | 在明文（`https=false`）worker 上，所有请求在进入应用前先重定向到 HTTPS |
+| `redirect_port` | number | 443 | 重定向目标 HTTPS 端口（为 443 时 URL 中省略） |
+| `redirect_status` | number | 301 | 重定向状态码：301 / 302 / 307 / 308（用 307/308 可保留非 GET 方法） |
+| `hsts` | bool / number / string / table | nil | `Strict-Transport-Security` 的值；会加到 HTTPS 响应与重定向上 |
+
+`hsts` 取值灵活：`true` → `max-age=31536000`；数字 → `max-age=<n>`；字符串 → 原样
+使用；表 → `{ max_age=, include_subdomains=, preload= }`。
+
+```lua
+-- 边缘 HTTP 监听：把所有请求弹到 HTTPS
+xhttp.start({
+    host = "0.0.0.0", port = 80,
+    worker_name = "edge", app_script = "app.lua",
+    force_https = true, redirect_port = 443, redirect_status = 308,
+    hsts = { max_age = 31536000, include_subdomains = true },
+})
+
+-- HTTPS 监听：传入 hsts，让每个安全响应都带上该头
+xhttp.start({
+    host = "0.0.0.0", port = 443, https = true,
+    cert_file = "server.crt", key_file = "server.key",
+    worker_name = "secure", app_script = "app.lua",
+    hsts = { max_age = 31536000 },
+})
+```
+
+`xhttp_codec` 也暴露了同样的原语，便于在处理器里手动使用：
+
+- `codec.https_redirect(req, opts)` → 重定向响应表（`opts`：`status`、`https_port`、
+  `host`、`hsts`）。
+- `codec.https_url(req, opts)` → `req` 对应的 `https://` URL 字符串。
+- `codec.hsts_value(spec)` → `Strict-Transport-Security` 头的值。
+
+这些辅助函数由 `tests/lua/websocket_spec.lua` 覆盖。
+
+### 8.9 WebSocket（RFC 6455）
+
+`scripts/core/share/xwebsocket.lua` 在 HTTP 服务之上提供 WebSocket。任意应用路由都可
+把连接「移交」给 WebSocket：返回一个带 `websocket` 字段的表，worker 就会完成
+`101 Switching Protocols` 握手，并通过 `conn:set_handler` 把该 fd 切换到帧分发器——
+此后这条连接讲 WebSocket 帧，而不再是 HTTP。该模块自带握手所需的
+`Sec-WebSocket-Accept` 计算（内置 SHA-1 + base64），并处理客户端帧解掩码、跨分片的
+消息重组，以及控制帧（ping → 自动 pong、close 挥手）。
+
+```lua
+local router = dofile("scripts/core/share/xhttp_router.lua")
+local xws    = dofile("scripts/core/share/xwebsocket.lua")
+
+router.get("/ws", function(req)
+    if not xws.is_upgrade(req) then
+        return { status = 426, body = "WebSocket only\n",
+                 headers = { Upgrade = "websocket", Connection = "Upgrade" } }
+    end
+    return {
+        protocol  = "echo",          -- 在 101 中回显的协商子协议（可选）
+        -- protocols = { "echo", "chat" },  -- 或让服务端从客户端列表里挑
+        -- max_message_size = 1048576,      -- 重组后消息上限（默认 4 MiB）
+        websocket = {
+            on_open    = function(ws) ws:send_text("welcome") end,
+            on_message = function(ws, msg, opcode)
+                if opcode == xws.OP_BIN then ws:send_binary(msg)
+                else ws:send_text("echo:" .. msg) end
+            end,
+            on_ping    = function(ws, payload) end,   -- 自动 pong 已发送
+            on_pong    = function(ws, payload) end,
+            on_close   = function(ws, reason) end,
+        },
+    }
+end)
+```
+
+**回调里拿到的 `ws` 对象**：
+
+| 方法 | 作用 |
+| --- | --- |
+| `ws:send_text(s)` / `ws:send(s)` | 发送文本帧 |
+| `ws:send_binary(s)` | 发送二进制帧 |
+| `ws:send_ping(p)` / `ws:send_pong(p)` | 发送控制帧 |
+| `ws:close(code, reason)` | 发送 close 帧并关闭连接 |
+| `ws:is_open()` | 是否仍连接 |
+| `ws:fd()` | 底层 fd |
+| `ws.protocol` | 协商的子协议（或 nil） |
+
+**编解码层**（可独立使用——驱动客户端或写测试）：
+
+- `xws.is_upgrade(req)` → bool —— `req` 是否像一次 WebSocket 握手。
+- `xws.accept_key(key)` → 客户端 key 对应的 `Sec-WebSocket-Accept` 值。
+- `xws.encode(opcode, payload, opts)` → 帧字节（`opts.fin`、`opts.mask`、
+  `opts.mask_key`）。服务端帧不加掩码；客户端帧传 `mask=true`。
+- `xws.decode(buf, pos, opts)` → `frame, next_pos` | `nil, pos, 'incomplete'` |
+  `nil, nil, err`。`frame = { fin, opcode, payload, masked, rsv }`；`opts.max_frame_size`
+  在缓冲负载前先对声明长度设上限。
+- `xws.text_frame` / `binary_frame` / `ping_frame` / `pong_frame` /
+  `close_frame(code, reason)` —— 便捷构造器。
+- `xws.parse_close(payload)` → `code, reason`。
+- 操作码：`xws.OP_TEXT`、`OP_BIN`、`OP_CLOSE`、`OP_PING`、`OP_PONG`、`OP_CONT`。
+- 关闭码：`xws.CLOSE_NORMAL`（1000）、`CLOSE_GOING_AWAY`、`CLOSE_PROTOCOL_ERROR`、
+  `CLOSE_TOO_LARGE`、`CLOSE_POLICY`、`CLOSE_INTERNAL`。
+
+**`wss://`（TLS 上的 WebSocket）无需额外代码。** 升级是叠加在 worker 已建立的传输之上
+的，所以把同一个服务以 `https = true`（外加 `cert_file` / `key_file`）启动，完全相同的
+`/ws` 路由就会在 TLS 隧道内讲 WebSocket。
+
+自测：`demo/xhttp_ws_main.lua`（worker 线程池)、`demo/xhttp_wss_main.lua`（TLS 之上）;
+帧编解码本身由 `tests/lua/websocket_spec.lua` 覆盖。
+
 ---
 
 ## 9. cmsgpack 模块——MessagePack 序列化
@@ -2288,12 +2405,18 @@ bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin2 XADMIN_PORT=1809
 
 | 路径 | 方法 | 鉴权 | 说明 |
 |---|---|---|---|
-| `/api/peers` | GET | 否 | 本节点 + 通过 heartbeat 发现的其他节点 |
-| `/api/stats` | GET | 否 | 所有线程的 queue depth 等运行时统计 |
-| `/api/exec` | POST | 可选 | 在指定节点跑一段 Lua（见 17.6） |
-| `/api/reload` | POST | 可选 | 热重载本节点 / 指定节点 / 所有节点（见 17.7） |
+| `/api/session` | GET | 公开 | 报告配置/登录状态、用户名、角色、可用认证方式 |
+| `/api/setup` | POST | 仅未配置时 | 首次初始化：建库 + 默认管理员（见 17.10） |
+| `/api/login` · `/api/logout` | POST | 公开 | 账号密码登录 / 注销 |
+| `/api/auth/jwt` | POST | 公开 | 用 JWT 换会话 cookie（见 17.12） |
+| `/api/auth/oauth/:p/{start,callback}` | GET | 公开 | OAuth2 登录（见 17.14） |
+| `/api/peers` | GET | 需登录 | 本节点 + 通过 heartbeat 发现的其他节点 |
+| `/api/stats` | GET | 需登录 | 所有线程的 queue depth 等运行时统计 |
+| `/api/tokens` | POST | 需 admin | 签发访问令牌（见 17.13） |
+| `/api/exec` | POST | 需 admin | 在指定节点跑一段 Lua（见 17.6） |
+| `/api/reload` | POST | 需 admin | 热重载本节点 / 指定节点 / 所有节点（见 17.7） |
 
-设置 `XADMIN_TOKEN=...` 后，`/api/exec` 与 `/api/reload` 要求请求头 `X-Xadmin-Token: <token>`。`/api/peers`、`/api/stats` 始终公开。
+认证与授权模型见 17.9。要点：未初始化时非公开端点返回 403；初始化后非公开端点需登录，其中 `/api/exec`、`/api/reload`、`/api/tokens` 仅 `admin` 角色。`XADMIN_TOKEN`（旧用法）仍可用——带 `X-Xadmin-Token` 即视为 admin，适合脚本/自动化免登录调用。
 
 ### 17.6 远程执行 `/api/exec`
 
@@ -2360,6 +2483,123 @@ curl -X POST http://127.0.0.1:18091/api/reload \
 ```
 
 整个过程不重启 xnet 进程。
+
+### 17.9 认证与授权总览
+
+xadmin 把“你是谁”（认证）和“你能做什么”（授权）分开。**认证**支持多种方式，**按需配置即启用**；**授权**只有两个角色：`admin`（可 `/api/exec`、`/api/reload`、签发令牌）和 `viewer`（只读，可看 `/api/peers`、`/api/stats`）。
+
+| 认证方式 | 启用条件 | 得到的角色 |
+|---|---|---|
+| 账号密码 | 完成初始化（17.10） | 初始管理员及 `XADMIN_ADMINS` 内 → admin，其余 viewer |
+| JWT（HS256） | 设 `XADMIN_JWT_HS256_SECRET`（17.12） | token 的 `role` 声明，缺省回退白名单 |
+| OAuth2 / OIDC | 设 `XADMIN_OAUTH_*`（17.14） | 白名单决定，默认 viewer |
+| mTLS | `XADMIN_HTTPS=1` + `XADMIN_TLS_CA_FILE`（17.15） | 白名单决定，默认 viewer |
+| `XADMIN_TOKEN` | 设该值 | 带 `X-Xadmin-Token` → admin（免登录，适合脚本） |
+| `XADMIN_SUPER_TOKEN` | 设该值 | 主控旁路，无条件 admin（连初始化都跳过） |
+| `XADMIN_DEV_NO_AUTH` | 设为 1 | 关闭一切认证/授权，全部按 admin（仅本地，17.16） |
+
+会话：密码/JWT/OAuth 登录成功后服务端发一个 `xadmin_sid` HttpOnly cookie（默认 7 天），之后凭 cookie 访问；角色随会话存储。
+
+> 安全提示：HS256 密钥、`XADMIN_TOKEN`、`XADMIN_SUPER_TOKEN` 都是对称密钥/共享口令，只能交给可信方，切勿下发给浏览器或终端用户。生产请配 `XADMIN_HTTPS=1`。
+
+### 17.10 账户初始化与密码登录
+
+首次打开控制台是初始化页：填 MySQL 连接 + 默认管理员账户，提交后自动建库建表、创建管理员、登录。账户与会话存在 MySQL；连接配置存在 `xadmin_db.json`（`XADMIN_DATA_FILE` 可改路径），与库解耦。
+
+也可在 `xnet.cfg` / 命令行用 `XADMIN_DB_*` 预置连接（按字段覆盖 JSON）；host+user+database 三项齐全时，初始化页只需设管理员账户：
+
+```
+XADMIN_DB_HOST=127.0.0.1
+XADMIN_DB_PORT=3306
+XADMIN_DB_USER=chib
+XADMIN_DB_PASSWORD=...
+XADMIN_DB_DATABASE=xadmin
+```
+
+接口：`POST /api/setup`（仅未配置时）、`POST /api/login {username,password}` → `{ok,username,role}` 并 Set-Cookie、`POST /api/logout`、`GET /api/session`（SPA 据此决定显示 初始化 / 登录 / 控制台）。无需手动建库——填对账号即自动 `CREATE DATABASE IF NOT EXISTS`。
+
+### 17.11 角色与授权
+
+- 默认 admin：**初始管理员**（初始化时创建，记在 `xadmin_db.json`）。
+- 额外 admin：`XADMIN_ADMINS=alice,ci-bot`（逗号分隔的本地名）。命中 → admin，其余 → viewer。
+- `/api/exec`、`/api/reload`、`/api/tokens` 要求 admin；`/api/peers`、`/api/stats` 任意登录角色可访问。控制台对 viewer 会禁用“执行/Reload”并隐藏“访问令牌”页。
+
+> 老库迁移：本版本给会话表加了 `role` 列；已存在的库在下次登录时**自动加列（自愈）**，无需手工迁移。若初始化早于本版本、`xadmin_db.json` 未记初始管理员名，启动会告警——把管理员名加进 `XADMIN_ADMINS` 即可。
+
+### 17.12 JWT（HS256）
+
+设 `XADMIN_JWT_HS256_SECRET=<共享密钥>` 启用。可信上游（网关/内部认证服务/自动化）用同一密钥签 HS256 JWT，xadmin 验签后放行——适合“别处已认证、转发令牌给 xadmin”。签名为标准 RFC 7515 base64url。
+
+校验声明：`aud`（默认 `xadmin`，`XADMIN_JWT_AUDIENCE` 可改，`*`=不校验）、`iss`（可选 `XADMIN_JWT_ISSUER`）、`exp`/`nbf`（30s 容差）。`sub` 作用户名。token 可带 `role` 声明（`admin`/`viewer`）——被信任（签名即授权），缺省回退白名单。
+
+两种用法：
+
+```bash
+# API/机器：直接作 Bearer 调任意接口
+curl -H "Authorization: Bearer <jwt>" -X POST .../api/exec -d '{"target":"self","script":"return 1"}'
+# 浏览器：换会话 cookie（角色随会话保存）
+curl -X POST .../api/auth/jwt -H 'Content-Type: application/json' -d '{"token":"<jwt>"}'
+```
+
+> 不支持 RS256（真实 IdP 常用）。要完整 OIDC 请用 17.14 的 OAuth，或在前面放网关验完 RS256、再用本节 HS256 转发给 xadmin。
+
+### 17.13 访问令牌签发
+
+控制台以 admin 登录后，左侧出现 **“访问令牌”** 页：选角色（只读/可操作）、有效期、可选标识（sub），点“生成”得一张 JWT（可复制）。等价接口：
+
+```
+POST /api/tokens            # 仅 admin；需已设 XADMIN_JWT_HS256_SECRET
+{ "role": "viewer"|"admin", "ttl_seconds": 3600, "sub": "ci-bot" }
+→ { "ok":true, "token":"...", "role":"...", "sub":"...", "exp":1780..., "expires_in":3600 }
+```
+
+`ttl_seconds` 范围 60s–30 天；`sub` 限 `[A-Za-z0-9_.@-]`、≤64，留空自动生成。令牌按 17.12 使用。**令牌等同密码、到期前无法撤销（除非轮换密钥使全部失效），请用短有效期。**
+
+### 17.14 OAuth2 / OIDC（Auth Code + PKCE）
+
+让 xadmin 自己引导用户跳到外部 IdP（Google/Okta/…）交互登录。
+
+```
+XADMIN_OAUTH_PROVIDERS=google
+XADMIN_OAUTH_GOOGLE_CLIENT_ID=...
+XADMIN_OAUTH_GOOGLE_CLIENT_SECRET=...
+XADMIN_OAUTH_GOOGLE_ISSUER=https://accounts.google.com   # 走 OIDC discovery 自动取端点
+# 或显式：_AUTH_URL / _TOKEN_URL / _USERINFO_URL
+# 可选：_SCOPE（默认 openid profile email）、_REDIRECT_URI、_USERNAME_FIELD（默认 sub）、_LABEL
+```
+
+登录页出现“使用 google 登录”按钮 → `/api/auth/oauth/google/start` → IdP → 回调 `/callback`。用 Auth Code + PKCE(S256)；state 由服务端 HMAC 签名（无需服务端 state 存储），PKCE verifier 走 HttpOnly cookie 不外泄。回调用 access_token 调 userinfo 取身份，首次登录自动建影子账号，角色默认 viewer（要 admin 就把映射后的本地名加进 `XADMIN_ADMINS`）。回调地址默认 `<scheme>://<host>/api/auth/oauth/<provider>/callback`；反代后请显式设 `_REDIRECT_URI`（回跳地址依赖 Host / `X-Forwarded-Proto`）。
+
+### 17.15 mTLS（双向 TLS）
+
+```
+XADMIN_HTTPS=1
+HTTPS_CERT=demo/certs/server.crt
+HTTPS_KEY=demo/certs/server.key
+XADMIN_TLS_CA_FILE=ca.pem          # 验客户端证书的受信 CA
+```
+
+开启后 xadmin 跑 HTTPS，握手时**请求但不强制**客户端证书（`VERIFY_OPTIONAL`）——没带证书的浏览器仍能走密码/JWT/OAuth 登录。当客户端出示由该 CA 签发**且校验通过**的证书，其 subject DN 作为身份（`mtls:<DN>`，可在 `oauth_links` 表映射到本地账户）；角色默认 viewer。
+
+> `XADMIN_TLS_CA_FILE` 必须配合 `XADMIN_HTTPS=1`，否则启动**直接报错退出**（避免“以为开了 mTLS 实则未生效”）。需要二进制以 `WITH_HTTPS=1` 构建。
+
+### 17.16 本地测试与旁路开关
+
+| 开关 | 作用 | 注意 |
+|---|---|---|
+| `XADMIN_DEV_NO_AUTH=1` | 关闭**全部**认证/授权：任何请求按 admin，跳过初始化/登录，无需数据库 | 仅本地；启动打 ERROR 告警 |
+| `XADMIN_SUPER_TOKEN=<v>` | 带 `X-Xadmin-Super-Token`（或 `X-Xadmin-Token`）即无条件 admin，连初始化都跳过 | 等同 root，务必保密 |
+
+```bash
+bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_DEV_NO_AUTH=1
+# → 浏览器直接进控制台；curl 任意接口免认证
+```
+
+### 17.17 MySQL 注意事项（caching_sha2）
+
+xadmin 内置的纯 Lua MySQL 客户端**不支持** `caching_sha2_password` 的首次“完整认证”（MySQL 8 默认，含 `root`）。账号缓存为冷（服务器重启后未登录过）时连接会被关闭，初始化报 `cannot reach database: ... caching_sha2_password ...`（明确快速失败，不再是误导性的 `rpc timeout`）。
+
+解决：用 `mysql_native_password` 账号（`ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'`），或先用 mysql CLI 登录一次焐热缓存。
 
 ---
 

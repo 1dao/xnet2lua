@@ -68,7 +68,7 @@ ifeq ($(SANITIZE),asan)
 else
     TARGET_LIB := lib$(LIB_NAME).a
 endif
-CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c
+CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c xshared.c
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
 
@@ -88,8 +88,12 @@ else
 endif
 
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
-XNET_CFLAGS := -I3rd/libdeflate
+# mbedTLS hash primitives (sha1/sha256/sha512/md5 + platform_util) are
+# self-contained -- no SSL/x509/PSA deps -- so xutils exports them on EVERY
+# build (see xlua/lua_xutils.c). The include path is therefore always needed.
+XNET_CFLAGS := -I3rd/libdeflate -I3rd/mbedtls3/include
 XNET_HTTPS_SRC :=
+XNET_CRYPTO_SRC :=
 
 # Pick libdeflate's per-arch cpu_features.c based on the host machine.
 # crc32.c et al. resolve libdeflate_{arm,x86}_cpu_features at link time,
@@ -108,7 +112,7 @@ else
 endif
 XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) $(XNET_CPU_FEATURES_SRC)
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
-XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c
+XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c xlua/lua_xshared.c
 XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=
@@ -152,9 +156,15 @@ ifneq ($(OS),Windows_NT)
 endif
 endif
 
+# WITH_HTTPS=1 compiles the whole mbedTLS library (which already contains the
+# hash files). WITH_HTTPS=0 still needs the hash subset for xutils, so add just
+# those files -- guarded so we never compile them twice (duplicate symbols).
 ifeq ($(WITH_HTTPS),1)
-	XNET_CFLAGS += -I3rd/mbedtls3/include
 	XNET_HTTPS_SRC := $(wildcard 3rd/mbedtls3/library/*.c)
+else
+	XNET_CRYPTO_SRC := 3rd/mbedtls3/library/sha1.c 3rd/mbedtls3/library/sha256.c \
+		3rd/mbedtls3/library/sha512.c 3rd/mbedtls3/library/md5.c \
+		3rd/mbedtls3/library/platform_util.c
 endif
 
 XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
@@ -198,9 +208,9 @@ $(TARGET_LIB): $(CORE_OBJS)
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
+$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(OBJ_DIR):

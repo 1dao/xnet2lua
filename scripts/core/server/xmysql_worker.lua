@@ -3,6 +3,7 @@
 
 local unpack_args = table.unpack or unpack
 local router = dofile('scripts/core/share/xrouter.lua')
+local xutils = require('xutils')   -- C-backed sha1/sha256 (always linked)
 router.set_log_prefix('XMYSQL-WORKER')
 
 local config = {
@@ -21,6 +22,13 @@ local conns = {}
 local waitq = {}
 local rr = 1
 local stopping = false
+-- Set when a connection fails for a reason that retrying cannot fix (bad
+-- credentials, an unsupported auth plugin, or caching_sha2_password full
+-- authentication which this client can't perform). We then fail queued/new
+-- requests immediately with this reason instead of letting them hang until the
+-- caller's RPC timeout fires and reports a misleading "rpc timeout". Cleared on
+-- every (re)start of the pool so corrected credentials get a fresh attempt.
+local fatal_auth_error = nil
 function xthread.register(pt, h) return router.register(pt, h) end
 
 local function resume_request(req, ...)
@@ -188,9 +196,6 @@ local function int4(n)
     return bchr(bit_band(n, 0xff), bit_band(bit_rshift(n, 8), 0xff), bit_band(bit_rshift(n, 16), 0xff), bit_band(bit_rshift(n, 24), 0xff))
 end
 
-local function be32(n)
-    return bchr(bit_band(bit_rshift(n, 24), 0xff), bit_band(bit_rshift(n, 16), 0xff), bit_band(bit_rshift(n, 8), 0xff), bit_band(n, 0xff))
-end
 
 local function read_null(data, pos)
     local p = string.find(data, '\0', pos, true)
@@ -252,149 +257,16 @@ local function xor_string(a, b)
     return table.concat(out)
 end
 
-local function add32(...)
-    local sum = 0
-    for i = 1, select('#', ...) do
-        sum = to_u32(sum + select(i, ...))
-    end
-    return sum
-end
-
-local function rol(x, n)
-    n = n % 32
-    if n == 0 then return to_u32(x) end
-    return bit_bor(bit_lshift(x, n), bit_rshift(x, 32 - n))
-end
-
-local function ror(x, n)
-    n = n % 32
-    if n == 0 then return to_u32(x) end
-    return bit_bor(bit_rshift(x, n), bit_lshift(x, 32 - n))
-end
-
+-- SHA-1 / SHA-256 are provided by the C xutils module (mbedTLS-backed, linked
+-- on every build). These thin wrappers keep the rest of the worker unchanged.
+-- The bit-op shim above is still used by the little-endian MySQL packet codecs
+-- (int1/int3/int4), so it stays.
 local function sha1(msg)
-    local ml = #msg * 8
-    msg = msg .. '\128'
-    while (#msg % 64) ~= 56 do
-        msg = msg .. '\0'
-    end
-    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(bit_band(ml, MASK32))
-
-    local h0, h1, h2, h3, h4 =
-        0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0
-
-    for chunk = 1, #msg, 64 do
-        local w = {}
-        for i = 0, 15 do
-            local p = chunk + i * 4
-            w[i] = bit_bor(
-                bit_lshift(byte_at(msg, p), 24),
-                bit_lshift(byte_at(msg, p + 1), 16),
-                bit_lshift(byte_at(msg, p + 2), 8),
-                byte_at(msg, p + 3)
-            )
-        end
-        for i = 16, 79 do
-            w[i] = rol(bit_bxor(w[i - 3], w[i - 8], w[i - 14], w[i - 16]), 1)
-        end
-
-        local a, b, c, d, e = h0, h1, h2, h3, h4
-        for i = 0, 79 do
-            local f, k
-            if i < 20 then
-                f = bit_bor(bit_band(b, c), bit_band(bit_bnot(b), d))
-                k = 0x5a827999
-            elseif i < 40 then
-                f = bit_bxor(b, c, d)
-                k = 0x6ed9eba1
-            elseif i < 60 then
-                f = bit_bor(bit_band(b, c), bit_band(b, d), bit_band(c, d))
-                k = 0x8f1bbcdc
-            else
-                f = bit_bxor(b, c, d)
-                k = 0xca62c1d6
-            end
-            local temp = add32(rol(a, 5), f, e, k, w[i])
-            e, d, c, b, a = d, c, rol(b, 30), a, temp
-        end
-
-        h0, h1, h2, h3, h4 =
-            add32(h0, a), add32(h1, b), add32(h2, c), add32(h3, d), add32(h4, e)
-    end
-
-    return be32(h0) .. be32(h1) .. be32(h2) .. be32(h3) .. be32(h4)
+    return xutils.sha1(tostring(msg or ''))
 end
-
-local K256 = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
-    0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
-    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
-    0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-    0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
-    0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
-    0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
-    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-}
 
 local function sha256(msg)
-    local ml = #msg * 8
-    msg = msg .. '\128'
-    while (#msg % 64) ~= 56 do
-        msg = msg .. '\0'
-    end
-    msg = msg .. be32(math.floor(ml / 0x100000000)) .. be32(bit_band(ml, MASK32))
-
-    local h = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    }
-
-    for chunk = 1, #msg, 64 do
-        local w = {}
-        for i = 0, 15 do
-            local p = chunk + i * 4
-            w[i] = bit_bor(
-                bit_lshift(byte_at(msg, p), 24),
-                bit_lshift(byte_at(msg, p + 1), 16),
-                bit_lshift(byte_at(msg, p + 2), 8),
-                byte_at(msg, p + 3)
-            )
-        end
-        for i = 16, 63 do
-            local s0 = bit_bxor(ror(w[i - 15], 7), ror(w[i - 15], 18), bit_rshift(w[i - 15], 3))
-            local s1 = bit_bxor(ror(w[i - 2], 17), ror(w[i - 2], 19), bit_rshift(w[i - 2], 10))
-            w[i] = add32(w[i - 16], s0, w[i - 7], s1)
-        end
-
-        local a, b, c, d, e, f, g, hh =
-            h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]
-        for i = 0, 63 do
-            local s1 = bit_bxor(ror(e, 6), ror(e, 11), ror(e, 25))
-            local ch = bit_bxor(bit_band(e, f), bit_band(bit_bnot(e), g))
-            local temp1 = add32(hh, s1, ch, K256[i + 1], w[i])
-            local s0 = bit_bxor(ror(a, 2), ror(a, 13), ror(a, 22))
-            local maj = bit_bxor(bit_band(a, b), bit_band(a, c), bit_band(b, c))
-            local temp2 = add32(s0, maj)
-            hh, g, f, e, d, c, b, a = g, f, e, add32(d, temp1), c, b, a, add32(temp1, temp2)
-        end
-
-        h[1], h[2], h[3], h[4] = add32(h[1], a), add32(h[2], b), add32(h[3], c), add32(h[4], d)
-        h[5], h[6], h[7], h[8] = add32(h[5], e), add32(h[6], f), add32(h[7], g), add32(h[8], hh)
-    end
-
-    local out = {}
-    for i = 1, 8 do
-        out[i] = be32(h[i])
-    end
-    return table.concat(out)
+    return xutils.sha256(tostring(msg or ''))
 end
 
 local function auth_token(plugin, password, seed)
@@ -731,6 +603,13 @@ local function mark_ready(c)
     flush_waiting()
 end
 
+local function fail_auth(c, reason)
+    -- Non-retryable auth failure: remember it so queued/new requests fail fast
+    -- with this reason rather than hanging until the caller's RPC timeout.
+    fatal_auth_error = reason
+    close_conn(c, reason)
+end
+
 local function handle_auth_packet(c, pkt)
     local payload = pkt.payload
     local tag = byte_at(payload, 1)
@@ -739,7 +618,7 @@ local function handle_auth_packet(c, pkt)
         return
     end
     if tag == 0xff then
-        close_conn(c, parse_err(payload))
+        fail_auth(c, parse_err(payload))
         return
     end
     if tag == 0xfe then
@@ -750,7 +629,7 @@ local function handle_auth_packet(c, pkt)
         end
         local token, err = auth_token(plugin, config.password, seed)
         if not token then
-            close_conn(c, err)
+            fail_auth(c, err)
             return
         end
         c.auth_plugin = plugin
@@ -769,11 +648,15 @@ local function handle_auth_packet(c, pkt)
                 c.conn:send_raw(pack_packet('', pkt.seq + 1))
                 return
             end
-            close_conn(c, 'caching_sha2 full auth requires TLS/RSA and is not implemented')
+            fail_auth(c, "MySQL account uses caching_sha2_password and requires "
+                .. "first-time full authentication, which this client does not "
+                .. "support. Use an account with mysql_native_password "
+                .. "(ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'), "
+                .. "or pre-authenticate once with the mysql CLI to warm the cache.")
             return
         end
     end
-    close_conn(c, 'unexpected auth packet')
+    fail_auth(c, 'unexpected auth packet')
 end
 
 local function handle_query_packet(c, pkt)
@@ -897,7 +780,16 @@ local function connect_one(c)
         c.conn = nil
         c.phase = 'closed'
         fail_conn_pending(c, reason or 'mysql connection closed')
-        if not stopping then
+        if fatal_auth_error then
+            -- Don't leave queued requests hanging until the caller times out;
+            -- surface the real reason now. Also stop retrying -- reconnecting
+            -- would just hit the same auth failure in a 1s loop.
+            local q = waitq
+            waitq = {}
+            for _, req in ipairs(q) do
+                fail_request(req, fatal_auth_error)
+            end
+        elseif not stopping then
             c.retry_at = os.time() + math.max(1, math.floor(config.reconnect_ms / 1000))
         end
         print(string.format('[XMYSQL-WORKER] close[%d]: %s', c.index, tostring(reason)))
@@ -924,6 +816,7 @@ local function start_pool(host, port, user, password, database, pool_size, recon
     config.max_packet = tonumber(max_packet) or config.max_packet
     config.charset = tonumber(charset) or config.charset
     stopping = false
+    fatal_auth_error = nil   -- fresh credentials get a fresh attempt
 
     for i = 1, config.pool_size do
         local c = {
@@ -975,10 +868,27 @@ xthread.register('xmysql_stop', function(silent)
     stop_pool(silent)
 end)
 
+-- In-place pool reconfigure: close the current connections and reconnect with
+-- new credentials WITHOUT destroying this thread (see xmysql.reconfigure). Used
+-- by the xadmin setup flow so changing DB settings at runtime doesn't require a
+-- thread shutdown (which corrupts other threads' poll state).
+xthread.register('xmysql_restart', function(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
+    print(string.format('[XMYSQL-WORKER] restart (in-place) %s:%s user=%s db=%s',
+        tostring(host), tostring(port), tostring(user),
+        database ~= '' and tostring(database) or '(none)'))
+    stop_pool(true)
+    start_pool(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
+end)
+
 xthread.register('xmysql_query', function(sql)
     local req = router.current_request()
     if not req then
         return false, 'xmysql rpc context missing'
+    end
+    if fatal_auth_error then
+        -- Pool can't authenticate; fail fast with the real reason instead of
+        -- queueing forever (and reporting a misleading rpc timeout).
+        return false, fatal_auth_error
     end
     req.sql = tostring(sql)
     req.payload = int1(0x03) .. req.sql
@@ -997,7 +907,7 @@ local function __update()
     -- callback only handles Lua-side reconnect timers.
     local now = os.time()
     for _, c in ipairs(conns) do
-        if not stopping and not c.connected and not c.connecting and c.retry_at > 0 and now >= c.retry_at then
+        if not stopping and not fatal_auth_error and not c.connected and not c.connecting and c.retry_at > 0 and now >= c.retry_at then
             c.retry_at = 0
             connect_one(c)
         end

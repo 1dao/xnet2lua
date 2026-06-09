@@ -86,6 +86,13 @@ LUA_API int luaopen_xnet(lua_State *L);
 LUA_API int luaopen_xutils(lua_State *L);
 LUA_API int luaopen_xtimer(lua_State *L);
 LUA_API int luaopen_xcompress(lua_State *L);
+LUA_API int luaopen_xshared(lua_State *L);
+
+/* xshared registry lifecycle (xshared.c) -- dicts are created from Lua at boot
+** and live in a process-global registry; free them once at shutdown.
+** xshared_tick() is the main-thread expiry sweep (self-throttled). */
+void xshared_shutdown(void);
+void xshared_tick(void);
 
 typedef struct {
     lua_State* L;
@@ -213,6 +220,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xcompress", luaopen_xcompress, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xshared", luaopen_xshared, 1);
     lua_pop(L, 1);
 }
 
@@ -465,6 +475,7 @@ static void main_update(MainLuaData* data) {
 
     int residual = main_auto_drive(data->tick_ms);
     xthread_update(residual);
+    xshared_tick();   /* main-thread expiry sweep; self-throttled, no-op if idle */
 }
 
 static void main_uninit(MainLuaData* data) {
@@ -571,6 +582,7 @@ int main(int argc, char** argv) {
 
     main_uninit(data);
     xthread_uninit();
+    xshared_shutdown();   /* workers joined; free shared dicts before rpmalloc */
     xargs_cleanup();
     xdebug_shutdown();
     xlog_uninit();
