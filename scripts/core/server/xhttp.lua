@@ -5,6 +5,8 @@
 local M = rawget(_G, 'xhttp')
 if type(M) ~= 'table' then M = {} end
 
+local to_bool = dofile('scripts/core/share/xmisc.lua').to_bool
+
 local DEFAULT_WORKER_SCRIPT = 'scripts/core/server/xhttp_worker.lua'
 
 local STATE_KEY = '__xnet_xhttp_state'
@@ -16,17 +18,6 @@ end
 if state.running == nil then state.running = false end
 if type(state.workers) ~= 'table' then state.workers = {} end
 if state.rr_index == nil then state.rr_index = 0 end
-
-local function to_bool(v, default)
-    if v == nil then return default end
-    if v == true or v == 1 or v == '1' or v == 'true' or v == 'yes' or v == 'on' then
-        return true
-    end
-    if v == false or v == 0 or v == '0' or v == 'false' or v == 'no' or v == 'off' then
-        return false
-    end
-    return default
-end
 
 local function build_workers(cfg)
     if type(cfg.workers) == 'table' and #cfg.workers > 0 then
@@ -66,12 +57,22 @@ local function normalize_config(cfg)
         cert_file = cfg.cert_file or cfg.cert or '',
         key_file = cfg.key_file or cfg.key or '',
         key_password = cfg.key_password or cfg.password or '',
+        ca_file = cfg.ca_file or '',
         max_request_size = tonumber(cfg.max_request_size) or 16 * 1024 * 1024,
         compress_enabled  = to_bool(compr.enabled, true),
         compress_min_size = tonumber(compr.min_size) or 256,
         compress_level    = tonumber(compr.level) or 6,
         decompress_requests = to_bool(cfg.decompress_requests, true),
         max_decompressed_size = max_decompressed_size,
+        -- HTTP -> HTTPS upgrade: when force_https is set on a plaintext server,
+        -- every request is answered with a redirect to redirect_port over https.
+        -- hsts (Strict-Transport-Security) is emitted on HTTPS responses and on
+        -- the redirect; accepts bool / number / string / table (see
+        -- xhttp_codec.hsts_value).
+        force_https     = to_bool(cfg.force_https, false),
+        redirect_port   = tonumber(cfg.redirect_port or cfg.https_port) or 443,
+        redirect_status = tonumber(cfg.redirect_status) or 301,
+        hsts            = cfg.hsts,
         workers = build_workers(cfg),
     }
 end
@@ -135,7 +136,14 @@ function M.start(cfg)
             conf.app_script, conf.max_request_size, conf.server_name,
             conf.https, conf.cert_file, conf.key_file, conf.key_password,
             conf.compress_enabled, conf.compress_min_size, conf.compress_level,
-            conf.decompress_requests, conf.max_decompressed_size)
+            conf.decompress_requests, conf.max_decompressed_size,
+            conf.ca_file,
+            {
+                force_https     = conf.force_https,
+                redirect_port   = conf.redirect_port,
+                redirect_status = conf.redirect_status,
+                hsts            = conf.hsts,
+            })
         if not ok then
             shutdown_workers()
             return false, err

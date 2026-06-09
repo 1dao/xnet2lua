@@ -9,6 +9,7 @@ local xcompress = require('xcompress')
 -- ============================================================================
 
 M.STATUS_TEXT = {
+    [101] = 'Switching Protocols',
     [200] = 'OK',
     [201] = 'Created',
     [202] = 'Accepted',
@@ -16,10 +17,14 @@ M.STATUS_TEXT = {
     [301] = 'Moved Permanently',
     [302] = 'Found',
     [304] = 'Not Modified',
+    [307] = 'Temporary Redirect',
+    [308] = 'Permanent Redirect',
     [400] = 'Bad Request',
+    [403] = 'Forbidden',
     [404] = 'Not Found',
     [405] = 'Method Not Allowed',
     [413] = 'Payload Too Large',
+    [426] = 'Upgrade Required',
     [500] = 'Internal Server Error',
     [501] = 'Not Implemented',
 }
@@ -597,6 +602,74 @@ function M.decompress_body(body, encoding, max_size)
     return nil, 'unsupported encoding: ' .. encoding
 end
 
+-- ============================================================================
+-- HTTP -> HTTPS upgrade helpers (force-HTTPS redirect + HSTS)
+-- ============================================================================
+--
+-- "Upgrading" a plaintext HTTP service to HTTPS in practice means two things:
+--   1. redirect plaintext requests to the https:// URL, and
+--   2. tell compliant clients to stick to HTTPS via HSTS
+--      (Strict-Transport-Security).
+-- (RFC 2817 "Upgrade: TLS" exists but no browser implements it, so the
+-- redirect + HSTS pair is the real-world mechanism.) The xhttp worker can apply
+-- both from config; these helpers are also usable directly from app handlers.
+
+-- Build a Strict-Transport-Security header value from a flexible spec:
+--   true            -> 'max-age=31536000'            (1 year)
+--   <number>        -> 'max-age=<number>'
+--   '<string>'      -> used verbatim
+--   { max_age=, include_subdomains=, preload= }
+function M.hsts_value(spec)
+    if spec == nil or spec == false then return nil end
+    if spec == true then return 'max-age=31536000' end
+    if type(spec) == 'number' then return 'max-age=' .. tostring(math.floor(spec)) end
+    if type(spec) == 'string' then return spec end
+    if type(spec) == 'table' then
+        local age = tonumber(spec.max_age) or 31536000
+        local v = 'max-age=' .. tostring(math.floor(age))
+        if spec.include_subdomains then v = v .. '; includeSubDomains' end
+        if spec.preload then v = v .. '; preload' end
+        return v
+    end
+    return 'max-age=31536000'
+end
+
+-- Compute the https:// URL a plaintext request should be redirected to. Host is
+-- taken from req.headers.host (port stripped) unless opts.host overrides it;
+-- the port is appended only when it is not the default 443.
+function M.https_url(req, opts)
+    opts = opts or {}
+    local host = opts.host
+        or (req.headers and req.headers['host'])
+        or 'localhost'
+    host = tostring(host):gsub(':%d+$', '')   -- strip any :port (keeps [ipv6])
+    local port = tonumber(opts.https_port or opts.port)
+    local hostport = host
+    if port and port ~= 443 then
+        hostport = host .. ':' .. tostring(port)
+    end
+    local target = req.target or req.path or '/'
+    if target == '' then target = '/' end
+    return 'https://' .. hostport .. target
+end
+
+-- Build a redirect response table to the https:// version of req.
+--   opts.status     -- 301 (default), 302, 307 or 308
+--   opts.https_port -- target HTTPS port (default 443)
+--   opts.host       -- override Host
+--   opts.hsts       -- HSTS spec (see hsts_value); included on the redirect too
+function M.https_redirect(req, opts)
+    opts = opts or {}
+    local headers = { ['Location'] = M.https_url(req, opts) }
+    local hsts = M.hsts_value(opts.hsts)
+    if hsts then headers['Strict-Transport-Security'] = hsts end
+    return {
+        status  = tonumber(opts.status) or 301,
+        headers = headers,
+        body    = opts.body or '',
+    }
+end
+
 function M.normalize_response(req, resp, opts)
     opts = opts or {}
     if resp == nil then
@@ -622,6 +695,13 @@ function M.normalize_response(req, resp, opts)
 
     headers['Server'] = headers['Server'] or opts.server_name or 'xnet-http'
     headers['Connection'] = headers['Connection'] or (req.keep_alive and 'keep-alive' or 'close')
+
+    -- HSTS: ask compliant clients to use HTTPS for future requests. Only
+    -- meaningful over TLS, so the worker passes opts.hsts on HTTPS responses.
+    if opts.hsts and not headers['Strict-Transport-Security'] then
+        local hv = M.hsts_value(opts.hsts)
+        if hv then headers['Strict-Transport-Security'] = hv end
+    end
 
     if file_path then
         local f = io.open(file_path, 'rb')

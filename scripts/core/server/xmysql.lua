@@ -51,8 +51,20 @@ function M.start(cfg)
     return true
 end
 
+-- xthread.rpc yields back three values: (channel_ok, app_ok, result).
+--   channel_ok == false -> the RPC itself failed; app_ok holds the reason.
+--   channel_ok == true  -> the xmysql_query handler returned (app_ok, result),
+--                          where result is the row set / OK-packet table, or an
+--                          error string when app_ok is false.
+-- Collapse that to the documented (ok, result) so callers don't accidentally
+-- read the channel flag as the result (which surfaced as queries returning
+-- boolean `true` and "attempt to index a boolean value" downstream).
 function M.query(sql)
-    return xthread.rpc(MYSQL_ID, 'xmysql_query', 0, sql)
+    local channel_ok, app_ok, result = xthread.rpc(MYSQL_ID, 'xmysql_query', 0, sql)
+    if not channel_ok then
+        return false, tostring(app_ok or 'mysql rpc failed')
+    end
+    return app_ok and true or false, result
 end
 
 M.call = M.query
@@ -73,6 +85,25 @@ function M.post(cb, sql)
     end)
 
     local ok, err = coroutine.resume(co)
+    if not ok then
+        return false, err
+    end
+    return true
+end
+
+-- Re-point the *running* pool at new credentials without tearing down the
+-- worker thread. Calling xthread.shutdown_thread on the live MySQL thread
+-- corrupts the shared poll state of other threads (they spin on closed fds), so
+-- code that changes DB settings at runtime (e.g. the xadmin setup flow) MUST
+-- use this rather than stop() + start(). Falls back to start() if not running.
+function M.reconfigure(cfg)
+    if not running then
+        return M.start(cfg)
+    end
+    local conf = normalize_config(cfg)
+    local ok, err = xthread.post(MYSQL_ID, 'xmysql_restart',
+        conf.host, conf.port, conf.user, conf.password, conf.database,
+        conf.pool_size, conf.reconnect_ms, conf.max_packet, conf.charset)
     if not ok then
         return false, err
     end

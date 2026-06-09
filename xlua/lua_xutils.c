@@ -26,6 +26,14 @@
 #else
 #include <dirent.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/attr.h>
+#include <sys/vnode.h>
+#elif defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 #if defined(LUA_EMBEDDED)
@@ -40,6 +48,15 @@
 ** preprocessed before xmacro.h takes effect. xmacro.h goes last. */
 #include "../3rd/yyjson.h"
 #include "xargs.h"
+
+/* mbedTLS hash primitives. These four files are self-contained (no SSL / x509 /
+** PSA dependencies), so the build links them on every configuration -- HTTPS or
+** not -- and xutils exposes sha1/sha256/sha512/md5 + HMAC unconditionally.
+** Pure declarations, safe to include before xmacro.h. */
+#include "mbedtls/sha1.h"
+#include "mbedtls/sha256.h"
+#include "mbedtls/sha512.h"
+#include "mbedtls/md5.h"
 
 #include "../xmacro.h"   /* malloc/free → rpmalloc; must be last include */
 
@@ -510,101 +527,295 @@ static void scan_dir_push_file(lua_State *L, int table_idx, int *count,
 
 static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
                               const char *dir, const char *rel,
-                              char *errbuf, size_t errcap) {
-#ifdef _WIN32
-    char *pattern = path_join_dup(dir, "*");
-    if (!pattern) {
+                              char *errbuf, size_t errcap);
+
+/* Build the child paths, then recurse into directories or record regular
+** files. Shared by every platform backend so the path/Lua-table bookkeeping
+** lives in exactly one place. */
+static int scan_dir_handle_entry(lua_State *L, int table_idx, int *count,
+                                 const char *dir, const char *rel,
+                                 const char *name, int is_dir, int is_reg,
+                                 char *errbuf, size_t errcap) {
+    if (!is_dir && !is_reg) return 0;
+
+    char *full = path_join_dup(dir, name);
+    char *child_rel = rel_join_dup(rel, name);
+    if (!full || !child_rel) {
+        free(full);
+        free(child_rel);
         snprintf(errbuf, errcap, "out of memory");
         return -1;
     }
 
-    WIN32_FIND_DATAA data;
-    HANDLE h = FindFirstFileA(pattern, &data);
-    free(pattern);
+    int rc = 0;
+    if (is_dir) {
+        rc = scan_dir_recursive(L, table_idx, count, full, child_rel,
+                                errbuf, errcap);
+    } else {
+        scan_dir_push_file(L, table_idx, count, full, child_rel);
+    }
+    free(full);
+    free(child_rel);
+    return rc;
+}
+
+#define SCAN_DIR_NAME_DOTS(n) \
+    ((n)[0] == '.' && ((n)[1] == '\0' || ((n)[1] == '.' && (n)[2] == '\0')))
+#define SCAN_DIR_BUF (64 * 1024)
+
+/* Each backend below enumerates `dir` with the fastest documented bulk API for
+** its platform, classifies every child as directory / regular / other, and
+** defers the recurse-or-record decision to scan_dir_handle_entry. Symlinks are
+** followed so behaviour matches the historical stat()-based scan. */
+
+#if defined(_WIN32)
+/* Windows: GetFileInformationByHandleEx fills a whole buffer of entries per
+** call (vs FindFirstFile's one-at-a-time) and FILE_ID_BOTH_DIR_INFO carries
+** the attributes inline, so there is no extra stat/GetFileAttributes per child.
+** Names stay in the system ANSI code page to match the narrow fopen() that
+** ultimately serves these paths (xchannel_send_file_raw). */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    HANDLE h = CreateFileA(dir, FILE_LIST_DIRECTORY,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
     if (h == INVALID_HANDLE_VALUE) {
         snprintf(errbuf, errcap, "cannot open directory: %s", dir);
         return -1;
     }
 
-    do {
-        const char *name = data.cFileName;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+    void *buf = malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        CloseHandle(h);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
+    }
 
-        char *full = path_join_dup(dir, name);
-        char *child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            FindClose(h);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                FindClose(h);
-                return -1;
+    int rc = 0;
+    while (GetFileInformationByHandleEx(h, FileIdBothDirectoryInfo,
+                                        buf, SCAN_DIR_BUF)) {
+        FILE_ID_BOTH_DIR_INFO *info = (FILE_ID_BOTH_DIR_INFO *)buf;
+        for (;;) {
+            char name[1024];
+            int wlen = (int)(info->FileNameLength / sizeof(WCHAR));
+            int nlen = WideCharToMultiByte(CP_ACP, 0, info->FileName, wlen,
+                                           name, (int)sizeof(name) - 1,
+                                           NULL, NULL);
+            if (nlen > 0) {
+                name[nlen] = '\0';
+                if (!SCAN_DIR_NAME_DOTS(name)) {
+                    int is_dir = (info->FileAttributes &
+                                  FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                               name, is_dir, !is_dir,
+                                               errbuf, errcap);
+                }
             }
-        } else {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
+            if (rc != 0 || info->NextEntryOffset == 0) break;
+            info = (FILE_ID_BOTH_DIR_INFO *)((char *)info +
+                                             info->NextEntryOffset);
         }
-        free(full);
-        free(child_rel);
-    } while (FindNextFileA(h, &data));
+        if (rc != 0) break;
+    }
 
-    FindClose(h);
-    return 0;
-#else
-    DIR *d = opendir(dir);
-    if (!d) {
+    if (rc == 0 && GetLastError() != ERROR_NO_MORE_FILES) {
+        snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+        rc = -1;
+    }
+
+    free(buf);
+    CloseHandle(h);
+    return rc;
+}
+
+#elif defined(__APPLE__)
+/* macOS: getattrlistbulk returns a bufferful of entries with name + object
+** type inline, replacing readdir + per-entry stat/getattrlist. */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    int fd = open(dir, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
         snprintf(errbuf, errcap, "cannot open directory: %s", dir);
         return -1;
     }
 
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        const char *name = ent->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
-
-        char *full = path_join_dup(dir, name);
-        char *child_rel = rel_join_dup(rel, name);
-        if (!full || !child_rel) {
-            free(full);
-            free(child_rel);
-            closedir(d);
-            snprintf(errbuf, errcap, "out of memory");
-            return -1;
-        }
-
-        struct stat st;
-        if (stat(full, &st) != 0) {
-            free(full);
-            free(child_rel);
-            continue;
-        }
-
-        if (S_ISDIR(st.st_mode)) {
-            if (scan_dir_recursive(L, table_idx, count, full, child_rel,
-                                   errbuf, errcap) != 0) {
-                free(full);
-                free(child_rel);
-                closedir(d);
-                return -1;
-            }
-        } else if (S_ISREG(st.st_mode)) {
-            scan_dir_push_file(L, table_idx, count, full, child_rel);
-        }
-        free(full);
-        free(child_rel);
+    char *buf = (char *)malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        close(fd);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
     }
 
-    closedir(d);
-    return 0;
-#endif
+    struct attrlist al;
+    memset(&al, 0, sizeof(al));
+    al.bitmapcount = ATTR_BIT_MAP_COUNT;
+    al.commonattr  = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+
+    int rc = 0;
+    for (;;) {
+        int n = getattrlistbulk(fd, &al, buf, SCAN_DIR_BUF, 0);
+        if (n < 0) {
+            snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+            rc = -1;
+            break;
+        }
+        if (n == 0) break;
+
+        char *entry = buf;
+        for (int i = 0; i < n && rc == 0; i++) {
+            char *field = entry;
+            uint32_t length;
+            memcpy(&length, field, sizeof(length));
+            char *next = entry + length;
+            field += sizeof(uint32_t);
+
+            /* Attributes follow in bitmap order, RETURNED_ATTRS always first. */
+            attribute_set_t returned;
+            memcpy(&returned, field, sizeof(returned));
+            field += sizeof(returned);
+
+            const char *name = NULL;
+            if (returned.commonattr & ATTR_CMN_NAME) {
+                attrreference_t ref;
+                memcpy(&ref, field, sizeof(ref));
+                name = field + ref.attr_dataoffset;
+                field += sizeof(ref);
+            }
+            fsobj_type_t objtype = VNON;
+            if (returned.commonattr & ATTR_CMN_OBJTYPE) {
+                memcpy(&objtype, field, sizeof(objtype));
+                field += sizeof(objtype);
+            }
+
+            entry = next;
+            if (!name || SCAN_DIR_NAME_DOTS(name)) continue;
+
+            int is_dir = (objtype == VDIR);
+            int is_reg = (objtype == VREG);
+            if (objtype == VLNK) {
+                struct stat st;
+                if (fstatat(fd, name, &st, 0) != 0) continue;
+                is_dir = S_ISDIR(st.st_mode);
+                is_reg = S_ISREG(st.st_mode);
+            }
+            rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                       name, is_dir, is_reg, errbuf, errcap);
+        }
+        if (rc != 0) break;
+    }
+
+    free(buf);
+    close(fd);
+    return rc;
 }
+
+#elif defined(__linux__)
+/* Linux/Android: getdents64 returns many entries per syscall and d_type gives
+** the kind without a stat. Only DT_UNKNOWN / DT_LNK fall back to fstatat, which
+** follows the link to match the previous stat()-based behaviour. */
+struct scan_dirent64 {
+    uint64_t       d_ino;
+    int64_t        d_off;
+    unsigned short d_reclen;
+    unsigned char  d_type;
+    char           d_name[];
+};
+
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    int fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
+        return -1;
+    }
+
+    char *buf = (char *)malloc(SCAN_DIR_BUF);
+    if (!buf) {
+        close(fd);
+        snprintf(errbuf, errcap, "out of memory");
+        return -1;
+    }
+
+    int rc = 0;
+    for (;;) {
+        long n = syscall(SYS_getdents64, fd, buf, SCAN_DIR_BUF);
+        if (n < 0) {
+            snprintf(errbuf, errcap, "cannot read directory: %s", dir);
+            rc = -1;
+            break;
+        }
+        if (n == 0) break;
+
+        for (long off = 0; off < n && rc == 0; ) {
+            struct scan_dirent64 *d = (struct scan_dirent64 *)(buf + off);
+            const char *name = d->d_name;
+            unsigned char type = d->d_type;
+            off += d->d_reclen;
+
+            if (SCAN_DIR_NAME_DOTS(name)) continue;
+
+            int is_dir, is_reg;
+            if (type == DT_DIR) { is_dir = 1; is_reg = 0; }
+            else if (type == DT_REG) { is_dir = 0; is_reg = 1; }
+            else {
+                struct stat st;
+                if (fstatat(fd, name, &st, 0) != 0) continue;
+                is_dir = S_ISDIR(st.st_mode);
+                is_reg = S_ISREG(st.st_mode);
+            }
+            rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                       name, is_dir, is_reg, errbuf, errcap);
+        }
+        if (rc != 0) break;
+    }
+
+    free(buf);
+    close(fd);
+    return rc;
+}
+
+#else
+/* Generic POSIX (BSD, etc.): readdir with d_type when the filesystem provides
+** it, fstatat otherwise -- still avoids the per-entry stat in the common case. */
+static int scan_dir_recursive(lua_State *L, int table_idx, int *count,
+                              const char *dir, const char *rel,
+                              char *errbuf, size_t errcap) {
+    DIR *dp = opendir(dir);
+    if (!dp) {
+        snprintf(errbuf, errcap, "cannot open directory: %s", dir);
+        return -1;
+    }
+    int dfd = dirfd(dp);
+
+    int rc = 0;
+    struct dirent *ent;
+    while (rc == 0 && (ent = readdir(dp)) != NULL) {
+        const char *name = ent->d_name;
+        if (SCAN_DIR_NAME_DOTS(name)) continue;
+
+        int is_dir = 0, is_reg = 0;
+#ifdef DT_DIR
+        if (ent->d_type == DT_DIR)      { is_dir = 1; }
+        else if (ent->d_type == DT_REG) { is_reg = 1; }
+        else
+#endif
+        {
+            struct stat st;
+            if (fstatat(dfd, name, &st, 0) != 0) continue;
+            is_dir = S_ISDIR(st.st_mode);
+            is_reg = S_ISREG(st.st_mode);
+        }
+        rc = scan_dir_handle_entry(L, table_idx, count, dir, rel,
+                                   name, is_dir, is_reg, errbuf, errcap);
+    }
+
+    closedir(dp);
+    return rc;
+}
+#endif
 
 static int l_util_scan_dir(lua_State *L) {
     const char *root = luaL_checkstring(L, 1);
@@ -622,12 +833,247 @@ static int l_util_scan_dir(lua_State *L) {
     return 1;
 }
 
+/* ==========================================================================
+** Hashing / HMAC / base64 / hex
+**
+** Backed by the self-contained mbedTLS hash files (linked on every build).
+** base64 and hex are implemented here directly -- they need no crypto lib.
+** These replace the per-module pure-Lua copies (xsha2, websocket handshake,
+** MySQL auth, JWT/PKCE base64url) with one C implementation.
+** ======================================================================== */
+
+/* Suppress warn_unused_result on the mbedTLS calls (they can't fail for these
+** one-shot/streaming uses with valid args). */
+#define XU_MB(call) do { int _rc = (call); (void)_rc; } while (0)
+
+static const char XU_HEXD[] = "0123456789abcdef";
+
+static void xu_push_hex(lua_State *L, const unsigned char *p, size_t n) {
+    luaL_Buffer b;
+    char *out = luaL_buffinitsize(L, &b, n * 2);
+    for (size_t i = 0; i < n; i++) {
+        out[i * 2]     = XU_HEXD[(p[i] >> 4) & 0xf];
+        out[i * 2 + 1] = XU_HEXD[p[i] & 0xf];
+    }
+    luaL_pushresultsize(&b, n * 2);
+}
+
+static int xu_hexval(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* --- one-shot hashes, unified (in, len, out) signature ----------------- */
+static void mb_sha1  (const unsigned char *in, size_t n, unsigned char *o) { XU_MB(mbedtls_sha1(in, n, o)); }
+static void mb_sha256(const unsigned char *in, size_t n, unsigned char *o) { XU_MB(mbedtls_sha256(in, n, o, 0)); }
+static void mb_sha512(const unsigned char *in, size_t n, unsigned char *o) { XU_MB(mbedtls_sha512(in, n, o, 0)); }
+static void mb_md5   (const unsigned char *in, size_t n, unsigned char *o) { XU_MB(mbedtls_md5(in, n, o)); }
+
+#define HASH_FN(name, fn, DIGLEN)                                        \
+    static int l_util_##name(lua_State *L) {                             \
+        size_t n = 0; const char *s = luaL_checklstring(L, 1, &n);       \
+        unsigned char d[DIGLEN];                                         \
+        fn((const unsigned char *)s, n, d);                              \
+        lua_pushlstring(L, (const char *)d, DIGLEN);                     \
+        return 1;                                                        \
+    }                                                                    \
+    static int l_util_##name##_hex(lua_State *L) {                       \
+        size_t n = 0; const char *s = luaL_checklstring(L, 1, &n);       \
+        unsigned char d[DIGLEN];                                         \
+        fn((const unsigned char *)s, n, d);                              \
+        xu_push_hex(L, d, DIGLEN);                                       \
+        return 1;                                                        \
+    }
+
+HASH_FN(sha1,   mb_sha1,   20)
+HASH_FN(sha256, mb_sha256, 32)
+HASH_FN(sha512, mb_sha512, 64)
+HASH_FN(md5,    mb_md5,    16)
+
+/* --- HMAC (streaming, block size 64 for sha1/sha256) ------------------- */
+static void hmac_sha256_raw(const unsigned char *key, size_t kl,
+                            const unsigned char *msg, size_t ml,
+                            unsigned char out[32]) {
+    unsigned char k[64], ipad[64], opad[64], inner[32];
+    if (kl > 64) { mb_sha256(key, kl, k); key = k; kl = 32; }
+    for (int i = 0; i < 64; i++) {
+        unsigned char b = (i < (int)kl) ? key[i] : 0;
+        ipad[i] = b ^ 0x36; opad[i] = b ^ 0x5c;
+    }
+    mbedtls_sha256_context c; mbedtls_sha256_init(&c);
+    XU_MB(mbedtls_sha256_starts(&c, 0));
+    XU_MB(mbedtls_sha256_update(&c, ipad, 64));
+    XU_MB(mbedtls_sha256_update(&c, msg, ml));
+    XU_MB(mbedtls_sha256_finish(&c, inner));
+    XU_MB(mbedtls_sha256_starts(&c, 0));
+    XU_MB(mbedtls_sha256_update(&c, opad, 64));
+    XU_MB(mbedtls_sha256_update(&c, inner, 32));
+    XU_MB(mbedtls_sha256_finish(&c, out));
+    mbedtls_sha256_free(&c);
+}
+
+static void hmac_sha1_raw(const unsigned char *key, size_t kl,
+                          const unsigned char *msg, size_t ml,
+                          unsigned char out[20]) {
+    unsigned char k[64], ipad[64], opad[64], inner[20];
+    if (kl > 64) { mb_sha1(key, kl, k); key = k; kl = 20; }
+    for (int i = 0; i < 64; i++) {
+        unsigned char b = (i < (int)kl) ? key[i] : 0;
+        ipad[i] = b ^ 0x36; opad[i] = b ^ 0x5c;
+    }
+    mbedtls_sha1_context c; mbedtls_sha1_init(&c);
+    XU_MB(mbedtls_sha1_starts(&c));
+    XU_MB(mbedtls_sha1_update(&c, ipad, 64));
+    XU_MB(mbedtls_sha1_update(&c, msg, ml));
+    XU_MB(mbedtls_sha1_finish(&c, inner));
+    XU_MB(mbedtls_sha1_starts(&c));
+    XU_MB(mbedtls_sha1_update(&c, opad, 64));
+    XU_MB(mbedtls_sha1_update(&c, inner, 20));
+    XU_MB(mbedtls_sha1_finish(&c, out));
+    mbedtls_sha1_free(&c);
+}
+
+static int l_util_hmac_sha256(lua_State *L) {
+    size_t kl = 0, ml = 0;
+    const unsigned char *k = (const unsigned char *)luaL_checklstring(L, 1, &kl);
+    const unsigned char *m = (const unsigned char *)luaL_checklstring(L, 2, &ml);
+    unsigned char out[32]; hmac_sha256_raw(k, kl, m, ml, out);
+    lua_pushlstring(L, (const char *)out, 32);
+    return 1;
+}
+static int l_util_hmac_sha256_hex(lua_State *L) {
+    size_t kl = 0, ml = 0;
+    const unsigned char *k = (const unsigned char *)luaL_checklstring(L, 1, &kl);
+    const unsigned char *m = (const unsigned char *)luaL_checklstring(L, 2, &ml);
+    unsigned char out[32]; hmac_sha256_raw(k, kl, m, ml, out);
+    xu_push_hex(L, out, 32);
+    return 1;
+}
+static int l_util_hmac_sha1(lua_State *L) {
+    size_t kl = 0, ml = 0;
+    const unsigned char *k = (const unsigned char *)luaL_checklstring(L, 1, &kl);
+    const unsigned char *m = (const unsigned char *)luaL_checklstring(L, 2, &ml);
+    unsigned char out[20]; hmac_sha1_raw(k, kl, m, ml, out);
+    lua_pushlstring(L, (const char *)out, 20);
+    return 1;
+}
+static int l_util_hmac_sha1_hex(lua_State *L) {
+    size_t kl = 0, ml = 0;
+    const unsigned char *k = (const unsigned char *)luaL_checklstring(L, 1, &kl);
+    const unsigned char *m = (const unsigned char *)luaL_checklstring(L, 2, &ml);
+    unsigned char out[20]; hmac_sha1_raw(k, kl, m, ml, out);
+    xu_push_hex(L, out, 20);
+    return 1;
+}
+
+/* --- base64 (standard + url-safe) and hex ------------------------------ */
+static const char XU_B64STD[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static const char XU_B64URL[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+static int xu_b64_encode(lua_State *L, const char *alpha, int pad) {
+    size_t n = 0;
+    const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 1, &n);
+    luaL_Buffer b; luaL_buffinit(L, &b);
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned b0 = s[i];
+        unsigned b1 = (i + 1 < n) ? s[i + 1] : 0;
+        unsigned b2 = (i + 2 < n) ? s[i + 2] : 0;
+        int rem = (int)(n - i);
+        luaL_addchar(&b, alpha[b0 >> 2]);
+        luaL_addchar(&b, alpha[((b0 & 3) << 4) | (b1 >> 4)]);
+        if (rem > 1)       luaL_addchar(&b, alpha[((b1 & 15) << 2) | (b2 >> 6)]);
+        else if (pad)      luaL_addchar(&b, '=');
+        if (rem > 2)       luaL_addchar(&b, alpha[b2 & 63]);
+        else if (pad)      luaL_addchar(&b, '=');
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
+static int l_util_base64_encode(lua_State *L)    { return xu_b64_encode(L, XU_B64STD, 1); }
+static int l_util_base64url_encode(lua_State *L) { return xu_b64_encode(L, XU_B64URL, 0); }
+
+/* Decodes both standard and url-safe alphabets; padding/whitespace ignored. */
+static int xu_b64dval(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+static int l_util_base64_decode(lua_State *L) {
+    size_t n = 0;
+    const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 1, &n);
+    luaL_Buffer b; luaL_buffinit(L, &b);
+    int acc = 0, bits = 0;
+    for (size_t i = 0; i < n; i++) {
+        int c = s[i];
+        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        int v = xu_b64dval(c);
+        if (v < 0) { lua_pushnil(L); lua_pushstring(L, "invalid base64"); return 2; }
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; luaL_addchar(&b, (char)((acc >> bits) & 0xff)); }
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
+
+static int l_util_hex_encode(lua_State *L) {
+    size_t n = 0;
+    const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 1, &n);
+    xu_push_hex(L, s, n);
+    return 1;
+}
+static int l_util_hex_decode(lua_State *L) {
+    size_t n = 0;
+    const char *s = luaL_checklstring(L, 1, &n);
+    if (n & 1) { lua_pushnil(L); lua_pushstring(L, "odd hex length"); return 2; }
+    luaL_Buffer b; luaL_buffinit(L, &b);
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = xu_hexval((unsigned char)s[i]);
+        int lo = xu_hexval((unsigned char)s[i + 1]);
+        if (hi < 0 || lo < 0) { lua_pushnil(L); lua_pushstring(L, "invalid hex"); return 2; }
+        luaL_addchar(&b, (char)((hi << 4) | lo));
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
+
 static const luaL_Reg xutils_funcs[] = {
     { "json_pack",    l_util_json_pack },
     { "json_unpack",  l_util_json_unpack },
     { "load_config",  l_util_load_config },
     { "get_config",   l_util_get_config },
     { "scan_dir",     l_util_scan_dir },
+
+    /* hashes: raw digest + lowercase-hex variant */
+    { "sha1",          l_util_sha1 },
+    { "sha1_hex",      l_util_sha1_hex },
+    { "sha256",        l_util_sha256 },
+    { "sha256_hex",    l_util_sha256_hex },
+    { "sha512",        l_util_sha512 },
+    { "sha512_hex",    l_util_sha512_hex },
+    { "md5",           l_util_md5 },
+    { "md5_hex",       l_util_md5_hex },
+
+    /* HMAC */
+    { "hmac_sha256",     l_util_hmac_sha256 },
+    { "hmac_sha256_hex", l_util_hmac_sha256_hex },
+    { "hmac_sha1",       l_util_hmac_sha1 },
+    { "hmac_sha1_hex",   l_util_hmac_sha1_hex },
+
+    /* encodings */
+    { "base64_encode",     l_util_base64_encode },
+    { "base64_decode",     l_util_base64_decode },
+    { "base64url_encode",  l_util_base64url_encode },
+    { "base64url_decode",  l_util_base64_decode },   /* one decoder handles both */
+    { "hex_encode",        l_util_hex_encode },
+    { "hex_decode",        l_util_hex_decode },
+
     { NULL, NULL }
 };
 

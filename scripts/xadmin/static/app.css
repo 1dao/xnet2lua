@@ -14,6 +14,11 @@
     --code-fg: #e5e7eb;
 }
 * { box-sizing: border-box; }
+/* The SPA toggles views via the `hidden` attribute. Author `display:` rules
+   (e.g. .auth-gate{display:flex}, .layout{display:flex}) outrank the UA
+   stylesheet's [hidden]{display:none}, so without this the auth overlay never
+   hides and the page sticks on "正在进入控制台..." after setup/login. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
     margin: 0;
@@ -170,6 +175,12 @@ code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size
     }
 }
 
+/* ---- access tokens page ---- */
+.token-form { display: flex; flex-direction: column; gap: 14px; max-width: 720px; }
+.token-form .auth-grid { grid-template-columns: 1fr 1fr 1fr; }
+.token-form #tk-generate { align-self: flex-start; }
+.token-form #tk-meta { min-height: 18px; }
+
 /* ---- auth gate (setup / login) ---- */
 .auth-gate {
     position: fixed; inset: 0;
@@ -209,6 +220,56 @@ code { font-family: "Cascadia Mono", "Fira Code", Consolas, monospace; font-size
 .auth-msg { margin-top: 12px; font-size: 13px; min-height: 18px; }
 .auth-msg.err { color: var(--red); }
 .auth-msg.ok { color: var(--green); }
+
+/* ---- federated login (OAuth buttons, JWT, mTLS hint) ---- */
+.auth-federated { margin-top: 22px; }
+.auth-divider {
+    display: flex; align-items: center; gap: 10px;
+    color: var(--muted); font-size: 12px;
+    margin: 18px 0 14px;
+}
+.auth-divider::before, .auth-divider::after {
+    content: ''; flex: 1;
+    height: 1px; background: var(--line);
+}
+.auth-buttons { display: flex; flex-direction: column; gap: 8px; }
+.btn-secondary {
+    background: #fff; color: var(--text);
+    border: 1px solid var(--line); font-weight: 500;
+    text-align: center; text-decoration: none;
+    display: inline-flex; align-items: center; justify-content: center;
+}
+.btn-secondary:hover { background: var(--band); border-color: var(--blue); color: var(--blue-d); }
+.auth-oauth-btn { width: 100%; }
+.auth-jwt { margin-top: 16px; }
+.auth-jwt label { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--muted); }
+.auth-jwt textarea {
+    padding: 8px 10px;
+    border: 1px solid var(--line); border-radius: 6px;
+    background: #fff; color: var(--text); font: inherit;
+    font-family: "Cascadia Mono", "Fira Code", Consolas, monospace;
+    font-size: 12px; line-height: 1.4;
+    resize: vertical; word-break: break-all;
+}
+.auth-jwt textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; border-color: var(--blue); }
+.auth-jwt .btn { margin-top: 10px; }
+.auth-jwt .auth-msg { margin-top: 8px; }
+.auth-mtls-hint {
+    margin-top: 18px; padding: 10px 12px;
+    background: var(--band);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    font-size: 12px; color: var(--muted);
+    display: flex; gap: 8px; align-items: flex-start;
+}
+.auth-mtls-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    background: var(--blue); color: #fff;
+    border-radius: 3px;
+    font-size: 11px; font-weight: 600;
+    white-space: nowrap;
+}
 
 .sidebar-user { margin-top: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .btn-sm { height: 26px; padding: 0 10px; line-height: 24px; font-size: 12px; }

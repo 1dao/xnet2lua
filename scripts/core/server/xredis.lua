@@ -47,8 +47,19 @@ function M.start(cfg)
     return true
 end
 
+-- xthread.rpc yields back three values: (channel_ok, app_ok, reply).
+--   channel_ok == false -> the RPC itself failed; app_ok holds the reason.
+--   channel_ok == true  -> the xredis_call handler returned (app_ok, reply),
+--                          where reply is the decoded Redis reply or an error.
+-- Collapse that to the documented (ok, reply) so callers don't accidentally
+-- read the channel flag as the reply (which surfaced as every command
+-- returning boolean `true`).
 function M.call(cmd, ...)
-    return xthread.rpc(REDIS_ID, 'xredis_call', 0, cmd, ...)
+    local channel_ok, app_ok, reply = xthread.rpc(REDIS_ID, 'xredis_call', 0, cmd, ...)
+    if not channel_ok then
+        return false, tostring(app_ok or 'redis rpc failed')
+    end
+    return app_ok and true or false, reply
 end
 
 function M.post(cb, cmd, ...)

@@ -106,9 +106,9 @@ set "XNET_EXE=%BIN_DIR%\xnet%PROGRAM_SUFFIX%.exe"
 set "THREAD_EXE=%BIN_DIR%\xthread_test%PROGRAM_SUFFIX%.exe"
 set "UNIT_EXE=%BIN_DIR%\test_core%PROGRAM_SUFFIX%.exe"
 
-set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c"
+set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c xshared.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
-set "XNET_SOURCES=xlua\xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c 3rd\yyjson.c xframe_aead.c"
+set "XNET_SOURCES=xlua\xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c xlua\lua_xshared.c 3rd\yyjson.c xframe_aead.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
@@ -125,10 +125,9 @@ if "%WITH_RPMALLOC%"=="1" (
 ) else (
     set "DEFS=%DEFS% /DXMACRO_USE_RPMALLOC=0"
 )
-set "INCS=/I. /I3rd\libdeflate"
-if "%WITH_HTTPS%"=="1" (
-    set "INCS=%INCS% /I3rd\mbedtls3\include"
-)
+REM mbedTLS include is always needed: xutils exports the self-contained hash
+REM primitives (sha1/sha256/sha512/md5) on every build, HTTPS or not.
+set "INCS=/I. /I3rd\libdeflate /I3rd\mbedtls3\include"
 if /I "%LUA_BACKEND%"=="luajit" (
     set "DEFS=%DEFS% /DXLUA_USE_LUAJIT=1"
     set "INCS=%INCS% /I%LUAJIT_INC%"
@@ -204,9 +203,16 @@ for %%F in (%C_UNIT_SOURCES%) do (
     set "UNIT_OBJECTS=!UNIT_OBJECTS! %OBJDIR%\unit_%%~nF.obj"
 )
 
+REM WITH_HTTPS=1 builds the whole mbedTLS library; WITH_HTTPS=0 still needs the
+REM self-contained hash subset for xutils. Compile each exactly once.
+set "MBEDTLS_CRYPTO_SRC=sha1.c sha256.c sha512.c md5.c platform_util.c"
 set "MBEDTLS_OBJECTS="
 if "%WITH_HTTPS%"=="1" (
     for %%F in ("3rd\mbedtls3\library\*.c") do (
+        set "MBEDTLS_OBJECTS=!MBEDTLS_OBJECTS! %OBJDIR%\mbedtls\%%~nF.obj"
+    )
+) else (
+    for %%F in (%MBEDTLS_CRYPTO_SRC%) do (
         set "MBEDTLS_OBJECTS=!MBEDTLS_OBJECTS! %OBJDIR%\mbedtls\%%~nF.obj"
     )
 )
@@ -295,7 +301,7 @@ if /I "%TARGET%"=="run-lua" (
 
 if exist "%OBJDIR%" rmdir /S /Q "%OBJDIR%"
 mkdir "%OBJDIR%"
-if "%WITH_HTTPS%"=="1" mkdir "%OBJDIR%\mbedtls"
+mkdir "%OBJDIR%\mbedtls"
 mkdir "%OBJDIR%\libdeflate"
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
@@ -325,6 +331,16 @@ if "%NEED_BUILD_XNET%"=="1" (
         for %%F in ("3rd\mbedtls3\library\*.c") do (
             echo %GREEN%[INFO]%RESET% cl %%~nxF
             cl %CFLAGS% /c "%%~F" /Fo"%OBJDIR%\mbedtls\%%~nF.obj"
+            if errorlevel 1 (
+                echo %RED%[ERROR]%RESET% Failed to compile %%F
+                exit /b 1
+            )
+        )
+    ) else (
+        echo %GREEN%[INFO]%RESET% Compiling mbedTLS hash subset for xutils...
+        for %%F in (%MBEDTLS_CRYPTO_SRC%) do (
+            echo %GREEN%[INFO]%RESET% cl %%F
+            cl %CFLAGS% /c "3rd\mbedtls3\library\%%F" /Fo"%OBJDIR%\mbedtls\%%~nF.obj"
             if errorlevel 1 (
                 echo %RED%[ERROR]%RESET% Failed to compile %%F
                 exit /b 1

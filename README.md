@@ -10,7 +10,7 @@ A small C networking runtime with an embedded Lua scripting layer. The C core ha
 - Embedded Lua via `minilua` by default; LuaJIT optional via `LUA_BACKEND=luajit`.
 - Lua bindings: `xnet` (sockets / TLS / runtime stats), `xthread` (threads / RPC / queue stats), `xtimer` (timer wheel), `xutils` (JSON via yyjson, config, filesystem), `xcompress` (gzip/deflate/checksums), `cmsgpack` (MessagePack), `xdebug` (optional VSCode debug adapter).
 - Lua share modules: `xhttp` (HTTP/1.x server with router), `xrouter` (unified POST/RPC dispatch), `xredis` / `xmysql` / `xnats` worker stacks, `xsession` (HTTP session helper).
-- Hot reload protocol, cross-process RPC over NATS, and an `xadmin` console for remote exec/reload.
+- Hot reload protocol, cross-process RPC over NATS, and an `xadmin` console for remote exec/reload with enterprise auth (password, JWT/HS256, OAuth2+PKCE, mTLS) and an admin/viewer role model.
 - In-tree regression tests with a CI matrix that covers both stripped and full-featured build flags.
 
 ## Architecture
@@ -279,6 +279,76 @@ make all WITH_HTTPS=0
 curl http://127.0.0.1:8080/hello?name=xnet2lua
 ```
 
+## Quick Start: WebSocket
+
+Any `xhttp` app route can hand a connection over to WebSocket (RFC 6455). Return
+a table with a `websocket` field and the worker completes the `101` handshake,
+then the fd speaks frames instead of HTTP. `scripts/core/share/xwebsocket.lua`
+handles the `Sec-WebSocket-Accept` key, masking, fragmentation and control
+frames (ping → auto-pong, close handshake).
+
+```lua
+local router = dofile("scripts/core/share/xhttp_router.lua")
+local xws    = dofile("scripts/core/share/xwebsocket.lua")
+
+router.get("/ws", function(req)
+    if not xws.is_upgrade(req) then
+        return { status = 426, body = "WebSocket only\n",
+                 headers = { Upgrade = "websocket", Connection = "Upgrade" } }
+    end
+    return {
+        protocol  = "echo",                    -- negotiated subprotocol (optional)
+        websocket = {
+            on_open    = function(ws) ws:send_text("welcome") end,
+            on_message = function(ws, msg, opcode) ws:send_text("echo:" .. msg) end,
+            on_close   = function(ws, reason) end,
+        },
+    }
+end)
+
+return { handle = function(req) return router.handle(req) end }
+```
+
+The `ws` object exposes `send_text` / `send_binary` / `send` / `send_ping` /
+`send_pong` / `close(code, reason)` / `is_open()`. The codec layer
+(`xws.encode` / `xws.decode` / `xws.accept_key`) is usable on its own to drive a
+client or in tests.
+
+**`wss://` is free:** start the server with `https = true` (plus `cert_file` /
+`key_file`) and the exact same `/ws` route now speaks WebSocket inside the TLS
+tunnel — the upgrade rides on whatever transport the worker attached, no
+WebSocket-specific TLS code. Self-tests:
+
+```sh
+./bin/xnet demo/xhttp_ws_main.lua     # WebSocket over the worker-pool server
+./bin/xnet demo/xhttp_wss_main.lua    # secure WebSocket over TLS (WITH_HTTPS=1)
+```
+
+## Quick Start: HTTP → HTTPS upgrade (force-HTTPS + HSTS)
+
+A plaintext `xhttp` server can redirect every request to its `https://` URL and
+emit HSTS so compliant clients stick to TLS. Turn it on from `xhttp.start`:
+
+```lua
+xhttp.start({
+    host = "0.0.0.0", port = 80,
+    worker_name = "edge", app_script = "app.lua",
+    force_https   = true,        -- 301-redirect plaintext requests to https
+    redirect_port = 443,         -- target HTTPS port (omit :443 from the URL)
+    redirect_status = 301,       -- or 302 / 307 / 308
+    hsts = { max_age = 31536000, include_subdomains = true },  -- Strict-Transport-Security
+})
+```
+
+On the HTTPS listener, pass the same `hsts` option and every response carries
+the `Strict-Transport-Security` header. The same primitives are exposed on the
+codec for manual use: `codec.https_redirect(req, opts)`, `codec.https_url(req,
+opts)` and `codec.hsts_value(spec)` — all covered by `tests/lua/websocket_spec.lua`.
+
+> Note: RFC 2817 `Upgrade: TLS` (in-band protocol upgrade) is intentionally not
+> implemented — no browser supports it. The redirect + HSTS pair above is the
+> real-world way to move an HTTP service to HTTPS.
+
 ## Quick Start: HTTP/HTTPS client
 
 `scripts/core/share/xhttp_client.lua` is an asynchronous, callback-based client
@@ -328,6 +398,8 @@ More entry points:
 - `demo/xhttp_client_main.lua` — async HTTP client self-test (content-length, echo, redirect, chunked, gzip)
 - `demo/xhttp_main.lua` — HTTP server + client smoke test
 - `demo/xhttp_compress_main.lua` — HTTP response compression and request decompression smoke test
+- `demo/xhttp_ws_main.lua` — WebSocket over the worker-pool HTTP server self-test
+- `demo/xhttp_wss_main.lua` — secure WebSocket (`wss://`) over the HTTPS worker pool (needs `WITH_HTTPS=1`)
 - `demo/xnet_main.lua`  — raw TCP + `xsession` RPC
 - `demo/xcompress_main.lua` — `xcompress` gzip/deflate/zlib/checksum smoke test
 - `demo/xraygui_main.lua` — interactive RayGUI controls demo (needs `tools/raygui.dll`)
@@ -337,7 +409,20 @@ More entry points:
 ### RayGUI demo
 
 `demo/xraygui_main.lua` shows the exported RayGUI controls in an interactive
-window:
+window — button, checkbox, slider, progress bar, single/multi-line textboxes,
+dropdown, list view — plus the features added in this round:
+
+- **UI themes** — 5 presets under `tools/styles/` (`dark` / `soft` / `nord` /
+  `candy` / `cyber`); apply via `require("styles.dark").apply(raygui)`.
+- **Built-in icons** — embed raygui icons in any control's text with `#iconID#`
+  (e.g. `"#131# Play"`); `set_icon_scale(n)` controls their size.
+- **Color emoji** — baked into a texture atlas (`tools/emoji_atlas.png`) and drawn
+  via `draw_texture_ex`, referenced by name through an inlined index table.
+- **Emoji + text buttons** — `emoji_button()` overlays a color emoji on a button.
+- **Modal confirm dialog** — `messagebox(...)` (e.g. the Delete button).
+- **Texture API** — `load_texture` / `draw_texture` / `draw_texture_ex`.
+- Correct dropdown/dialog z-order via `lock()` / `unlock()`; the multi-line
+  textbox now clips & scrolls to the cursor; Backspace/arrows auto-repeat on hold.
 
 ```sh
 bin/xnet demo/xraygui_main.lua
@@ -348,6 +433,20 @@ For automated checks, add a frame limit so the window exits by itself:
 ```sh
 bin/xnet demo/xraygui_main.lua frames=120
 ```
+
+> **⚠️ Platform & Lua version**
+>
+> The bundled `tools/raygui.dll` is built **for Windows x64 and Lua 5.5 only** —
+> it links `lua55.dll` and uses the Lua 5.4/5.5 C API. It therefore will **not**
+> load under **LuaJIT** or other Lua versions (incompatible ABI), and **no
+> Linux/macOS binary** ships in this repo.
+>
+> To run the UI on **another platform (Linux / macOS)** or with a **different Lua
+> version / LuaJIT**, build the matching `raygui.dll` / `raygui.so` yourself from
+> the source & packaging repo — **https://github.com/1dao/xlua_raygui.git** — and
+> drop it into `tools/`. Its `Makefile` already handles Windows / Linux / macOS;
+> for a non-5.5 runtime, point the linked Lua lib (and headers) at your target
+> (e.g. LuaJIT's `lua51` import lib) before building.
 
 ### RayGUI smoke test
 
@@ -385,8 +484,9 @@ Pure-Lua, loaded via `dofile`:
 | ------------------------------------------------- | --------------------------------------------- | ----------- |
 | `scripts/core/share/xrouter.lua`                  | unified POST + RPC dispatch with coroutines   | docs §3.3   |
 | `scripts/core/share/xhttp_router.lua`             | HTTP path/method router with path params      | docs §8.5   |
-| `scripts/core/share/xhttp_codec.lua`              | HTTP request/response parsing                 | docs §8     |
+| `scripts/core/share/xhttp_codec.lua`              | HTTP request/response parsing + HTTPS-redirect/HSTS helpers | docs §8 |
 | `scripts/core/share/xhttp_client.lua`             | async HTTP/HTTPS client (get/post/request)    | docs §8     |
+| `scripts/core/share/xwebsocket.lua`               | RFC 6455 WebSocket codec + server upgrade     | docs §8     |
 | `scripts/core/share/xsession.lua`                 | request/reply session helper over raw `xnet`  | docs §5     |
 | `scripts/core/share/xtimerx.lua`                  | reload-safe application timers on top of xtimer | docs §3.5  |
 | `scripts/core/server/xhttp.lua` + `xhttp_worker.lua` | HTTP/HTTPS server boot + worker pool       | docs §8     |
@@ -427,6 +527,7 @@ Task-oriented index:
 | Make a module hot-reload safe                        | docs §19                               |
 | Debug Lua from VSCode                                | docs §20                               |
 | Operate the xadmin console (remote exec / reload)    | docs §17                               |
+| Secure the xadmin console (login, JWT, OAuth2, mTLS, roles) | docs §17.9–17.17                 |
 
 ## Contributing
 

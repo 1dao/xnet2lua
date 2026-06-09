@@ -1,6 +1,7 @@
 -- xhttp_router.lua - Lua-state singleton router for xhttp apps.
 
 local xutils = require 'xutils'
+local lower = dofile('scripts/core/share/xmisc.lua').lower
 local ROUTER_KEY = '__xnet_xhttp_router'
 local M = rawget(_G, ROUTER_KEY)
 
@@ -34,10 +35,6 @@ local CONTENT_TYPES = {
     webp = 'image/webp',
     
 }
-
-local function lower(s)
-    return string.lower(tostring(s or ''))
-end
 
 local function normalize_static_rel(rel)
     rel = tostring(rel or ''):gsub('\\', '/'):gsub('^/+', '')

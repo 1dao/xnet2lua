@@ -3,6 +3,7 @@
 
 local xsession = dofile('scripts/core/share/xsession.lua')
 local codec    = dofile('scripts/core/share/xhttp_codec.lua')
+local xws      = dofile('scripts/core/share/xwebsocket.lua')
 local router   = dofile('scripts/core/share/xrouter.lua')
 router.set_log_prefix('XHTTP-WORKER')
 router.set_unknown_rpc(function(reply_router, co_id, sk, pt, ...)
@@ -20,6 +21,12 @@ local server_name = 'xnet-http'
 local use_https = false
 local tls_config = nil
 local connections = {}
+
+-- HTTP -> HTTPS upgrade knobs (set from xhttp_worker_start).
+local force_https = false      -- redirect plaintext requests to https
+local redirect_port = 443      -- target port for the redirect
+local redirect_status = 301    -- 301/302/307/308
+local hsts_opts = nil          -- Strict-Transport-Security spec (or nil)
 
 -- Compression knobs. Response compression is on by default with a 256-byte
 -- floor (smaller bodies aren't worth the headers). Request decompression is
@@ -75,6 +82,16 @@ end
 
 local app_router = {
     handle = function(req)
+        -- HTTP -> HTTPS upgrade: on a plaintext worker with force_https on,
+        -- bounce every request to the https:// URL before touching the app.
+        if force_https and not use_https then
+            return codec.https_redirect(req, {
+                https_port = redirect_port,
+                status     = redirect_status,
+                hsts       = hsts_opts,
+            })
+        end
+
         local ok, resp = pcall(dispatch_request, req)
         if not ok then
             io.stderr:write('[XHTTP-WORKER] app error: ' .. tostring(resp) .. '\n')
@@ -108,9 +125,39 @@ local server_handler = xsession.make({
     classify = function(_) return 'rpc' end,
 
     send_response = function(conn, req, resp)
+        -- WebSocket upgrade: an app route returns
+        --   { websocket = { on_open=, on_message=, on_close=, ... },
+        --     protocol = '...', max_message_size = N }
+        -- and we hand the fd over to the WebSocket frame dispatcher.
+        if type(resp) == 'table' and type(resp.websocket) == 'table' then
+            local cstate = connections[conn]
+            local ws, werr = xws.upgrade(conn, req, resp.websocket, {
+                protocol         = resp.protocol,
+                protocols        = resp.protocols,
+                server_name      = server_name,
+                max_message_size = resp.max_message_size or max_request_size,
+                handshake_headers = resp.handshake_headers,
+                on_detach        = function(c) connections[c] = nil end,
+            })
+            if ws then
+                -- The fd now speaks WebSocket, not HTTP. Wind down the xsession
+                -- session for it so on_packet stops parsing bytes as requests;
+                -- on_detach clears the connections entry on socket close.
+                if cstate then cstate.closing = true end
+            else
+                io.stderr:write('[XHTTP-WORKER] websocket upgrade failed: '
+                    .. tostring(werr) .. '\n')
+                codec.send_error(conn, 400, werr or 'bad websocket upgrade',
+                    { server_name = server_name })
+                conn:close('ws_upgrade_failed')
+            end
+            return
+        end
+
         codec.send_response(conn, req, resp, {
             server_name = server_name,
             compression = compression_opts,
+            hsts        = use_https and hsts_opts or nil,
         })
     end,
 
@@ -145,7 +192,8 @@ local server_handler = xsession.make({
 xthread.register('xhttp_worker_start', function(script_path, max_size, name,
                                                https, cert_file, key_file, key_password,
                                                compr_enabled, compr_min_size, compr_level,
-                                               req_decompress, max_decompressed)
+                                               req_decompress, max_decompressed,
+                                               ca_file, extra)
     max_request_size = tonumber(max_size) or max_request_size
     server_name = name or server_name
     use_https = https and true or false
@@ -154,6 +202,7 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
             cert_file = cert_file,
             key_file = key_file,
             password = key_password ~= '' and key_password or nil,
+            ca_file = (type(ca_file) == 'string' and ca_file ~= '') and ca_file or nil,
             max_packet = max_request_size,
         }
     else
@@ -166,11 +215,18 @@ xthread.register('xhttp_worker_start', function(script_path, max_size, name,
     if req_decompress ~= nil then decompress_requests = req_decompress and true or false end
     if max_decompressed then max_decompressed_size = tonumber(max_decompressed) end
 
+    extra = type(extra) == 'table' and extra or {}
+    force_https = extra.force_https and true or false
+    redirect_port = tonumber(extra.redirect_port) or 443
+    redirect_status = tonumber(extra.redirect_status) or 301
+    hsts_opts = extra.hsts
+
     load_app(script_path)
-    print(string.format('[XHTTP-WORKER] start scheme=%s app=%s max_request=%d compress=%s/%d/L%d',
+    print(string.format('[XHTTP-WORKER] start scheme=%s app=%s max_request=%d compress=%s/%d/L%d force_https=%s hsts=%s',
         use_https and 'https' or 'http', tostring(script_path), max_request_size,
         compression_opts.enabled and 'on' or 'off',
-        compression_opts.min_size, compression_opts.level))
+        compression_opts.min_size, compression_opts.level,
+        tostring(force_https), hsts_opts ~= nil and 'on' or 'off'))
 end)
 
 xthread.register('xhttp_accept', function(fd, ip, port)
