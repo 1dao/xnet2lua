@@ -130,27 +130,6 @@ static xArgsCFG g_arg_configs[] = {
     { 'd', "daemon", NULL, 1 },
 };
 
-static bool config_bool_enabled(const char* value) {
-    if (!value) return false;
-    if (value[0] == '\0') return true;
-
-    char buf[16];
-    size_t n = strlen(value);
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-    for (size_t i = 0; i < n; ++i) {
-        char c = value[i];
-        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-        buf[i] = c;
-    }
-    buf[n] = '\0';
-
-    return strcmp(buf, "1") == 0 ||
-           strcmp(buf, "true") == 0 ||
-           strcmp(buf, "yes") == 0 ||
-           strcmp(buf, "on") == 0 ||
-           strcmp(buf, "daemon") == 0;
-}
-
 static int load_runner_config(void) {
     const char* config_file = xargs_get("config");
     if (config_file && config_file[0]) {
@@ -168,10 +147,12 @@ static int load_runner_config(void) {
     return 0;
 }
 
-static bool daemon_requested(void) {
-    const char* daemon_arg = xargs_get("daemon");
-    if (daemon_arg) return config_bool_enabled(daemon_arg);
-    return config_bool_enabled(xargs_get("DAEMON"));
+/* Whether the runner should daemonize: --daemon/-d on argv or DAEMON in config.
+** This is the caller's policy; xdaemon_init() just takes the resulting flag so
+** the daemon module stays decoupled from xargs. */
+static int daemon_requested(void) {
+    if (xargs_get("daemon")) return xargs_get_bool("daemon");
+    return xargs_get_bool("DAEMON");
 }
 
 static int l_xthread_stop(lua_State* L) {
@@ -408,7 +389,7 @@ static MainLuaData* main_init(void) {
 
     call_xthread_init(data);
 
-    if (data->init_ref != LUA_NOREF && g_running) {
+    if (data->init_ref != LUA_NOREF && g_running && !xdaemon_should_stop()) {
         int base = lua_gettop(L);
         lua_rawgeti(L, LUA_REGISTRYINDEX, data->init_ref);
         if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
@@ -423,7 +404,7 @@ static MainLuaData* main_init(void) {
     ** xpoll gives us a precise sleep-with-wakeup mechanism for the auto-update
     ** loop below. We track this so we balance the teardown ourselves and don't
     ** double-uninit anything the script set up via xnet.init. */
-    if (g_running && xtimer_inited() && !xpoll_inited()) {
+    if (g_running && !xdaemon_should_stop() && xtimer_inited() && !xpoll_inited()) {
         if (socket_init() == 0) {
             if (xpoll_init() == 0) {
                 xthread_wakeup_init();
@@ -546,7 +527,13 @@ int main(int argc, char** argv) {
     g_process_name = xargs_get("SERVER_NAME");
     xdebug_configure(xargs_get("XDEBUG_BOOT"), xargs_get("XDEBUG_PORT"), xargs_get("XDEBUG_WAIT"));
 
-    if (daemon_requested() && xdaemon_daemonize() != 0) {
+    /* Install termination-signal handlers (Ctrl-C, `kill <pid>`) and daemonize
+    ** if requested. Handlers are hooked first -- even in the foreground -- so a
+    ** signal during startup is caught; the main loop polls xdaemon_should_stop()
+    ** and unwinds through the full teardown chain instead of being hard-killed.
+    ** Set g_running before init so an early signal isn't lost. */
+    g_running = true;
+    if (xdaemon_init(daemon_requested()) != 0) {
         fprintf(stderr, "[xnet] daemonize failed\n");
         xargs_cleanup();
         xdebug_shutdown();
@@ -565,7 +552,6 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    g_running = true;
     MainLuaData* data = main_init();
     if (!data) {
         xthread_uninit();
@@ -576,13 +562,14 @@ int main(int argc, char** argv) {
         return g_exit_code ? g_exit_code : 1;
     }
 
-    while (g_running) {
+    while (g_running && !xdaemon_should_stop()) {
         main_update(data);
     }
 
     main_uninit(data);
     xthread_uninit();
     xshared_shutdown();   /* workers joined; free shared dicts before rpmalloc */
+    xdaemon_uninit();
     xargs_cleanup();
     xdebug_shutdown();
     xlog_uninit();
