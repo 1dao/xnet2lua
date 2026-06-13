@@ -119,6 +119,17 @@ XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)$(EXE_EXT)
 
+# Windows: embed the UTF-8 activeCodePage manifest (inlined in xlua/xnet.rc) so
+# all ANSI APIs in the process (Lua io/os/popen, CreateProcessA) speak UTF-8 —
+# non-ASCII paths are otherwise mangled through the system code page (GBK on
+# zh-CN systems).
+ifeq ($(OS),Windows_NT)
+    WINDRES ?= windres
+    XNET_RES_OBJ := $(BIN_DIR)/xnet_res.o
+else
+    XNET_RES_OBJ :=
+endif
+
 # rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
 # directly. libxnet.a itself does NOT contain rpmalloc symbols, so xnet adds
 # it here and tests/Makefile adds it for xthread_test.
@@ -182,9 +193,16 @@ $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 
 .PHONY: all xnet xdebug_dap asan asan-test asan-unit asan-run-lua clean $(TEST_TARGETS) run-lua
 
+# Intermediate build artifacts removed after a successful build, leaving only the
+# binaries (+ libxnet.a): the core object dir, the windres object, and the
+# per-binary dependency files dropped by the inline (-MMD) exe builds.
+BUILD_TMP := $(OBJ_DIR) $(XNET_RES_OBJ) $(BIN_DIR)/*_build.d tools/*.d
+
 all: $(TARGET_LIB) $(XNET_TARGET) $(XDEBUG_DAP_TARGET)
+	@$(RM) $(BUILD_TMP)
 
 xnet: $(XNET_TARGET)
+	@$(RM) $(BUILD_TMP)
 
 asan:
 	$(MAKE) -B all $(ASAN_BUILD_ARGS)
@@ -208,9 +226,14 @@ $(TARGET_LIB): $(CORE_OBJS)
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
+ifeq ($(OS),Windows_NT)
+$(XNET_RES_OBJ): xlua/xnet.rc | $(BIN_DIR)
+	$(WINDRES) xlua/xnet.rc $(XNET_RES_OBJ)
+endif
+
+$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) $(XNET_RES_OBJ) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(XNET_RES_OBJ) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(OBJ_DIR):

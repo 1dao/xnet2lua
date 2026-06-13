@@ -158,7 +158,6 @@ build.bat clean
 ./bin/xnet demo/xredis_main.lua
 ./bin/xnet demo/xmysql_main.lua
 ./bin/xnet demo/xnats_main.lua SERVER_NAME=game1
-./bin/xnet scripts/xpac/xpac_main.lua
 ```
 
 CLI 的 `KEY=VALUE` 优先于 `xnet.cfg`，但被读取的键必须在 `xnet_main.c` 的 `g_arg_configs[]` 白名单中（新增 Lua 配置项时如果想让它支持命令行覆盖，记得同步更新该数组）。

@@ -119,7 +119,7 @@ set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG%"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG%"
 if "%WITH_RPMALLOC%"=="1" (
     set "DEFS=%DEFS% /DENABLE_OVERRIDE=0 /DXMACRO_USE_RPMALLOC=1"
 ) else (
@@ -368,8 +368,22 @@ if "%NEED_BUILD_XNET%"=="1" (
     if "%WITH_RPMALLOC%"=="1" set "XNET_LIBS=!XNET_LIBS! Advapi32.lib"
     if defined XNET_LUA_LIB set "XNET_LIBS=!XNET_LIBS! !XNET_LUA_LIB!"
 
+    REM Embed the UTF-8 activeCodePage manifest (inlined in xlua\xnet.rc) so all
+    REM ANSI APIs in the process (Lua io/os/popen, CreateProcessA) speak UTF-8
+    REM instead of the system code page (GBK on zh-CN) -- non-ASCII paths would
+    REM otherwise turn to mojibake at every file/cmd boundary. rc.exe is MSVC's
+    REM resource compiler (the windres counterpart used by the Makefile build).
+    echo %GREEN%[INFO]%RESET% rc xlua\xnet.rc
+    rc /nologo /fo "%OBJDIR%\xnet.res" xlua\xnet.rc
+    if errorlevel 1 (
+        echo %RED%[ERROR]%RESET% Failed to compile xlua\xnet.rc
+        exit /b 1
+    )
+
     echo %GREEN%[INFO]%RESET% Linking %XNET_EXE%...
-    link /nologo %LDFLAGS% /OUT:%XNET_EXE% %COMMON_OBJECTS% %XNET_OBJECTS% %MBEDTLS_OBJECTS% !DEFLATE_OBJECTS! !XNET_LIBS!
+    REM /MANIFEST:NO: our manifest comes from xnet.res; stop the linker emitting
+    REM its own (a stray xnet.exe.manifest beside the binary).
+    link /nologo %LDFLAGS% /MANIFEST:NO /OUT:%XNET_EXE% %COMMON_OBJECTS% %XNET_OBJECTS% %MBEDTLS_OBJECTS% !DEFLATE_OBJECTS! "%OBJDIR%\xnet.res" !XNET_LIBS!
     if errorlevel 1 (
         echo %RED%[ERROR]%RESET% Link failed for %XNET_EXE%
         exit /b 1
@@ -420,7 +434,7 @@ if "%NEED_BUILD_THREAD%"=="1" (
 )
 
 if "%NEED_BUILD_UNIT%"=="1" (
-    set "UNIT_DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0601 /D_WIN32_WINNT=0x0601 /D_CRT_SECURE_NO_WARNINGS /DXMACRO_USE_RPMALLOC=0"
+    set "UNIT_DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXMACRO_USE_RPMALLOC=0"
     set "UNIT_CFLAGS=/nologo /TC /W3 /utf-8 /std:c11 /experimental:c11atomics /wd4005 /wd4100 /wd4206 /wd4244 /wd4267 /wd4334 /wd4706 /wd4996 !UNIT_DEFS! /I."
     if /I "%BUILD_MODE%"=="debug" (
         set "UNIT_CFLAGS=!UNIT_CFLAGS! /Od /Zi /MDd /DDEBUG"
@@ -484,6 +498,12 @@ if "%RUN_SINGLE_LUA%"=="1" (
     call :run_lua_script "%RUN_SCRIPT%"
     if errorlevel 1 exit /b 1
 )
+
+REM Tidy: keep only the final binaries -- drop the intermediate object dir and
+REM the MSVC link debris (import lib + exports), all regenerated each build.
+if exist "%OBJDIR%" rmdir /S /Q "%OBJDIR%"
+if exist "%BIN_DIR%\xnet%PROGRAM_SUFFIX%.exp" del /Q "%BIN_DIR%\xnet%PROGRAM_SUFFIX%.exp"
+if exist "%BIN_DIR%\xnet%PROGRAM_SUFFIX%.lib" del /Q "%BIN_DIR%\xnet%PROGRAM_SUFFIX%.lib"
 
 echo %GREEN%[INFO]%RESET% Build complete.
 if exist "%XNET_EXE%" echo %GREEN%[INFO]%RESET% output: %CD%\%XNET_EXE%

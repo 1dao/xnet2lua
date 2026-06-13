@@ -168,7 +168,6 @@ the Lua script to execute; subsequent `KEY=VALUE` pairs override config:
 ./bin/xnet demo/xredis_main.lua
 ./bin/xnet demo/xmysql_main.lua
 ./bin/xnet demo/xnats_main.lua SERVER_NAME=game1
-./bin/xnet scripts/xpac/xpac_main.lua
 ```
 
 CLI `KEY=VALUE` overrides win over `xnet.cfg`, but the key must be on the

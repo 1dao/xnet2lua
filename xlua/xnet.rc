@@ -1,0 +1,17 @@
+// xnet.rc — embedded Win32 resources for xnet.exe.
+//
+// Holds the application manifest (RT_MANIFEST = 24, id 1 =
+// CREATEPROCESS_MANIFEST_RESOURCE_ID) with activeCodePage=UTF-8 (Win10 1903+):
+// this makes every ANSI Win32/CRT API in the process (Lua io.*/os.*/io.popen,
+// CreateProcessA) speak UTF-8 instead of the system code page (GBK on zh-CN), so
+// non-ASCII paths from the GUI/PowerShell round-trip instead of turning into
+// mojibake at every file/cmd boundary.
+//
+// The manifest XML is inlined here as a single self-contained file (no separate
+// xnet.manifest). Compiled by windres from the repo root (see XNET_RES_OBJ in
+// Makefile). In an .rc string a literal " is written as "".
+
+1 24
+BEGIN
+"<?xml version=""1.0"" encoding=""UTF-8"" standalone=""yes""?><assembly xmlns=""urn:schemas-microsoft-com:asm.v1"" manifestVersion=""1.0""><assemblyIdentity type=""win32"" name=""xnet"" version=""1.0.0.0""/><application xmlns=""urn:schemas-microsoft-com:asm.v3""><windowsSettings><activeCodePage xmlns=""http://schemas.microsoft.com/SMI/2019/WindowsSettings"">UTF-8</activeCodePage></windowsSettings></application></assembly>"
+END
