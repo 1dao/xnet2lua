@@ -35,7 +35,7 @@ function M.apply(raygui)
     raygui.set_style(D, raygui.TEXT_SPACING,          1)
     raygui.set_style(D, raygui.TEXT_PADDING,          8)
     raygui.set_style(D, raygui.TEXT_LINE_SPACING,     10)
-    raygui.set_style(D, raygui.LINE_COLOR,            0x1f3a4dff)
+    raygui.set_style(D, raygui.LINE_COLOR,            0x2c6f85ff)
     raygui.set_style(D, raygui.BACKGROUND_COLOR,      0x080d14ff)  -- 面板背景（近黑蓝）
 
     -- ========== BUTTON ==========
