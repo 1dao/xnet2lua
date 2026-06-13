@@ -35,7 +35,7 @@ function M.apply(raygui)
     raygui.set_style(D, raygui.TEXT_SPACING,          1)
     raygui.set_style(D, raygui.TEXT_PADDING,          8)
     raygui.set_style(D, raygui.TEXT_LINE_SPACING,     10)
-    raygui.set_style(D, raygui.LINE_COLOR,            0x2e333dff)  -- 分割线/边
+    raygui.set_style(D, raygui.LINE_COLOR,            0x596273ff)  -- Group title/separator color
     raygui.set_style(D, raygui.BACKGROUND_COLOR,      0x16191fff)  -- 面板背景（近黑）
 
     -- ========== BUTTON ==========
