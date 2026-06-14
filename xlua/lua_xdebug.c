@@ -73,7 +73,8 @@ typedef enum {
     XDBG_REQ_NONE = 0,
     XDBG_REQ_STACK,
     XDBG_REQ_LOCALS,
-    XDBG_REQ_FIELDS
+    XDBG_REQ_FIELDS,
+    XDBG_REQ_EVAL
 } XDbgReq;
 
 typedef struct {
@@ -550,7 +551,11 @@ static int xdbg_push_path(lua_State* L, lua_Debug* ar, const char* path) {
 
 static void xdbg_emit_var(char* response, size_t cap, const char* name,
                           lua_State* L, int idx, const char* path) {
-    char val[512];
+    /* One variable's serialised value. Kept large so long strings (e.g. the
+    ** xagent system prompt) survive to the DAP client for Copy Value; the whole
+    ** locals/fields reply is still bounded by response[XDBG_RESP_SIZE]. The DAP
+    ** bridge's XDAP_LINE_MAX must stay above this. */
+    char val[16384];
     int expandable = (lua_type(L, idx) == LUA_TTABLE && path && *path);
     xdbg_value(val, sizeof(val), L, idx);
     xdbg_append(response, cap, "%s\t%s\t%s\t%d\n",
@@ -660,6 +665,158 @@ static void xdbg_build_fields(XDbgState* st, int frame, const char* path) {
     xdbg_finish(st->response, sizeof(st->response));
 }
 
+/* Append one eval-reply row "<tag>\t<text>\n" to the response, escaping \ and
+** control chars so the payload stays on a single protocol line. The DAP bridge
+** reverses the escaping before showing it. */
+static void xdbg_eval_row(XDbgState* st, const char* tag, const char* s, size_t len) {
+    char* buf = st->response;
+    size_t cap = sizeof(st->response);
+    size_t o = strlen(buf), i;
+    for (const char* t = tag; *t && o + 1 < cap; t++) buf[o++] = *t;
+    if (o + 1 < cap) buf[o++] = '\t';
+    for (i = 0; s && i < len && o + 2 < cap; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char e = 0;
+        if (c == '\\') e = '\\';
+        else if (c == '\n') e = 'n';
+        else if (c == '\r') e = 'r';
+        else if (c == '\t') e = 't';
+        if (e) { buf[o++] = '\\'; buf[o++] = e; }
+        else if (c < 0x20) buf[o++] = ' ';
+        else buf[o++] = (char)c;
+    }
+    if (o + 1 < cap) buf[o++] = '\n';
+    buf[o < cap ? o : cap - 1] = '\0';
+}
+
+/* print() replacement used only during eval: joins its args with tabs and
+** stashes the line in the accumulator table (upvalue 1) instead of stdout, so
+** the output reaches the DAP console rather than xlog. */
+static int xdbg_eval_print(lua_State* L) {
+    int n = lua_gettop(L), i;
+    char line[8192];
+    size_t o = 0;
+    for (i = 1; i <= n && o + 1 < sizeof(line); i++) {
+        size_t len = 0;
+        const char* s;
+        if (i > 1) line[o++] = '\t';
+        s = luaL_tolstring(L, i, &len);
+        if (s) {
+            if (len > sizeof(line) - 1 - o) len = sizeof(line) - 1 - o;
+            memcpy(line + o, s, len);
+            o += len;
+        }
+        lua_pop(L, 1);
+    }
+    line[o] = '\0';
+    lua_pushlstring(L, line, o);
+    lua_seti(L, lua_upvalueindex(1), luaL_len(L, lua_upvalueindex(1)) + 1);
+    return 0;
+}
+
+/* Evaluate `expr` in the context of stack `frame` of the stopped thread. The
+** frame's locals and upvalues are snapshotted into an environment whose
+** metatable forwards reads/writes to _G, so globals work and global writes
+** take effect (local writes do not propagate back). The line hook is disabled
+** across the pcall so eval'd Lua does not re-enter the debugger. */
+static void xdbg_build_eval(XDbgState* st, int frame, const char* expr) {
+    lua_Debug ar;
+    lua_State* L = st->stop_L ? st->stop_L : st->L;
+    int base = lua_gettop(L);
+    int env, acc, chunk, i, status;
+    char src[XDBG_LINE_SIZE + 16];
+
+    st->response[0] = '\0';
+    xdbg_append(st->response, sizeof(st->response), "OK eval\n");
+    if (!expr) expr = "";
+    while (*expr == ' ' || *expr == '\t') expr++;
+
+    if (!lua_getstack(L, frame, &ar)) {
+        xdbg_eval_row(st, "E", "frame not found", 15);
+        xdbg_finish(st->response, sizeof(st->response));
+        return;
+    }
+
+    lua_newtable(L);
+    env = lua_gettop(L);
+    if (lua_getinfo(L, "f", &ar)) {
+        int func = lua_gettop(L);
+        for (i = 1;; i++) {
+            const char* name = lua_getupvalue(L, func, i);
+            if (!name) break;
+            if (name[0] == '(') { lua_pop(L, 1); continue; }
+            lua_setfield(L, env, name);
+        }
+        lua_pop(L, 1);
+    }
+    for (i = 1;; i++) {
+        const char* name = lua_getlocal(L, &ar, i);
+        if (!name) break;
+        if (name[0] == '(') { lua_pop(L, 1); continue; }
+        lua_setfield(L, env, name);
+    }
+    lua_newtable(L);
+    lua_pushglobaltable(L);
+    lua_setfield(L, -2, "__index");
+    lua_pushglobaltable(L);
+    lua_setfield(L, -2, "__newindex");
+    lua_setmetatable(L, env);
+
+    lua_newtable(L);
+    acc = lua_gettop(L);
+    lua_pushvalue(L, acc);
+    lua_pushcclosure(L, xdbg_eval_print, 1);
+    lua_setfield(L, env, "print");
+
+    snprintf(src, sizeof(src), "return %s", expr);
+    status = luaL_loadbuffer(L, src, strlen(src), "=xdebug-eval");
+    if (status != LUA_OK) {
+        lua_pop(L, 1);
+        status = luaL_loadbuffer(L, expr, strlen(expr), "=xdebug-eval");
+    }
+    if (status != LUA_OK) {
+        size_t elen = 0;
+        const char* emsg = lua_tolstring(L, -1, &elen);
+        xdbg_eval_row(st, "E", emsg ? emsg : "compile error", emsg ? elen : 13);
+        lua_settop(L, base);
+        xdbg_finish(st->response, sizeof(st->response));
+        return;
+    }
+    chunk = lua_gettop(L);
+    lua_pushvalue(L, env);
+    lua_setupvalue(L, chunk, 1);
+
+    lua_sethook(L, NULL, 0, 0);
+    status = lua_pcall(L, 0, LUA_MULTRET, 0);
+    lua_sethook(L, xdbg_hook, LUA_MASKLINE, 0);
+
+    {
+        lua_Integer n = luaL_len(L, acc), k;
+        for (k = 1; k <= n; k++) {
+            size_t len = 0;
+            const char* s;
+            lua_geti(L, acc, k);
+            s = lua_tolstring(L, -1, &len);
+            if (s) xdbg_eval_row(st, "O", s, len);
+            lua_pop(L, 1);
+        }
+    }
+
+    if (status != LUA_OK) {
+        size_t elen = 0;
+        const char* emsg = lua_tolstring(L, -1, &elen);
+        xdbg_eval_row(st, "E", emsg ? emsg : "error", emsg ? elen : 5);
+    } else if (lua_gettop(L) < chunk) {
+        xdbg_eval_row(st, "V", "", 0);
+    } else {
+        char val[16384];
+        xdbg_value(val, sizeof(val), L, chunk);
+        xdbg_eval_row(st, "V", val, strlen(val));
+    }
+    lua_settop(L, base);
+    xdbg_finish(st->response, sizeof(st->response));
+}
+
 static int xdbg_has_break_locked(const char* file, int line) {
     int i;
     for (i = 0; i < g_dbg.break_count; i++) {
@@ -687,6 +844,7 @@ static void xdbg_stop_locked(XDbgState* st, lua_State* L, const char* file, int 
         if (st->req == XDBG_REQ_STACK) xdbg_build_stack(st);
         else if (st->req == XDBG_REQ_LOCALS) xdbg_build_locals(st, st->req_frame);
         else if (st->req == XDBG_REQ_FIELDS) xdbg_build_fields(st, st->req_frame, st->req_path);
+        else if (st->req == XDBG_REQ_EVAL) xdbg_build_eval(st, st->req_frame, st->req_path);
         st->req = XDBG_REQ_NONE;
         xdbg_cond_signal(&g_dbg.cond);
     }
@@ -854,6 +1012,7 @@ static void xdbg_help(SOCKET_T fd) {
         "stack <thread>\n"
         "locals <thread> <frame>\n"
         "fields <thread> <frame> <path>\n"
+        "eval <thread> <frame> <expr>\n"
         "END\n");
 }
 
@@ -895,6 +1054,12 @@ static int xdbg_handle_line(SOCKET_T fd, char* line) {
         char* path = strtok(NULL, " \t");
         if (!id || !path) xdbg_send(fd, "ERR usage: fields <thread> <frame> <path>\nEND\n");
         else xdbg_cmd_request(fd, atoi(id), XDBG_REQ_FIELDS, frame ? atoi(frame) : 0, path);
+    } else if (strcmp(cmd, "eval") == 0) {
+        char* id = strtok(NULL, " \t");
+        char* frame = strtok(NULL, " \t");
+        char* expr = strtok(NULL, "");  /* remainder of the line, spaces kept */
+        if (!id || !frame) xdbg_send(fd, "ERR usage: eval <thread> <frame> <expr>\nEND\n");
+        else xdbg_cmd_request(fd, atoi(id), XDBG_REQ_EVAL, atoi(frame), expr ? expr : "");
     } else {
         xdbg_send(fd, "ERR unknown command\nEND\n");
     }

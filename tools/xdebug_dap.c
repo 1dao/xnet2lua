@@ -18,7 +18,11 @@
 #endif
 
 #define DAP_BUF_INIT 4096
-#define XDAP_LINE_MAX 2048
+/* Must hold the longest single line the native xdebug server emits, i.e. one
+** variable line "name\tvalue\tpath\texpandable\n". The value is capped native
+** side by xdbg_emit_var's buffer (16 KB), so keep this comfortably above it --
+** xreadline drops the overflow and corrupts framing otherwise. */
+#define XDAP_LINE_MAX 32768
 
 typedef struct { char *p; size_t n, cap; } Str;
 typedef struct { char **v; int n, cap; } Lines;
@@ -28,8 +32,10 @@ typedef struct { char *file; int *lines; int n, cap; } BpFile;
 typedef struct { BpFile *v; int n, cap; } Breakpoints;
 typedef struct { int id, tid, frame; } FrameRef;
 typedef struct { FrameRef *v; int n, cap; } Frames;
-typedef struct { int id, kind, tid, frame; char *path; } VarRef;
+typedef struct { int id, kind, tid, frame; char *path, *ename; } VarRef;
 typedef struct { VarRef *v; int n, cap; } Vars;
+typedef struct { char *name, *val; } EvalVar;
+typedef struct { EvalVar *v; int n, cap; } EvalVars;
 typedef struct { int tid; char reason[32]; } Reason;
 typedef struct { Reason *v; int n, cap; } Reasons;
 
@@ -57,6 +63,7 @@ typedef struct Session {
     Threads threads;
     Frames frames;
     Vars vars;
+    EvalVars evals;
     Reasons reasons;
 } Session;
 
@@ -514,16 +521,61 @@ static FrameRef *frames_find(Session *s, int id) {
     return NULL;
 }
 
-static int vars_add(Session *s, int kind, int tid, int frame, const char *path) {
+static int vars_add(Session *s, int kind, int tid, int frame, const char *path, const char *ename) {
     if (!reserve_vec((void **)&s->vars.v, &s->vars.cap, s->vars.n + 1, sizeof(VarRef))) return 0;
     int id = s->next_var++;
-    s->vars.v[s->vars.n++] = (VarRef){ id, kind, tid, frame, path && *path ? sdup(path) : NULL };
+    s->vars.v[s->vars.n++] = (VarRef){ id, kind, tid, frame,
+                                       path && *path ? sdup(path) : NULL,
+                                       ename && *ename ? sdup(ename) : NULL };
     return id;
 }
 
 static VarRef *vars_find(Session *s, int id) {
     for (int i = 0; i < s->vars.n; i++) if (s->vars.v[i].id == id) return &s->vars.v[i];
     return NULL;
+}
+
+/* Cache of evaluateName -> value for the current stop. VS Code's "Copy Value",
+** Watch and hover all issue an `evaluate` request; the native protocol has no
+** expression evaluator, so we answer from the values we already streamed in the
+** variables responses. Reset whenever a thread resumes (values go stale). */
+static void evals_put(Session *s, const char *name, const char *val) {
+    if (!name || !*name) return;
+    for (int i = 0; i < s->evals.n; i++) {
+        if (strcmp(s->evals.v[i].name, name) == 0) {
+            free(s->evals.v[i].val);
+            s->evals.v[i].val = sdup(val ? val : "");
+            return;
+        }
+    }
+    if (!reserve_vec((void **)&s->evals.v, &s->evals.cap, s->evals.n + 1, sizeof(EvalVar))) return;
+    s->evals.v[s->evals.n].name = sdup(name);
+    s->evals.v[s->evals.n].val = sdup(val ? val : "");
+    s->evals.n++;
+}
+
+static const char *evals_get(Session *s, const char *name) {
+    if (!name) return NULL;
+    for (int i = 0; i < s->evals.n; i++)
+        if (strcmp(s->evals.v[i].name, name) == 0) return s->evals.v[i].val;
+    return NULL;
+}
+
+static void evals_reset(Session *s) {
+    for (int i = 0; i < s->evals.n; i++) { free(s->evals.v[i].name); free(s->evals.v[i].val); }
+    s->evals.n = 0;
+}
+
+/* Build a child's evaluateName from its parent's, e.g. "req"+"headers" ->
+** "req.headers" and "req.headers"+"[\"x-api-key\"]" -> the bracketed form. The
+** native side already prints non-identifier keys as ["..."] / [n]. */
+static char *ename_join(const char *parent, const char *name) {
+    Str s = {0};
+    if (!parent || !*parent) return sdup(name ? name : "");
+    sb_add(&s, parent);
+    if (name && name[0] == '[') sb_add(&s, name);
+    else { sb_add(&s, "."); sb_add(&s, name ? name : ""); }
+    return s.p ? s.p : sdup(parent);
 }
 
 static void reason_set(Session *s, int tid, const char *reason) {
@@ -576,8 +628,10 @@ static void session_free(Session *s) {
     breakpoints_free(&s->bps);
     threads_free(&s->threads);
     free(s->frames.v);
-    for (int i = 0; i < s->vars.n; i++) free(s->vars.v[i].path);
+    for (int i = 0; i < s->vars.n; i++) { free(s->vars.v[i].path); free(s->vars.v[i].ename); }
     free(s->vars.v);
+    evals_reset(s);
+    free(s->evals.v);
     free(s->reasons.v);
     free(s);
 }
@@ -783,7 +837,14 @@ static int poll_threads(Session *s) {
     char err[XSOCK_ERR_LEN] = {0}, reason[32];
     Threads next;
     if (!s || s->xfd == INVALID_SOCKET_VAL) return 0;
-    if (!get_threads(s, &next, err)) return 0;
+    if (!get_threads(s, &next, err)) {
+        /* The native debug server is gone -- debuggee exited / window closed.
+        ** End the DAP session so VS Code stops debugging and the bridge process
+        ** exits, instead of lingering on a dead connection. */
+        send_event(s, "terminated", "{}");
+        session_close(s);
+        return 0;
+    }
     for (int i = 0; i < next.n; i++) {
         Thread *t = &next.v[i], *prev = threads_find(&s->threads, t->id);
         if (!prev) {
@@ -835,7 +896,8 @@ static void on_initialize(Session *s, Request *req) {
         "\"supportsTerminateRequest\":true,"
         "\"supportsSingleThreadExecutionRequests\":true,"
         "\"supportsStepInTargetsRequest\":false,"
-        "\"supportsEvaluateForHovers\":false,"
+        "\"supportsEvaluateForHovers\":true,"
+        "\"supportsClipboardContext\":true,"
         "\"supportsSetVariable\":false}";
     send_response(s, req, body, 1, NULL);
     send_event(s, "initialized", "{}");
@@ -1011,8 +1073,8 @@ static void on_scopes(Session *s, Request *req) {
     Str body = {0};
     sb_add(&body, "{\"scopes\":[");
     if (fr) {
-        int thread_ref = vars_add(s, 1, fr->tid, fr->frame, NULL);
-        int locals_ref = vars_add(s, 2, fr->tid, fr->frame, NULL);
+        int thread_ref = vars_add(s, 1, fr->tid, fr->frame, NULL, NULL);
+        int locals_ref = vars_add(s, 2, fr->tid, fr->frame, NULL, NULL);
         sb_printf(&body,
             "{\"name\":\"XNet Thread\",\"variablesReference\":%d,\"expensive\":false},"
             "{\"name\":\"Locals\",\"variablesReference\":%d,\"expensive\":false}",
@@ -1024,13 +1086,19 @@ static void on_scopes(Session *s, Request *req) {
 }
 
 static void add_var(Session *s, Str *arr, int *count, int tid, int frame,
-                    const char *name, const char *value, const char *path, int expandable) {
-    int ref = expandable && path && *path ? vars_add(s, 3, tid, frame, path) : 0;
+                    const char *name, const char *value, const char *path, int expandable,
+                    const char *ename) {
+    int ref = expandable && path && *path ? vars_add(s, 3, tid, frame, path, ename) : 0;
+    if (ename && *ename) evals_put(s, ename, value ? value : "");
     if ((*count)++) sb_add(arr, ",");
     sb_add(arr, "{\"name\":");
     sb_json(arr, name);
     sb_add(arr, ",\"value\":");
     sb_json(arr, value ? value : "");
+    if (ename && *ename) {
+        sb_add(arr, ",\"evaluateName\":");
+        sb_json(arr, ename);
+    }
     sb_printf(arr, ",\"variablesReference\":%d}", ref);
 }
 
@@ -1043,11 +1111,11 @@ static void on_variables(Session *s, Request *req) {
         Thread *t = threads_find(&s->threads, vr->tid);
         char tmp[64], at[1200] = "";
         snprintf(tmp, sizeof(tmp), "%d", vr->tid);
-        add_var(s, &arr, &count, 0, 0, "xnet_thread_id", tmp, NULL, 0);
-        add_var(s, &arr, &count, 0, 0, "status", t && t->stopped ? "stopped" : "running", NULL, 0);
-        add_var(s, &arr, &count, 0, 0, "script", t ? t->script : "", NULL, 0);
+        add_var(s, &arr, &count, 0, 0, "xnet_thread_id", tmp, NULL, 0, "xnet_thread_id");
+        add_var(s, &arr, &count, 0, 0, "status", t && t->stopped ? "stopped" : "running", NULL, 0, "status");
+        add_var(s, &arr, &count, 0, 0, "script", t ? t->script : "", NULL, 0, "script");
         if (t && t->file && *t->file) snprintf(at, sizeof(at), "%s:%d", t->file, t->line);
-        add_var(s, &arr, &count, 0, 0, "stopped_at", at, NULL, 0);
+        add_var(s, &arr, &count, 0, 0, "stopped_at", at, NULL, 0, "stopped_at");
     } else if (vr) {
         char err[XSOCK_ERR_LEN] = {0};
         Lines lines;
@@ -1064,8 +1132,12 @@ static void on_variables(Session *s, Request *req) {
             if (strncmp(lines.v[i], "ERR ", 4) == 0) break;
             char *tmp = sdup(lines.v[i]), *p[4] = {0};
             split_tabs(tmp, p, 4);
-            if (p[0] && p[1]) add_var(s, &arr, &count, vr->tid, vr->frame,
-                                      p[0], p[1], p[2] ? p[2] : "", p[3] && atoi(p[3]) != 0);
+            if (p[0] && p[1]) {
+                char *cename = (vr->kind == 3) ? ename_join(vr->ename, p[0]) : sdup(p[0]);
+                add_var(s, &arr, &count, vr->tid, vr->frame,
+                        p[0], p[1], p[2] ? p[2] : "", p[3] && atoi(p[3]) != 0, cename);
+                free(cename);
+            }
             free(tmp);
         }
         lines_free(&lines);
@@ -1088,6 +1160,7 @@ static void resume_req(Session *s, Request *req, int tid, const char *cmd, const
         return;
     }
     lines_free(&lines);
+    evals_reset(s);  /* cached variable values belong to the stop we just left */
     if (all) {
         for (int i = 0; i < s->threads.n; i++) s->threads.v[i].stopped = 0;
     } else {
@@ -1104,6 +1177,84 @@ static void resume_req(Session *s, Request *req, int tid, const char *cmd, const
     sb_printf(&b, "{\"allThreadsContinued\":%s}", all ? "true" : "false");
     send_response(s, req, b.p, 1, NULL);
     sb_free(&b);
+}
+
+/* Reverse xdbg_eval_row's escaping (\\, \n, \r, \t) back into raw bytes. */
+static void eval_unescape(Str *out, const char *s) {
+    for (; s && *s; s++) {
+        if (*s == '\\' && s[1]) {
+            char c = *++s, r = c == 'n' ? '\n' : c == 'r' ? '\r' : c == 't' ? '\t' : c;
+            sb_addn(out, &r, 1);
+        } else {
+            sb_addn(out, s, 1);
+        }
+    }
+}
+
+/* DAP `evaluate`. Copy Value (clipboard) is served from the value we already
+** streamed for that variable -- exact and cheap. Debug Console / Watch / hover
+** run a real native eval at the selected frame; any print() output comes back
+** as `output` events. Falls back to the cache when there is no frame context or
+** the eval transport fails. */
+static void on_evaluate(Session *s, Request *req) {
+    char *expr = json_get_string(req->json, req->end, "expression");
+    char *ctx = json_get_string(req->json, req->end, "context");
+    int is_clipboard = ctx && strcmp(ctx, "clipboard") == 0;
+    FrameRef *fr = frames_find(s, json_get_int(req->json, req->end, "frameId", 0));
+
+    if (expr && !is_clipboard && fr) {
+        for (char *p = expr; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
+        Lines lines;
+        char err[XSOCK_ERR_LEN] = {0};
+        if (xcmd(s, &lines, err, "eval %d %d %s", fr->tid, fr->frame, expr)) {
+            Str result = {0};
+            int is_err = 0;
+            for (int i = 0; i < lines.n; i++) {
+                const char *ln = lines.v[i];
+                if (strncmp(ln, "O\t", 2) == 0) {
+                    Str o = {0}, ev = {0};
+                    eval_unescape(&o, ln + 2);
+                    if (o.n == 0 || o.p[o.n - 1] != '\n') sb_add(&o, "\n");
+                    sb_add(&ev, "{\"category\":\"stdout\",\"output\":");
+                    sb_json(&ev, o.p ? o.p : "");
+                    sb_add(&ev, "}");
+                    send_event(s, "output", ev.p);
+                    sb_free(&ev);
+                    sb_free(&o);
+                } else if (strncmp(ln, "V\t", 2) == 0 || strncmp(ln, "E\t", 2) == 0) {
+                    sb_free(&result);
+                    memset(&result, 0, sizeof(result));
+                    eval_unescape(&result, ln + 2);
+                    is_err = ln[0] == 'E';
+                }
+            }
+            lines_free(&lines);
+            if (is_err) {
+                send_response(s, req, "{}", 0, result.p ? result.p : "eval error");
+            } else {
+                Str b = {0};
+                sb_add(&b, "{\"result\":");
+                sb_json(&b, result.p ? result.p : "");
+                sb_add(&b, ",\"variablesReference\":0}");
+                send_response(s, req, b.p, 1, NULL);
+                sb_free(&b);
+            }
+            sb_free(&result);
+            free(expr);
+            free(ctx);
+            return;
+        }
+    }
+
+    const char *val = evals_get(s, expr);
+    Str b = {0};
+    sb_add(&b, "{\"result\":");
+    sb_json(&b, val ? val : "");
+    sb_add(&b, ",\"variablesReference\":0}");
+    send_response(s, req, b.p, 1, NULL);
+    sb_free(&b);
+    free(expr);
+    free(ctx);
 }
 
 static void handle_request(Session *s, Request *req) {
@@ -1148,7 +1299,7 @@ static void handle_request(Session *s, Request *req) {
         send_response(s, req, "{}", 1, NULL);
         session_close(s);
     } else if (strcmp(cmd, "evaluate") == 0) {
-        send_response(s, req, "{\"result\":\"\",\"variablesReference\":0}", 1, NULL);
+        on_evaluate(s, req);
     } else {
         send_response(s, req, "{}", 1, NULL);
     }
