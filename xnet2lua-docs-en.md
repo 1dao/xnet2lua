@@ -29,6 +29,7 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 18. xnats Cross-Process RPC
 19. Hot Reload Protocol
 20. Lua Debugging and VSCode Debugging
+21. xagent Desktop Coding Assistant
 
 ---
 
@@ -3344,3 +3345,57 @@ use `XDEBUG_WAIT=0`.
 
 Look at the Call Stack thread name or the `XNet Thread` scope in the Variables
 panel.
+
+---
+
+## 21. xagent Desktop Coding Assistant
+
+`scripts/xagent/` is a full application built on top of this runtime — a Claude
+Code-style local coding assistant whose interaction layer is a **raygui desktop
+GUI** (not a terminal TUI). It is the runtime's showcase: a streaming TLS
+client, coroutine-as-async/await, xthread subprocess offload, and a tick-driven
+GUI running concurrently with network I/O.
+
+### 21.1 Running
+
+```bash
+# Desktop GUI
+bin/xnet scripts/xagent/gui.lua
+
+# Headless single turn (--print style; non-ASCII prompts via a UTF-8 file)
+bin/xnet scripts/xagent/main.lua "PROMPT_FILE=question.txt"
+```
+
+Configuration lives in `scripts/xagent/config.lua`: non-secret keys
+(`XAGENT_BASE_URL` / `XAGENT_MODEL` / `XAGENT_AUTH_STYLE`) go in `xnet.cfg`; the
+secret `XAGENT_AUTH_TOKEN` goes in the **gitignored** `xagent.local.cfg`. It
+targets the Anthropic Messages API and is validated against DeepSeek's
+`/anthropic`-compatible endpoint.
+
+### 21.2 How it exercises the runtime
+
+| Runtime capability | xagent usage |
+|---|---|
+| `xnet.connect_tls` + bundled CA | Direct HTTPS to the LLM endpoint |
+| Streaming framing (raw `on_data`) | `llm/sse.lua` de-chunks + parses SSE incrementally |
+| Coroutine + async callbacks | The agent loop is a coroutine: start async HTTPS, `yield`, `resume` from the SSE callback |
+| `xthread` worker | Blocking `io.popen` is offloaded to a worker (`proc/`); results `post` back and `resume` the loop |
+| Tick loop (`__update`) | One raygui frame per tick while the same tick pumps xpoll/xtimer, so streaming and rendering run in parallel |
+| `xutils.json` / `scan_dir` / base64 / sha | Request/response codec, file tools, image base64 |
+| UTF-8 manifest (see §2) | End-to-end UTF-8 for non-ASCII paths through the GUI/subprocess |
+
+### 21.3 Feature overview
+
+- **Streaming chat** + tool turns (`tool_use` → `tool_result`, multi-round); auto-retry on transient network drops
+- **12 tools**: Read / Write / Edit / MultiEdit / LS / Glob / Grep / Bash / WebFetch / MemoryWrite / TodoWrite / Skill
+- **Context management**: usage-anchored token budget + two-tier compaction (near the limit, micro-clear old tool outputs first, then LLM-summarize while keeping a tool-pair-safe recent tail)
+- **Sessions**: JSON persistence (`~/.xagent/sessions`), rename/delete, grouped by working directory, resume
+- **Project memory**: walk up for `AGENT.md` / `CLAUDE.md` and inject into the system prompt; `MemoryWrite` tool appends
+- **Skills**: discover `<user|project>/.xagent/skills/<name>/SKILL.md`, list them in the system prompt, invoke via the `Skill` tool or `/<name> [args]`; `paths` frontmatter enables touch-triggered conditional activation
+- **GUI**: virtualized streaming transcript, Markdown, color emoji, switchable themes, history sidebar, directory picker, **image paste (multimodal input)**, context-usage meter, and `/compact` `/context` … slash commands
+
+### 21.4 Going deeper
+
+- Detailed design (architecture / phased roadmap / per-module mapping): `xagent_design_v1.md`
+- Feature parity vs easy-agent: `xagent_功能对照.md`; source mapping: `xagent_源码对照.md`
+- Offline tests: `tests/lua/xagent_{llm,tools,session,context,skills}_spec.lua` (66 cases, `make -C tests unit-lua`)

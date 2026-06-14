@@ -117,7 +117,12 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/http_codec_spec.lua \
 	tests/lua/http_client_spec.lua \
 	tests/lua/websocket_spec.lua \
-	tests/lua/xutils_crypto_spec.lua
+	tests/lua/xutils_crypto_spec.lua \
+	tests/lua/xagent_llm_spec.lua \
+	tests/lua/xagent_tools_spec.lua \
+	tests/lua/xagent_session_spec.lua \
+	tests/lua/xagent_context_spec.lua \
+	tests/lua/xagent_skills_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \
@@ -184,6 +189,7 @@ coverage-c: $(C_UNIT_COVERAGE_TARGET)
 	for src in $(C_UNIT_ROOT_SRCS); do \
 		$(GCOV) -o coverage $$src; \
 	done
+	@$(RM) $(COVERAGE_DIR)
 
 test: unit test-c test-lua-core
 
@@ -250,11 +256,13 @@ $(XTHREAD_TEST_TARGET): $(XTHREAD_TEST_SRCS) | $(BIN_DIR)
 	$(RM) $(XTHREAD_TEST_BUILD)
 	$(CC) $(CFLAGS) -o $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_SRCS) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS)
 	$(MV) $(XTHREAD_TEST_BUILD) $(XTHREAD_TEST_TARGET)
+	@$(RM) $(XTHREAD_TEST_BUILD:$(EXE_EXT)=.d)
 
 $(C_UNIT_TARGET): $(C_UNIT_SRCS) | $(BIN_DIR)
 	$(RM) $(C_UNIT_BUILD)
 	$(CC) $(C_UNIT_CFLAGS) -o $(C_UNIT_BUILD) $(C_UNIT_SRCS) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS)
 	$(MV) $(C_UNIT_BUILD) $(C_UNIT_TARGET)
+	@$(RM) $(C_UNIT_BUILD:$(EXE_EXT)=.d)
 
 $(C_UNIT_COVERAGE_TARGET): $(C_UNIT_COVERAGE_OBJS) | $(BIN_DIR)
 	$(RM) $(C_UNIT_COVERAGE_TARGET)

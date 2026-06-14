@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "XAgent Lua Attach :19090",
+            "type": "node",
+            "request": "attach",
+            "debugServer": 4711,
+            "preLaunchTask": "xnet-xdebug-dap",
+            "cwd": "${workspaceFolder}",
+            "xdebugHost": "127.0.0.1",
+            "xdebugPort": 19090
+        }
+    ]
+}

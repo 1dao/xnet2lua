@@ -1,0 +1,26 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "xnet-xdebug-dap",
+            "type": "shell",
+            "command": "${workspaceFolder}/tools/xdebug_dap.exe",
+            "args": [
+                "--listen", "4711",
+                "--xdebug-host", "127.0.0.1",
+                "--xdebug-port", "19090",
+                "--cwd", "${workspaceFolder}"
+            ],
+            "isBackground": true,
+            "problemMatcher": {
+                "owner": "xnet-xdebug-dap",
+                "pattern": { "regexp": ".*" },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "xnet-xdebug-dap starting",
+                    "endsPattern": "xnet-xdebug-dap listening"
+                }
+            }
+        }
+    ]
+}
