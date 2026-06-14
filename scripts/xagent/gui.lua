@@ -19,11 +19,14 @@ local registry      = require('xagent.tools.registry')
 local system_prompt = require('xagent.context.system_prompt')
 local project_md    = require('xagent.context.project_md')
 local subprocess    = require('xagent.proc.subprocess')
+local mcp           = require('xagent.mcp.bootstrap')
+local mcp_registry  = require('xagent.mcp.registry')
 local session       = require('xagent.session.session')
 local transcript    = require('xagent.ui.transcript')
 local markdown      = require('xagent.ui.markdown')
 local text          = dofile('scripts/core/share/xtext.lua')
 local fs            = dofile('scripts/core/share/xfs.lua')
+local api_log       = require('xagent.llm.api_log')
 
 registry.register(require('xagent.tools.read'))
 registry.register(require('xagent.tools.write'))
@@ -81,10 +84,14 @@ local S = {
     emoji_tex = nil,
     cfg = nil,
     started = false,
-    -- left sidebar: nil | 'history' | 'settings'
+    -- left sidebar: nil | 'history' | 'settings' | 'apilog'
     sidebar = nil,
     history_items = {},
     history_scroll = 0,        -- pixel scroll offset of the history list
+    -- API request/response log panel (in-memory, this run only)
+    apilog_scroll = 0,         -- pixel scroll of the API-log list
+    apilog_selected = nil,     -- the log record whose detail is shown in the main area
+    log_view = nil,            -- transcript view used to render the selected record
     renaming = nil,            -- id of the session being renamed inline
     rename_text = '',
     rename_edit = false,
@@ -312,10 +319,33 @@ local function handle_slash(text)
         S.input = ''
         new_session()
         return true
+    elseif cmd == 'mcp' then
+        S.input = ''
+        local lines = { 'MCP 服务器:' }
+        local conns = mcp_registry.connections()
+        if S.mcp_status == 'connecting' then
+            lines[#lines + 1] = '（连接中…）'
+        end
+        if #conns == 0 then
+            lines[#lines + 1] = '（未配置；在 ~/.xagent/mcp.json 或 <当前目录>/.mcp.json ' ..
+                '中添加 mcpServers，重启后生效）'
+        else
+            for _, c in ipairs(conns) do
+                local entry = mcp_registry.get(c.name)
+                local n = entry and #entry.tools or 0
+                local icon = (c.status == 'connected' and '●')
+                    or (c.status == 'pending' and '◐') or '○'
+                local line = string.format('%s %s  [%s]  %d 工具', icon, c.name, c.status, n)
+                if c.error then line = line .. '  — ' .. tostring(c.error) end
+                lines[#lines + 1] = line
+            end
+        end
+        add('system', table.concat(lines, '\n'))
+        return true
     elseif cmd == 'help' then
         S.input = ''
         local lines = { '可用命令:', '/compact [重点]  压缩上下文', '/context  查看上下文用量',
-                        '/new  新会话', '/help  帮助' }
+                        '/mcp  查看 MCP 服务器', '/new  新会话', '/help  帮助' }
         local sk = require('xagent.skills').all_user_invocable()
         if #sk > 0 then
             lines[#lines + 1] = ''
@@ -527,7 +557,139 @@ end
 local function toggle_sidebar(mode)
     if S.sidebar == mode then S.sidebar = nil; return end
     if mode == 'history' then refresh_history(); S.history_scroll = 0 end
+    if mode == 'apilog' then S.apilog_scroll = 0; S.apilog_selected = nil end
     S.sidebar = mode
+end
+
+-- ── API request/response log panel ─────────────────────────────────────────
+-- Insert newlines at structural points of a compact JSON body so it wraps and
+-- reads reasonably. String-aware: breaks are added ONLY outside quoted strings,
+-- so the result is still valid JSON (copyable + parseable), never split mid-value.
+local function reflow_json(s)
+    s = tostring(s or '')
+    local out, oi = {}, 0
+    local instr, esc = false, false
+    for i = 1, #s do
+        local c = s:sub(i, i)
+        oi = oi + 1; out[oi] = c
+        if instr then
+            if esc then esc = false
+            elseif c == '\\' then esc = true
+            elseif c == '"' then instr = false end
+        elseif c == '"' then instr = true
+        elseif c == ',' or c == '{' or c == '[' then
+            oi = oi + 1; out[oi] = '\n'
+        end
+    end
+    return table.concat(out)
+end
+
+local function shorttok(v)
+    if not v then return '?' end
+    if v >= 1000 then return string.format('%.1fk', v / 1000) end
+    return tostring(v)
+end
+
+-- COMPLETE HTTP request as raw text (request line + headers + full body); this is
+-- what the 请求 copy button puts on the clipboard. Auth header is already redacted
+-- in api_log. NOT reflowed — the body is the exact bytes we sent.
+local function http_request_text(rec)
+    local lines = { (rec.method or 'POST') .. ' ' .. tostring(rec.url or '') }
+    if type(rec.headers) == 'table' then
+        local keys = {}
+        for k in pairs(rec.headers) do keys[#keys + 1] = k end
+        table.sort(keys)
+        for _, k in ipairs(keys) do lines[#lines + 1] = k .. ': ' .. tostring(rec.headers[k]) end
+    end
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = rec.request or ''
+    if rec.req_truncated then
+        lines[#lines + 1] = string.format('\n…[请求体过大，已截断；原始 %d 字节]', rec.request_bytes or 0)
+    end
+    return table.concat(lines, '\n')
+end
+
+-- COMPLETE response as raw text (status line + full answer + tool calls); this is
+-- what the 返回 copy button puts on the clipboard (uses answer_full, not the 100B
+-- preview).
+local function http_response_text(rec)
+    local lines = {}
+    if not rec.done then
+        lines[#lines + 1] = '（进行中…）'
+    elseif rec.error then
+        lines[#lines + 1] = 'HTTP ' .. tostring(rec.status or '-') .. ' 失败'
+        lines[#lines + 1] = '错误: ' .. tostring(rec.error)
+    else
+        lines[#lines + 1] = string.format('HTTP %s  stop=%s  in=%s out=%s tok  %dms',
+            tostring(rec.status or '-'), tostring(rec.stop_reason or '?'),
+            tostring(rec.usage and rec.usage.input_tokens or '?'),
+            tostring(rec.usage and rec.usage.output_tokens or '?'),
+            rec.elapsed_ms or 0)
+        if rec.tool_calls then lines[#lines + 1] = '工具调用: ' .. rec.tool_calls end
+        lines[#lines + 1] = ''
+        lines[#lines + 1] = rec.answer_full or rec.answer or ''
+    end
+    return table.concat(lines, '\n')
+end
+
+-- Build the read-only detail "transcript" for one API-log record. The two body
+-- rows carry an explicit copy_text = the COMPLETE raw request / response, so the
+-- 复制 button copies the full original (not the reflowed preview). Other rows opt
+-- out of copy via no_copy.
+local function build_log_detail(rec)
+    local rows = {}
+    local function L(role, t, extra)
+        local row = { role = role, text = t or '' }
+        if extra then for k, v in pairs(extra) do row[k] = v end end
+        rows[#rows + 1] = row
+    end
+    if not rec then return rows end
+
+    L('user', string.format('请求 #%d  ·  %s', rec.seq, os.date('%Y-%m-%d %H:%M:%S', rec.ts)), { no_copy = true })
+    L('system', '')
+
+    -- ── 请求 ── (body row copies the COMPLETE raw HTTP request)
+    L('tool', '请求方法：' .. (rec.method or 'POST'), { no_copy = true })
+    L('tool', '请求地址：' .. tostring(rec.url or ''), { no_copy = true })
+    L('system', '模型：' .. tostring(rec.model or '?'))
+    L('user', '【请求参数】（点“复制”得到完整 HTTP 请求）', { no_copy = true })
+    L('tool_result', (rec.request ~= '' and reflow_json(rec.request)) or '（空）',
+        { copy_text = http_request_text(rec) })
+    if rec.req_truncated then
+        L('system', string.format('… 请求体过大仅截断“显示”，复制仍为完整（原始 %d 字节）', rec.request_bytes or 0))
+    end
+
+    L('system', '')
+    -- ── 返回 ── (body row copies the COMPLETE response incl. full content)
+    if not rec.done then
+        L('tool', '返回状态：进行中…', { no_copy = true })
+    elseif rec.error then
+        L('tool', '返回状态：HTTP ' .. tostring(rec.status or '-') .. '  失败', { no_copy = true })
+        L('error', '错误：' .. tostring(rec.error))
+    else
+        L('tool', string.format('返回状态：HTTP %s  ·  stop=%s  ·  输入 %s / 输出 %s tok  ·  %dms',
+            tostring(rec.status or '-'), tostring(rec.stop_reason or '?'),
+            tostring(rec.usage and rec.usage.input_tokens or '?'),
+            tostring(rec.usage and rec.usage.output_tokens or '?'),
+            rec.elapsed_ms or 0), { no_copy = true })
+    end
+    if rec.tool_calls then L('system', '工具调用：' .. rec.tool_calls) end
+    L('user', '【返回内容】（显示前 100 字节；点“复制”得到完整返回）', { no_copy = true })
+    L('tool_result', (rec.answer ~= '' and rec.answer)
+        or (rec.done and not rec.error and '（无文本，仅工具调用或空回答）' or '（暂无）'),
+        { copy_text = http_response_text(rec) })
+    if rec.answer_truncated then L('system', '… 回答超过 100 字节，仅“显示”截断；复制为完整内容') end
+    return rows
+end
+
+-- Select a log record to show in the main area; clicking the active one closes it.
+local function select_log(rec)
+    if S.apilog_selected == rec then rec = nil end
+    S.apilog_selected = rec
+    S.log_detail = build_log_detail(rec)
+    S.log_detail_for = rec
+    S.log_detail_done = rec and rec.done or nil
+    if S.log_view then S.log_view.scroll = 0; S.log_view.follow = false end
 end
 
 local function load_history_item(it)
@@ -628,6 +790,7 @@ local function apply_theme(name)
     S.header_bg = base
     S.sidebar_bg = shift(bg, dark and 8 or -8)
     S.view:invalidate()
+    if S.log_view then S.log_view.bg = bg; S.log_view:invalidate() end
 
     pcall(function()
         fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
@@ -656,12 +819,20 @@ local function __init()
 
     -- Color emoji come from the atlas (the font has no emoji glyphs).
     S.emoji_tex = raygui.load_texture('tools/emoji_atlas.png')
-    S.view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui, emoji_tex = S.emoji_tex })
-    -- Copy a message's raw Markdown to the clipboard (the "复制" button per answer).
-    S.view.on_copy = function(entry)
-        raygui.set_clipboard(entry.text or '')
+    -- Copy puts the RAW source on the clipboard, never the rendered/reflowed text:
+    -- entry.copy_text (explicit raw payload) wins, else entry.text (raw Markdown).
+    local function copy_entry(entry)
+        raygui.set_clipboard(entry.copy_text or entry.text or '')
         S.status = 'copied ✓'
     end
+
+    S.view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui, emoji_tex = S.emoji_tex })
+    S.view.on_copy = copy_entry
+
+    -- A second view renders the selected API-log record's request/response detail.
+    S.log_view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui,
+        emoji_tex = S.emoji_tex, anchor_top = true })
+    S.log_view.on_copy = copy_entry
 
     -- Apply the saved (or default) color theme.
     local saved = fs.read_file(THEME_FILE)
@@ -686,6 +857,31 @@ local function __init()
         (pmd and '  (project memory loaded)' or '') ..
         '\nEnter 发送 · Ctrl+Enter 换行')
     S.started = true
+
+    -- Bring up MCP servers in the background. The handshake awaits the network,
+    -- so it runs as a coroutine that the event loop resumes between frames; tools
+    -- register globally, so we refresh the live session's tools param when done
+    -- (new/resumed sessions pick them up automatically at creation).
+    S.mcp_status = 'connecting'
+    local boot_co = coroutine.create(function()
+        -- bootstrap is best-effort (no throws): bad config / failed servers are
+        -- collected into summary.errors, never raised. It awaits the network, so
+        -- it isn't wrapped in pcall (yielding across pcall isn't safe on every
+        -- Lua backend); a stray error surfaces via the resume check below or, on
+        -- a later resume, xasync's resume-error log.
+        local summary = mcp.bootstrap(cwd, { verify = S.cfg.verify })
+        S.mcp_status = 'ready'
+        if summary.tool_count > 0 then
+            if S.sess then S.sess.tools = registry.to_api_params() end
+            add('system', string.format('✓ MCP：%d 个服务器已连接，新增 %d 个工具',
+                summary.connected, summary.tool_count))
+        elseif summary.connected > 0 then
+            add('system', string.format('✓ MCP：%d 个服务器已连接（无工具）', summary.connected))
+        end
+        for _, e in ipairs(summary.errors) do add('error', 'MCP: ' .. tostring(e)) end
+    end)
+    local ok, err = coroutine.resume(boot_co)
+    if not ok then S.mcp_status = 'error'; add('error', 'MCP 启动失败: ' .. tostring(err)) end
 end
 
 local function __update()
@@ -709,7 +905,7 @@ local function __update()
     if S.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
         status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
     end
-    raygui.label(12, 8, W - 260, 24, 'xagent  ·  ' ..
+    raygui.label(12, 8, W - 326, 24, 'xagent  ·  ' ..
         (S.cfg and S.cfg.model or '?') .. '  ·  ' .. status_text)
 
     -- context-usage meter: token count + a thin bar filling toward the window.
@@ -717,7 +913,7 @@ local function __update()
     -- imminent / just happened).
     local b = S.budget
     if b then
-        local mw, mx, my, mh = 96, W - 196, 15, 8
+        local mw, mx, my, mh = 96, W - 238, 15, 8
         local kt = b.estimated >= 1000 and string.format('%.1fk', b.estimated / 1000)
             or tostring(b.estimated)
         raygui.label(mx - 70, 8, 66, 24, kt .. ' tok')
@@ -731,8 +927,9 @@ local function __update()
         raygui.draw_rectangle(mx, my, math.floor(mw * pct), mh, fill[1], fill[2], fill[3], 255)
     end
 
-    if raygui.button(W - 88, 6, 38, 28, '#141#') then toggle_sidebar('settings') end   -- gear
-    if raygui.button(W - 46, 6, 38, 28, '#139#') then toggle_sidebar('history') end    -- clock
+    if raygui.button(W - 130, 6, 38, 28, '#141#') then toggle_sidebar('settings') end  -- gear
+    if raygui.button(W - 88, 6, 38, 28, '#139#') then toggle_sidebar('history') end    -- clock
+    if raygui.button(W - 46, 6, 38, 28, '#171#') then toggle_sidebar('apilog') end     -- link-net: API log
 
     -- left sidebar (inline, default hidden); shifts the main area right
     local lx = 0
@@ -851,6 +1048,56 @@ local function __update()
                 end
                 raygui.end_scissor()
             end
+        elseif S.sidebar == 'apilog' then
+            raygui.label(10, 46, SIDEBAR_W - 90, 22, 'API 记录')
+            if raygui.button(SIDEBAR_W - 78, 44, 70, 26, '清空') then
+                api_log.clear(); S.apilog_selected = nil
+                S.log_detail = nil; S.log_detail_for = nil
+            end
+            raygui.label(10, 74, SIDEBAR_W - 20, 20, '点击条目查看 请求/返回 详情（重启清空）')
+
+            local recs = api_log.list()
+            local n = #recs
+            local list_top = 100
+            local view_h = H - list_top - 8
+            local row_h = FONT_SIZE + 18
+            local max_scroll = math.max(0, n * row_h - view_h)
+
+            local mx, my = raygui.get_mouse()
+            local over = not S.dir_dialog and mx >= 0 and mx <= SIDEBAR_W
+                and my >= list_top and my <= list_top + view_h
+            if over then
+                local d = raygui.get_wheel()
+                if d ~= 0 then S.apilog_scroll = S.apilog_scroll - d * row_h * 1.5 end
+            end
+            if S.apilog_scroll > max_scroll then S.apilog_scroll = max_scroll end
+            if S.apilog_scroll < 0 then S.apilog_scroll = 0 end
+
+            if n == 0 then
+                raygui.label(10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无请求记录）')
+            else
+                raygui.begin_scissor(0, list_top, SIDEBAR_W, view_h)
+                for i = 1, n do
+                    local rec = recs[n - i + 1]          -- newest first
+                    local ry = list_top + (i - 1) * row_h - S.apilog_scroll
+                    if ry + row_h > list_top and ry < list_top + view_h then
+                        local icon = (not rec.done) and '○' or (rec.error and '×' or '✓')
+                        local lbl
+                        if rec.done and not rec.error then
+                            lbl = string.format('%s #%d %s  %s→%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
+                                shorttok(rec.usage and rec.usage.input_tokens),
+                                shorttok(rec.usage and rec.usage.output_tokens))
+                        elseif rec.error then
+                            lbl = string.format('%s #%d %s  失败', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+                        else
+                            lbl = string.format('%s #%d %s  …', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+                        end
+                        lbl = (rec == S.apilog_selected and '● ' or '   ') .. lbl
+                        if raygui.button(8, ry, SIDEBAR_W - 16, row_h - 5, lbl) then select_log(rec) end
+                    end
+                end
+                raygui.end_scissor()
+            end
         else -- settings
             raygui.label(10, 46, SIDEBAR_W - 20, 22, '配色方案')
             local by = 78
@@ -868,7 +1115,18 @@ local function __update()
     local att_h = (#S.attachments > 0) and 58 or 0
     local tx, ty = lx + 8, 44
     local tw, th = W - lx - 16, H - ty - input_h - att_h - 12
-    S.view:draw(S.entries, tx, ty, tw, th)
+    if S.sidebar == 'apilog' and S.apilog_selected then
+        local rec = S.apilog_selected
+        -- rebuild the detail if the record finished since it was first shown
+        if S.log_detail_for ~= rec or S.log_detail_done ~= rec.done then
+            S.log_detail = build_log_detail(rec)
+            S.log_detail_for = rec
+            S.log_detail_done = rec.done
+        end
+        S.log_view:draw(S.log_detail, tx, ty, tw, th)
+    else
+        S.view:draw(S.entries, tx, ty, tw, th)
+    end
 
     -- attachment strip: pasted images as thumbnails, each with a ✗ to remove
     if att_h > 0 then

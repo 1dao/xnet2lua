@@ -18,6 +18,7 @@ local registry    = require('xagent.tools.registry')
 local loop        = require('xagent.core.loop')
 local system_prompt = require('xagent.context.system_prompt')
 local subprocess  = require('xagent.proc.subprocess')
+local mcp         = require('xagent.mcp.bootstrap')
 
 -- Register the M1 tools.
 registry.register(require('xagent.tools.read'))
@@ -132,6 +133,19 @@ local function __init()
         local cwd = (r.stdout or '.'):gsub('%s+$', '')
 
         skills.bootstrap(cwd)
+
+        -- Bring up MCP servers (from ~/.xagent/mcp.json + <cwd>/.mcp.json) before
+        -- building the tools param, so any bridged mcp__* tools are advertised
+        -- to the model on the very first turn.
+        local mcp_sum = mcp.bootstrap(cwd, { verify = cfg.verify })
+        if mcp_sum.connected > 0 then
+            out(string.format('\27[90m[mcp] %d server(s) connected, %d tool(s)\27[0m\n',
+                mcp_sum.connected, mcp_sum.tool_count))
+        end
+        for _, e in ipairs(mcp_sum.errors) do
+            io.stderr:write('[mcp] ' .. tostring(e) .. '\n')
+        end
+
         local ctx = { cwd = cwd }
         local sys = system_prompt.build({ cwd = cwd })
         local rem = skills.reminder()

@@ -97,7 +97,10 @@ function M.new_view(opts)
         line_h = fs + 6,
         pad = 8,
         scroll = 0,
-        follow = true,        -- stick to bottom unless the user scrolls up
+        -- anchor_top: read top-down, never auto-jump to the bottom (used by the
+        -- API-log detail). Default views follow the streaming tail (chat).
+        anchor_top = opts.anchor_top or nil,
+        follow = not opts.anchor_top,   -- stick to bottom unless the user scrolls up
         cache = setmetatable({}, { __mode = 'k' }),   -- entry -> { width, len, lines }
         layout = nil,         -- tail-first incremental rows for the current entries/width
     }, View)
@@ -172,8 +175,10 @@ end
 local function entry_block(self, entry, width)
     local block = {}
     for _, r in ipairs(self:entry_rows(entry, width)) do block[#block + 1] = r end
-    -- copy button on any content message (skip the short tool-call cards + system)
-    if #entry.text > 0 and (entry.role == 'assistant' or entry.role == 'user' or entry.role == 'tool_result') then
+    -- copy button on any content message (skip the short tool-call cards + system,
+    -- and any entry that opted out via no_copy)
+    if #entry.text > 0 and not entry.no_copy
+        and (entry.role == 'assistant' or entry.role == 'user' or entry.role == 'tool_result') then
         block[#block + 1] = { copy = entry, entry = entry }
     end
     block[#block + 1] = { text = '' }
@@ -192,7 +197,7 @@ function View:ensure_layout(entries, width)
         l = { entries = entries, width = width, lo = #entries, hi = #entries - 1, rows = {} }
         self.layout = l
         self.scroll = 0
-        self.follow = true
+        self.follow = not self.anchor_top
         return l
     end
     -- same entries+width: append entries that just became stable (new messages)
@@ -276,7 +281,7 @@ function View:draw(entries, x, y, w, h)
     if self.follow then self.scroll = max_scroll end
     if self.scroll > max_scroll then self.scroll = max_scroll end
     if self.scroll < 0 then self.scroll = 0 end
-    if self.scroll >= max_scroll - 1 then self.follow = true end
+    if not self.anchor_top and self.scroll >= max_scroll - 1 then self.follow = true end
 
     -- which message is the pointer over? the copy button shows on hover only
     local hover_entry

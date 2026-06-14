@@ -10,6 +10,7 @@
 
 local stream = dofile('scripts/core/share/xhttp_stream.lua')
 local xutils = require('xutils')
+local api_log = require('xagent.llm.api_log')
 
 local M = {}
 
@@ -219,8 +220,16 @@ function M.stream_message(cfg, params, cb)
             return
         end
 
+        -- Record this HTTP attempt (in-memory, for the GUI's "API 记录" panel).
+        -- Each attempt is its own entry, so retried/dropped requests show up too.
+        local rec = api_log.begin({
+            model = params.model or cfg.model, url = req.url, method = 'POST',
+            body = req.body, headers = req.headers,
+        })
+
         local got_content = false
         local function retry_or_fail(msg, transient)
+            api_log.fail(rec, { error = msg })
             if transient and not got_content and n < max_retries then
                 attempt(n + 1)            -- immediate re-attempt (fresh connection)
             elseif cb.on_error then
@@ -235,7 +244,7 @@ function M.stream_message(cfg, params, cb)
                 if cb.on_tool_use_start then cb.on_tool_use_start(id, name) end
             end,
             on_tool_input = cb.on_tool_input,
-            on_done = function(r) if cb.on_done then cb.on_done(r) end end,
+            on_done = function(r) api_log.finish(rec, r); if cb.on_done then cb.on_done(r) end end,
             -- decoder errors include the "connection closed before any data"
             -- case (got_any=false) and SSE `error` events — both transient.
             on_error = function(m) retry_or_fail(m, true) end,
@@ -245,11 +254,13 @@ function M.stream_message(cfg, params, cb)
             url = req.url, method = 'POST', headers = req.headers, body = req.body,
             verify = cfg.verify, ca_file = cfg.ca_file,
         }, {
+            on_headers = function(status) api_log.set_status(rec, status) end,
             on_sse = function(event, data) decoder:on_sse(event, data) end,
             on_done = function() decoder:finish() end,   -- close before message_stop
             on_error = function(err) retry_or_fail('connection error: ' .. tostring(err), true) end,
             on_http_error = function(status, body)
                 local transient = (status == 429 or status >= 500)
+                api_log.set_status(rec, status)
                 retry_or_fail(format_http_error(status, body), transient)
             end,
         })
