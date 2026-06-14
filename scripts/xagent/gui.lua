@@ -119,6 +119,9 @@ local S = {
 local SIDEBAR_W = 290
 local THEMES = { 'nord', 'soft', 'candy', 'cyber', 'dark' }
 local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
+-- Last picked working directory, persisted so the NEXT app launch defaults its
+-- initial session to it (mirrors how THEME_FILE persists the color theme).
+local CWD_FILE   = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/cwd'
 
 -- ── color helpers ──────────────────────────────────────────────────────────
 local function unpack_color(v)
@@ -497,16 +500,27 @@ local function refresh_history()   -- reload items; keeps scroll, clears inline 
     S.menu_item = nil
 end
 
--- Switch the working directory for NEW sessions. Keeps the caller's UTF-8
--- string as-is (picker/dialog paths are already canonical; see dir_exists for
--- why we never round-trip the path through cmd's output).
+-- Persist the chosen working dir so the next app launch defaults to it.
+-- Best-effort (same pattern as the theme file); failure is silent.
+local function save_cwd(dir)
+    pcall(function()
+        fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
+        fs.write_file(CWD_FILE, dir)
+    end)
+end
+
+-- Switch the working directory and START A NEW SESSION rooted in it. Keeps the
+-- caller's UTF-8 string as-is (picker/dialog paths are already canonical; see
+-- dir_exists for why we never round-trip the path through cmd's output). The
+-- choice is persisted so the next launch opens its first session here too.
 local function apply_cwd(dir)
     dir = tostring(dir or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if #dir > 3 then dir = dir:gsub('[\\/]+$', '') end   -- keep "C:\" intact
     if dir ~= '' and dir_exists(dir) then
         S.cwd = dir
         skills.bootstrap(dir)   -- reload project skills for the new working dir
-        S.status = '目录已切换（新会话生效）'
+        save_cwd(dir)
+        new_session()           -- immediately switch to a fresh session here
     else
         print('[xagent] apply_cwd failed for: ' .. dir)   -- diagnosis via xlog
         S.status = '目录不存在: ' .. dir
@@ -751,7 +765,7 @@ function new_session()
     S.cur, S.text_tail, S.busy = nil, '', false
     S.budget = nil                               -- meter restarts on the next turn
     clear_attachments()
-    add('system', 'new session · ' .. S.cfg.model .. '\nEnter 发送 · Ctrl+Enter 换行')
+    add('system', 'new session · ' .. S.cfg.model .. ' · ' .. cwd .. '\nEnter 发送 · Ctrl+Enter 换行')
     S.sidebar = nil
     S.status = 'new session'
 end
@@ -848,7 +862,12 @@ local function __init()
         return
     end
 
+    -- Default the first session's dir to the last picked one (persisted across
+    -- launches); fall back to the process cwd if none saved or it's gone.
     local cwd = get_cwd()
+    local saved = fs.read_file(CWD_FILE)
+    saved = saved and saved:gsub('^%s+', ''):gsub('%s+$', '')
+    if saved and saved ~= '' and dir_exists(saved) then cwd = saved end
     S.cwd = cwd
     skills.bootstrap(cwd)   -- discover ~/.xagent/skills + <cwd>/.xagent/skills
     local pmd = project_md.load(cwd)

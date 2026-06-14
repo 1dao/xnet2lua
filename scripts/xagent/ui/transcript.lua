@@ -239,7 +239,8 @@ end
 
 function View:draw(entries, x, y, w, h)
     local rg, pad = self.rg, self.pad
-    local width = w - pad * 2
+    local SB_W = 8                          -- scrollbar track/thumb width
+    local width = w - pad * 2 - SB_W - 4     -- reserve a right gutter for the bar
     local viewport_h = h - pad * 2
     local visible_rows = math.max(1, math.ceil(viewport_h / self.line_h))
     local l = self:ensure_layout(entries, width)
@@ -278,6 +279,35 @@ function View:draw(entries, x, y, w, h)
 
     local total_h = total * self.line_h
     local max_scroll = math.max(0, total_h - viewport_h)
+
+    -- ── draggable scrollbar (right gutter) ──────────────────────────────────
+    -- Drag the thumb (or click the track) to jump anywhere instantly, instead
+    -- of crawling with the wheel. Geometry is reused by the draw pass below.
+    local sb_x, sb_y, sb_h = x + w - SB_W - 2, y + 2, h - 4
+    local function thumb_geom()
+        local th = math.min(sb_h, math.max(28, sb_h * viewport_h / total_h))
+        local trange = sb_h - th
+        local ty = sb_y + (max_scroll > 0 and (self.scroll / max_scroll) or 0) * trange
+        return th, ty, trange
+    end
+    -- Hidden by default; revealed when the pointer nears the right edge (a zone a
+    -- bit wider than the thin bar, so it's easy to find/grab) or while dragging.
+    local hot = mx >= sb_x - 12 and mx <= x + w and my >= y and my <= y + h
+    local down = (rg.mouse_down and rg.mouse_down()) or false
+    if max_scroll > 0 and not self.lock_input then
+        local th, ty, trange = thumb_geom()
+        if down and not self.prev_down and hot then            -- press edge
+            self.sb_drag = (my >= ty and my <= ty + th) and (my - ty) or (th / 2)
+        end
+        if self.sb_drag and down then                          -- dragging: map y → scroll
+            local rel = trange > 0 and ((my - self.sb_drag - sb_y) / trange) or 0
+            self.scroll = math.max(0, math.min(1, rel)) * max_scroll
+            self.follow = false
+        end
+    end
+    if not down then self.sb_drag = nil end
+    self.prev_down = down
+
     if self.follow then self.scroll = max_scroll end
     if self.scroll > max_scroll then self.scroll = max_scroll end
     if self.scroll < 0 then self.scroll = 0 end
@@ -314,12 +344,22 @@ function View:draw(entries, x, y, w, h)
             end
         elseif r.text and r.text ~= '' then
             if r.bg then
-                rg.draw_rectangle(x + pad - 3, ly - 1, w - pad * 2 + 6, self.line_h, r.bg[1], r.bg[2], r.bg[3], r.bg[4])
+                rg.draw_rectangle(x + pad - 3, ly - 1, width + 6, self.line_h, r.bg[1], r.bg[2], r.bg[3], r.bg[4])
             end
             self:draw_line(r.text, x + pad, ly, r.color)
         end
     end
     rg.end_scissor()
+
+    -- scrollbar track + thumb — only while hovered (hot) or being dragged
+    if max_scroll > 0 and (hot or self.sb_drag) then
+        local th, ty = thumb_geom()
+        local b = self.bg
+        local lum = 0.299 * b[1] + 0.587 * b[2] + 0.114 * b[3]
+        local base = lum < 128 and 255 or 0
+        rg.draw_rectangle(sb_x, sb_y, SB_W, sb_h, base, base, base, 28)
+        rg.draw_rectangle(sb_x, ty, SB_W, th, base, base, base, self.sb_drag and 150 or 115)
+    end
 end
 
 return M
