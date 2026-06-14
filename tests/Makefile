@@ -123,7 +123,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/xagent_session_spec.lua \
 	tests/lua/xagent_context_spec.lua \
 	tests/lua/xagent_skills_spec.lua \
-	tests/lua/xagent_mcp_spec.lua
+	tests/lua/xagent_mcp_spec.lua \
+	tests/lua/xagent_complete_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

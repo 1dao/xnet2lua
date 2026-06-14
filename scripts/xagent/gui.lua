@@ -24,6 +24,7 @@ local mcp_registry  = require('xagent.mcp.registry')
 local session       = require('xagent.session.session')
 local transcript    = require('xagent.ui.transcript')
 local markdown      = require('xagent.ui.markdown')
+local complete      = require('xagent.ui.complete')
 local text          = dofile('scripts/core/share/xtext.lua')
 local fs            = dofile('scripts/core/share/xfs.lua')
 local async         = dofile('scripts/core/share/xasync.lua')
@@ -114,6 +115,12 @@ local S = {
     cwd = '.',
     picking_dir = false,       -- a folder dialog is currently open
     frame = 0,                 -- frame counter (drives the thinking-dots animation)
+    -- input autocomplete (/ commands, @ file refs): the live popup above the box
+    menu = nil,                -- { kind, items, prefix } computed each frame, or nil
+    menu_sel = 1,              -- highlighted item (1-based)
+    menu_off = 0,              -- first visible row when the list scrolls
+    menu_dismissed_for = nil,  -- input text the user pressed Esc on (re-show on edit)
+    dir_cache = {},            -- abspath -> immediate children, for the @ picker
 }
 
 local SIDEBAR_W = 290
@@ -722,6 +729,7 @@ local function load_history_item(it)
     S.entries = rebuild_entries(s2.messages)
     S.cur, S.text_tail, S.busy = nil, '', false
     S.budget = nil                               -- meter restarts on the next turn
+    S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
     clear_attachments()
     S.sidebar = nil
     S.status = 'resumed (' .. #s2.messages .. ' msgs)'
@@ -764,6 +772,7 @@ function new_session()
     S.entries = {}
     S.cur, S.text_tail, S.busy = nil, '', false
     S.budget = nil                               -- meter restarts on the next turn
+    S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
     clear_attachments()
     add('system', 'new session · ' .. S.cfg.model .. ' · ' .. cwd .. '\nEnter 发送 · Ctrl+Enter 换行')
     S.sidebar = nil
@@ -822,6 +831,136 @@ local function get_cwd()
     local s = (f:read('*a') or '.'):gsub('%s+$', '')
     f:close()
     return s
+end
+
+-- ── input autocomplete (/ commands · @ file refs) ───────────────────────────
+-- Immediate children of <cwd>/<rel> (dirs marked with a trailing '/'), reduced
+-- from xutils.scan_dir like the LS tool and cached per resolved directory: the
+-- recursive walk runs once per directory the user drills into, not per keystroke
+-- (files created mid-session won't show until the working dir changes).
+local function list_dir_cached(rel)
+    rel = tostring(rel or '')
+    local base = S.cwd or '.'
+    local sub = rel:gsub('[/\\]+$', '')
+    local abs = (sub == '') and base or (base:gsub('[/\\]+$', '') .. '/' .. sub)
+    local hit = S.dir_cache[abs]
+    if hit then return hit end
+    local entries = xutils.scan_dir(abs)
+    local seen, children = {}, {}
+    if entries then
+        for _, e in ipairs(entries) do
+            local r = (e.rel or ''):gsub('\\', '/')
+            local first = r:match('^([^/]+)')
+            if first and first ~= '' then
+                local label = r:find('/') and (first .. '/') or first
+                if not seen[label] then seen[label] = true; children[#children + 1] = label end
+            end
+        end
+    end
+    table.sort(children)
+    S.dir_cache[abs] = children
+    return children
+end
+
+-- The slash-command catalog (built-ins handled by handle_slash + user skills).
+local function slash_items()
+    local items = {
+        { name = 'compact', desc = '压缩上下文' },
+        { name = 'context', desc = '查看上下文用量' },
+        { name = 'mcp',     desc = '查看 MCP 服务器' },
+        { name = 'new',     desc = '新会话' },
+        { name = 'help',    desc = '帮助' },
+    }
+    for _, s in ipairs(skills.all_user_invocable()) do
+        items[#items + 1] = { name = s.name, desc = s.description or '' }
+    end
+    return items
+end
+
+local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached }
+
+-- Recompute S.menu from the current input each frame. NOT gated on input focus:
+-- clicking a popup row defocuses the textbox, and GuiButton fires on mouse
+-- RELEASE, so the menu must survive the press→release of its own click. Token
+-- presence is the gate instead (input is cleared on every session switch, so a
+-- token only ever appears after the user has focused and typed).
+local function update_completion_menu()
+    S.menu = nil
+    if S.busy or S.dir_dialog or S.pending_confirm then return end
+    local menu = complete.compute(S.input, completion_deps)
+    if not menu then S.menu_dismissed_for = nil; return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.menu_dismissed_for = S.input; return     -- Esc hides it until the text changes
+    end
+    if S.menu_dismissed_for == S.input then return end
+    local n = #menu.items
+    if S.menu_sel < 1 or S.menu_sel > n then S.menu_sel = 1 end
+    if raygui.is_key_pressed then
+        if raygui.is_key_pressed(raygui.KEY_DOWN) then S.menu_sel = S.menu_sel % n + 1 end
+        if raygui.is_key_pressed(raygui.KEY_UP)   then S.menu_sel = (S.menu_sel - 2) % n + 1 end
+    end
+    S.menu = menu
+end
+
+-- Insert the chosen candidate into the input and drop the caret after it.
+local function accept_completion(item)
+    if not S.menu or not item then return end
+    local new_input, caret = complete.apply(S.menu, item)
+    if not new_input then return end
+    S.input = new_input
+    if raygui.set_textbox_cursor then raygui.set_textbox_cursor(caret) end
+    S.input_edit = true                            -- the popup click defocused the box
+    S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
+end
+
+-- Render the popup above the input box; handles hover (selects) and click (inserts).
+local function draw_completion_menu(lx, iy, W)
+    local menu = S.menu
+    if not menu then return end
+    local items = menu.items
+    local n = #items
+    local MAXVIS, row_h, head_h = 8, FONT_SIZE + 12, 24
+    local vis = math.min(MAXVIS, n)
+
+    local off = S.menu_off or 0                     -- keep the highlight on-screen
+    if S.menu_sel <= off then off = S.menu_sel - 1 end
+    if S.menu_sel > off + MAXVIS then off = S.menu_sel - MAXVIS end
+    off = math.max(0, math.min(off, math.max(0, n - MAXVIS)))
+    S.menu_off = off
+
+    local px, pw = lx + 8, W - lx - 16
+    local ph = head_h + vis * row_h + 6
+    local py = iy - ph - 6
+
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 250)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(px, py, 4, ph, ac[1], ac[2], ac[3], 255)
+
+    local more = (n > vis or items.truncated)
+        and ('   (' .. n .. (items.truncated and '+' or '') .. ')') or ''
+    raygui.label(px + 12, py + 3, pw - 24, 20,
+        ((menu.kind == 'slash') and '命令' or '文件/目录') ..
+        '   ↑↓ 选择 · Enter 插入 · Esc 关闭' .. more)
+
+    local mx, my = raygui.get_mouse()
+    for i = 1, vis do
+        local idx = off + i
+        local it = items[idx]
+        if it then
+            local ry = py + head_h + (i - 1) * row_h
+            if mx >= px and mx <= px + pw and my >= ry and my < ry + row_h then
+                S.menu_sel = idx                    -- hover highlights (Enter takes it)
+            end
+            local label = ((idx == S.menu_sel) and '● ' or '   ') .. sanitize_label(it.label)
+            if menu.kind == 'slash' and it.desc and it.desc ~= '' then
+                label = label .. '    ' .. it.desc
+            end
+            if raygui.button(px + 6, ry, pw - 12, row_h - 4, label) then
+                accept_completion(it)
+            end
+        end
+    end
 end
 
 local function __init()
@@ -1183,10 +1322,31 @@ local function __update()
     S.input, new_edit, submitted = raygui.textbox_multi(
         lx + 8, iy, W - lx - 16, input_h, S.input,
         (not S.dir_dialog) and S.input_edit or false, true)
+
+    -- live / @ autocomplete menu, recomputed from the (possibly edited) input
+    update_completion_menu()
+
     if not S.dir_dialog then
         S.input_edit = new_edit
-        if submitted then submit() end
+        if submitted then
+            if S.menu then
+                -- Enter inserts the highlighted candidate — except when the user
+                -- already typed a full slash command verbatim, then just run it.
+                local it = S.menu.items[S.menu_sel]
+                if S.menu.kind == 'slash' and it and ('/' .. it.name) == S.input then
+                    submit()
+                else
+                    accept_completion(it)
+                end
+            else
+                submit()
+            end
+        end
     end
+
+    -- popup is drawn above the input box (after focus handling, so a row click
+    -- can re-focus the box); only shows while a / or @ token is present
+    draw_completion_menu(lx, iy, W)
 
     -- while running: a stop square overlays the input's top-right corner
     -- (clicking requests cancellation at the next turn boundary)
