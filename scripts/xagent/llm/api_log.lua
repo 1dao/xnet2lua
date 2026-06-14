@@ -16,12 +16,16 @@
 -- (REQ_MAX_BYTES) that only ever bites on a giant base64 image in the prompt;
 -- text requests and responses are stored in full.
 
+local xutils = require('xutils')
+
 local M = {}
 
 local MAX_ENTRIES         = 100        -- ring cap: oldest entries drop off
 local ANSWER_PREVIEW_BYTES = 100       -- first 100 bytes of the answer shown in the panel
 local REQ_MAX_BYTES       = 2000000    -- safety cap on the stored request body (~2MB)
 local ANSWER_MAX_BYTES    = 2000000    -- safety cap on the stored full answer (answers are small)
+local TOOL_INPUT_MAX      = 200000     -- per-tool-call input cap (Write content can be large)
+local RAW_MAX_BYTES       = 4000000    -- safety cap on the stored raw response body (~4MB)
 
 local entries = {}     -- list, oldest → newest
 local seq = 0
@@ -56,22 +60,28 @@ local function redact_headers(h)
     return out
 end
 
--- Concatenate the text blocks of an assembled assistant message and note any
--- tool calls (a turn is often pure tool_use with no prose).
+-- Concatenate the text blocks of an assembled assistant message and capture each
+-- tool call WITH its arguments (a turn is often pure tool_use with no prose — and
+-- "Bash" alone is useless without the command, so we keep the input JSON too).
 local function summarize_answer(message)
-    local text_parts, tool_names = {}, {}
+    local text_parts, tools = {}, {}
     if message and type(message.content) == 'table' then
         for _, b in ipairs(message.content) do
             if b.type == 'text' then
                 text_parts[#text_parts + 1] = b.text or ''
             elseif b.type == 'tool_use' then
-                tool_names[#tool_names + 1] = tostring(b.name)
+                local ij = ''
+                local ok, s = pcall(xutils.json_pack, b.input or {})
+                if ok and type(s) == 'string' then ij = s end
+                local trunc = false
+                if #ij > TOOL_INPUT_MAX then ij = ij:sub(1, TOOL_INPUT_MAX); trunc = true end
+                tools[#tools + 1] = { name = tostring(b.name), input_json = ij, truncated = trunc }
             elseif b.type == 'thinking' then
                 -- skip thinking from the preview; it's not the "answer"
             end
         end
     end
-    return table.concat(text_parts, ''), tool_names
+    return table.concat(text_parts, ''), tools
 end
 
 -- Begin a record at request time. `info` = { model, url, method, body, headers }.
@@ -108,6 +118,12 @@ function M.begin(info)
         stop_reason   = nil,
         error         = nil,
         elapsed_ms    = nil,
+        -- raw response body (the exact SSE bytes the server sent), accumulated
+        -- via append_raw during streaming and flushed to raw_response on finalize.
+        raw_response  = nil,
+        raw_truncated = false,
+        _raw          = {},
+        raw_bytes     = 0,
     }
     entries[#entries + 1] = rec
     while #entries > MAX_ENTRIES do table.remove(entries, 1) end
@@ -117,6 +133,27 @@ end
 -- Record the HTTP status code (from the response headers), if available.
 function M.set_status(rec, status)
     if rec then rec.status = status end
+end
+
+-- Append a chunk of the RAW response body as it streams in (de-chunked SSE bytes
+-- / error JSON). Capped at RAW_MAX_BYTES. Cheap: buffers parts, joined on finalize.
+function M.append_raw(rec, chunk)
+    if not rec or not rec._raw or rec.raw_truncated then return end
+    chunk = tostring(chunk or '')
+    if chunk == '' then return end
+    local room = RAW_MAX_BYTES - rec.raw_bytes
+    if room <= 0 then rec.raw_truncated = true; return end
+    if #chunk > room then chunk = chunk:sub(1, room); rec.raw_truncated = true end
+    rec._raw[#rec._raw + 1] = chunk
+    rec.raw_bytes = rec.raw_bytes + #chunk
+end
+
+-- Join the buffered raw parts into rec.raw_response (called on finish/fail).
+local function flush_raw(rec)
+    if rec._raw then
+        rec.raw_response = table.concat(rec._raw)
+        rec._raw = nil
+    end
 end
 
 -- Finalize a successful attempt. `result` is the decoder's on_done payload
@@ -130,12 +167,16 @@ function M.finish(rec, result)
     rec.answer_full = full
     rec.answer = preview
     rec.answer_truncated = truncated
-    rec.tool_calls = (#tools > 0) and table.concat(tools, ', ') or nil
+    rec.tools = tools                                    -- { {name, input_json, truncated}, ... }
+    local names = {}
+    for _, t in ipairs(tools) do names[#names + 1] = t.name end
+    rec.tool_calls = (#names > 0) and table.concat(names, ', ') or nil
     rec.usage = result.usage
     rec.stop_reason = result.stop_reason
     rec.done = true
     rec.ok = true
     rec.elapsed_ms = math.floor((os.clock() - (rec.started_clock or 0)) * 1000 + 0.5)
+    flush_raw(rec)
 end
 
 -- Finalize a failed attempt (HTTP error, connection drop, or SSE error).
@@ -148,6 +189,7 @@ function M.fail(rec, info)
     rec.done = true
     rec.ok = false
     rec.elapsed_ms = math.floor((os.clock() - (rec.started_clock or 0)) * 1000 + 0.5)
+    flush_raw(rec)
 end
 
 -- Newest-first snapshot is what the UI wants; return the raw list (oldest→newest)

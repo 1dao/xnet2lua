@@ -14,6 +14,7 @@
 --   stream.request({ url = 'https://host/path', method = 'POST',
 --                    headers = {...}, body = '...', verify = true }, {
 --     on_headers = function(status, headers) end,
+--     on_body    = function(chunk) end,          -- raw de-chunked body bytes
 --     on_sse     = function(event, data) end,   -- per SSE event
 --     on_done    = function(reason) end,         -- connection finished
 --     on_error   = function(err) end,            -- connect/transport error
@@ -201,6 +202,9 @@ function M.request(opts, cb)
 
         local body = te_chunked and chunked:feed(data) or data
         if body and #body > 0 then
+            -- raw de-chunked response body (all paths) — lets callers capture the
+            -- exact bytes the server sent (the SSE stream / the error JSON)
+            if cb.on_body then cb.on_body(body) end
             if is_http_error then
                 err_body[#err_body + 1] = body          -- collect the error JSON
             elseif cb.on_sse then

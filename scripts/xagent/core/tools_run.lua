@@ -9,6 +9,14 @@ local text = dofile('scripts/core/share/xtext.lua')
 
 local M = {}
 
+local function is_read_only(tool)
+    if tool and type(tool.is_read_only) == 'function' then
+        local ok, v = pcall(tool.is_read_only)
+        return ok and v == true
+    end
+    return false
+end
+
 -- content_blocks: the assistant message's content array.
 -- ctx: tool context ({ cwd, ... }).
 -- on_event: optional fn(event) for UI/headless surfacing.
@@ -26,8 +34,13 @@ function M.run(content_blocks, ctx, on_event)
             local res
             if not tool then
                 res = { content = 'Error: unknown tool "' .. tostring(block.name) .. '"', is_error = true }
+            elseif ctx and ctx.confirm and not is_read_only(tool)
+                   and ctx.confirm({ name = block.name, input = input }) == false then
+                -- "ask" mode: the user denied this state-changing tool. Read-only
+                -- tools and "write" mode (no ctx.confirm) skip the prompt entirely.
+                res = { content = 'Error: 用户拒绝执行该工具调用（询问模式）', is_error = true }
             else
-                -- M1: auto-allow all tools (headless). Permission engine lands later.
+                -- auto-allow all tools when "write" mode.
                 local ok, r = pcall(tool.call, input, ctx)
                 if ok and type(r) == 'table' then
                     res = r

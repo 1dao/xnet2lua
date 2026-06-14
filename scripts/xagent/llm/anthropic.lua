@@ -255,6 +255,7 @@ function M.stream_message(cfg, params, cb)
             verify = cfg.verify, ca_file = cfg.ca_file,
         }, {
             on_headers = function(status) api_log.set_status(rec, status) end,
+            on_body = function(chunk) api_log.append_raw(rec, chunk) end,
             on_sse = function(event, data) decoder:on_sse(event, data) end,
             on_done = function() decoder:finish() end,   -- close before message_stop
             on_error = function(err) retry_or_fail('connection error: ' .. tostring(err), true) end,

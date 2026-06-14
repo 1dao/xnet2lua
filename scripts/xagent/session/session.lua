@@ -106,7 +106,7 @@ function Session:run(on_event)
         messages = self.messages,
         system = system,
         tools = self.tools,
-        ctx = { cwd = self.cwd, session_id = self.id },
+        ctx = { cwd = self.cwd, session_id = self.id, confirm = self.confirm },
         max_tokens = self.max_tokens,
         on_event = on_event,
         last_usage = self.last_usage,

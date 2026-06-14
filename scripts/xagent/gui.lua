@@ -26,6 +26,7 @@ local transcript    = require('xagent.ui.transcript')
 local markdown      = require('xagent.ui.markdown')
 local text          = dofile('scripts/core/share/xtext.lua')
 local fs            = dofile('scripts/core/share/xfs.lua')
+local async         = dofile('scripts/core/share/xasync.lua')
 local api_log       = require('xagent.llm.api_log')
 
 registry.register(require('xagent.tools.read'))
@@ -79,6 +80,10 @@ local S = {
     input_edit = true,
     busy = false,
     status = 'ready',
+    -- tool permission mode: 'write' = auto-run (default), 'ask' = confirm each
+    -- state-changing tool before it runs. pending_confirm holds the parked await.
+    mode = 'write',
+    pending_confirm = nil,     -- { req = {name,input}, resolve = fn } while awaiting
     sess = nil,
     view = nil,
     emoji_tex = nil,
@@ -210,6 +215,20 @@ local function compact(v)
     if not ok then return tostring(v) end
     if #s > 160 then s = s:sub(1, 160) .. '...' end
     return s
+end
+
+-- Per-session permission gate handed to the agent (ctx.confirm). In 'write' mode
+-- (or for a turn from a session the user has since left) it auto-allows; in 'ask'
+-- mode it parks the agent coroutine on an await until the user clicks 允许/拒绝.
+-- Runs inside the agent coroutine, so async.await is safe here.
+local function make_confirm(sess)
+    return function(req)
+        if S.mode ~= 'ask' then return true end
+        if S.sess ~= sess then return true end   -- background turn of an old session: don't block
+        return async.await(function(resolve)
+            S.pending_confirm = { req = req, resolve = resolve }
+        end)
+    end
 end
 
 -- Split off any trailing incomplete UTF-8 sequence so the displayed text is
@@ -609,29 +628,6 @@ local function http_request_text(rec)
     return table.concat(lines, '\n')
 end
 
--- COMPLETE response as raw text (status line + full answer + tool calls); this is
--- what the 返回 copy button puts on the clipboard (uses answer_full, not the 100B
--- preview).
-local function http_response_text(rec)
-    local lines = {}
-    if not rec.done then
-        lines[#lines + 1] = '（进行中…）'
-    elseif rec.error then
-        lines[#lines + 1] = 'HTTP ' .. tostring(rec.status or '-') .. ' 失败'
-        lines[#lines + 1] = '错误: ' .. tostring(rec.error)
-    else
-        lines[#lines + 1] = string.format('HTTP %s  stop=%s  in=%s out=%s tok  %dms',
-            tostring(rec.status or '-'), tostring(rec.stop_reason or '?'),
-            tostring(rec.usage and rec.usage.input_tokens or '?'),
-            tostring(rec.usage and rec.usage.output_tokens or '?'),
-            rec.elapsed_ms or 0)
-        if rec.tool_calls then lines[#lines + 1] = '工具调用: ' .. rec.tool_calls end
-        lines[#lines + 1] = ''
-        lines[#lines + 1] = rec.answer_full or rec.answer or ''
-    end
-    return table.concat(lines, '\n')
-end
-
 -- Build the read-only detail "transcript" for one API-log record. The two body
 -- rows carry an explicit copy_text = the COMPLETE raw request / response, so the
 -- 复制 button copies the full original (not the reflowed preview). Other rows opt
@@ -673,12 +669,18 @@ local function build_log_detail(rec)
             tostring(rec.usage and rec.usage.output_tokens or '?'),
             rec.elapsed_ms or 0), { no_copy = true })
     end
-    if rec.tool_calls then L('system', '工具调用：' .. rec.tool_calls) end
-    L('user', '【返回内容】（显示前 100 字节；点“复制”得到完整返回）', { no_copy = true })
-    L('tool_result', (rec.answer ~= '' and rec.answer)
-        or (rec.done and not rec.error and '（无文本，仅工具调用或空回答）' or '（暂无）'),
-        { copy_text = http_response_text(rec) })
-    if rec.answer_truncated then L('system', '… 回答超过 100 字节，仅“显示”截断；复制为完整内容') end
+    -- The RAW response body, shown UNPARSED — the exact SSE stream the server
+    -- sent. It already carries every block (text deltas AND tool_use blocks with
+    -- their streamed input), so this single view IS "the complete return". Display
+    -- == copy == the protocol bytes; no extraction, no preview.
+    L('user', '【HTTP 返回 · 原始 SSE】（含 text 与 tool_use；显示=复制=原文）', { no_copy = true })
+    local raw = rec.raw_response
+    L('tool_result',
+        (raw and raw ~= '' and raw)
+        or (not rec.done and '（进行中…）')
+        or '（无原始返回内容；旧记录或重启前发起的请求没有此字段）',
+        { copy_text = (raw and raw ~= '' and raw) or '' })
+    if rec.raw_truncated then L('system', '… 原始返回超过 4MB，显示与复制均已截断') end
     return rows
 end
 
@@ -700,6 +702,7 @@ local function load_history_item(it)
     s2.tools = registry.to_api_params()
     s2.system = system_prompt.build({ cwd = s2.cwd, project_md = project_md.load(s2.cwd) })
     s2.max_tokens = 4096
+    s2.confirm = make_confirm(s2)
     S.sess = s2
     S.cwd = s2.cwd or S.cwd                      -- follow the resumed session's dir
     S.entries = rebuild_entries(s2.messages)
@@ -743,6 +746,7 @@ function new_session()
         system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
         max_tokens = 4096,
     })
+    S.sess.confirm = make_confirm(S.sess)
     S.entries = {}
     S.cur, S.text_tail, S.busy = nil, '', false
     S.budget = nil                               -- meter restarts on the next turn
@@ -853,6 +857,7 @@ local function __init()
         cfg = S.cfg, cwd = cwd, tools = registry.to_api_params(),
         system = sys, max_tokens = 4096,
     })
+    S.sess.confirm = make_confirm(S.sess)
     add('system', 'xagent ready · ' .. S.cfg.model .. ' · ' .. cwd ..
         (pmd and '  (project memory loaded)' or '') ..
         '\nEnter 发送 · Ctrl+Enter 换行')
@@ -905,8 +910,14 @@ local function __update()
     if S.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
         status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
     end
-    raygui.label(12, 8, W - 326, 24, 'xagent  ·  ' ..
+    raygui.label(12, 8, W - 406, 24, 'xagent  ·  ' ..
         (S.cfg and S.cfg.model or '?') .. '  ·  ' .. status_text)
+
+    -- tool permission mode toggle (Write = auto-run · Ask = confirm each write)
+    if raygui.button(W - 386, 6, 70, 28, S.mode == 'ask' and 'Ask' or 'Write') then
+        S.mode = (S.mode == 'ask') and 'write' or 'ask'
+        S.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
+    end
 
     -- context-usage meter: token count + a thin bar filling toward the window.
     -- Green normally, amber on 'warning', red on 'error'/'blocking' (compaction
@@ -1164,7 +1175,35 @@ local function __update()
         local sb = 26
         if stop_button(W - 14 - sb, iy + 6, sb, sb, { 215, 95, 85, 255 }) then
             if S.sess then S.sess.cancelled = true end
+            -- release a parked confirm (as a deny) so the loop can reach its
+            -- next cancellation boundary instead of hanging on the prompt
+            if S.pending_confirm then
+                local pc = S.pending_confirm; S.pending_confirm = nil; pc.resolve(false)
+            end
             S.status = '停止中'
+        end
+    end
+
+    -- "ask" mode: a state-changing tool is parked awaiting the user's decision.
+    -- A strip above the input shows the tool + args with 允许 / 拒绝.
+    if S.pending_confirm then
+        local pc = S.pending_confirm
+        local bx, bw, bh = lx + 8, W - lx - 16, 86
+        local by = iy - bh - 6
+        local pb = S.sidebar_bg
+        raygui.draw_rectangle(bx, by, bw, bh, pb[1], pb[2], pb[3], 255)
+        local ac = (markdown.palette and markdown.palette.heading) or { 210, 175, 70, 255 }
+        raygui.draw_rectangle(bx, by, 4, bh, ac[1], ac[2], ac[3], 255)
+        raygui.label(bx + 14, by + 8, bw - 28, 22, '询问模式 · 是否执行此工具调用？')
+        raygui.label(bx + 14, by + 32, bw - 28, 22,
+            (pc.req and pc.req.name or '?') .. '   ' .. compact(pc.req and pc.req.input or {}))
+        -- clear BEFORE resolve: resolve resumes the agent, which may immediately
+        -- park the NEXT tool's confirm into S.pending_confirm.
+        if raygui.button(bx + bw - 188, by + bh - 34, 86, 28, '允许') then
+            S.pending_confirm = nil; pc.resolve(true)
+        end
+        if raygui.button(bx + bw - 96, by + bh - 34, 86, 28, '拒绝') then
+            S.pending_confirm = nil; pc.resolve(false)
         end
     end
 
