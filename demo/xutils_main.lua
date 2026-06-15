@@ -72,19 +72,19 @@ os.remove(cfg_path)
 -- ============================================================================
 head('scan_dir')
 
-local files, scan_err = xutils.scan_dir('scripts/xpac/static')
+local files, scan_err = xutils.scan_dir('scripts/core/share')
 ok('scan_dir returns a table', type(files) == 'table', tostring(scan_err))
 ok('scan_dir at least 1 file',  #files >= 1)
 
-local saw_index = false
+local saw_known = false
 for _, f in ipairs(files) do
     if type(f) ~= 'table' or type(f.path) ~= 'string' or type(f.rel) ~= 'string' then
         ok('entry shape', false, 'bad entry')
         break
     end
-    if f.rel == 'index.html' then saw_index = true end
+    if f.rel == 'xmisc.lua' then saw_known = true end
 end
-ok('scan_dir contains index.html', saw_index)
+ok('scan_dir contains xmisc.lua', saw_known)
 
 local nx, nx_err = xutils.scan_dir('scripts/core/share/this_dir_does_not_exist_zzz')
 ok('scan_dir missing => nil',     nx == nil)
@@ -106,7 +106,7 @@ for _, f in ipairs(nested) do
     if f.rel:find('/', 1, true)  then saw_slash = true end
     if f.rel:find('\\', 1, true) then saw_backslash = true end
     -- these are directories under scripts/, must NOT appear as entries
-    if f.rel == 'core' or f.rel == 'core/share' or f.rel == 'xpac' then
+    if f.rel == 'core' or f.rel == 'core/share' then
         saw_dir_entry = true
     end
 end

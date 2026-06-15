@@ -16,6 +16,13 @@
 #define XLOG_RECORD_MAX_BYTES (1024u * 1024u)
 #endif
 
+/* Per-file size cap. Once the active per-thread log file reaches this many
+** bytes it is archived (renamed with a timestamp) and a fresh file is opened.
+** Default 2 GiB. Override at build time to change the roll-over threshold. */
+#ifndef XLOG_MAX_FILE_BYTES
+#define XLOG_MAX_FILE_BYTES (2ull * 1024ull * 1024ull * 1024ull)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif

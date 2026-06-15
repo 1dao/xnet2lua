@@ -43,6 +43,10 @@ typedef struct {
     char tag[96];
     char path[512];
     FILE* file;
+    /* Running size of the active file; drives the 2 GiB size roll-over. Owned by
+    ** this thread alone, so the hot path is a single add + compare, no lock. */
+    unsigned long long file_bytes;
+    unsigned int rotate_seq;    /* disambiguates archives rolled within one second */
     /* Per-thread localtime cache: skips libc tz-conversion lock for repeat seconds. */
     time_t ts_cached_sec;
     char ts_cached_str[XLOG_TS_CACHE_LEN];
@@ -416,15 +420,16 @@ static void xlog_format_body(const char* fmt, va_list ap,
 ** Both file and console sinks share the same `body` bytes — we never re-run
 ** vsnprintf for the second sink, only re-render the small prefix. */
 
-static void xlog_emit_to_file(FILE* out, const xLogRecordContext* ctx,
-                              const char* body, size_t body_len,
-                              int append_newline, int do_flush) {
+static size_t xlog_emit_to_file(FILE* out, const xLogRecordContext* ctx,
+                                const char* body, size_t body_len,
+                                int append_newline, int do_flush) {
     char prefix[256];
     size_t plen = xlog_build_prefix(ctx, 0, prefix, sizeof(prefix));
     if (plen) fwrite(prefix, 1, plen, out);
     if (body_len) fwrite(body, 1, body_len, out);
     if (append_newline) fputc('\n', out);
     if (do_flush) fflush(out);
+    return plen + body_len + (append_newline ? 1u : 0u);
 }
 
 static void xlog_emit_to_console(FILE* out, const xLogRecordContext* ctx,
@@ -552,6 +557,74 @@ size_t xlog_format(int level, const char* level_name, const char* msg, size_t le
     return total;
 }
 
+/* ---------- Size-based file roll-over (2 GiB per file by default) ---------- */
+
+/* Current size of an already-open file. With "ab" mode writes always land at
+** EOF regardless of the read cursor, so this is only consulted once at open to
+** seed file_bytes (a freshly appended-to file may already hold prior data). */
+static unsigned long long xlog_stream_size(FILE* f) {
+#ifdef _WIN32
+    if (_fseeki64(f, 0, SEEK_END) == 0) {
+        __int64 p = _ftelli64(f);
+        if (p > 0) return (unsigned long long)p;
+    }
+#else
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t p = ftello(f);
+        if (p > 0) return (unsigned long long)p;
+    }
+#endif
+    return 0;
+}
+
+/* Build the archive name for a filled file: insert a two-digit ".NN" index
+** before the ".log" suffix of st->path, cycling 00..99. The index is a bounded
+** ring, so a thread keeps at most 100 archives (oldest overwritten on wrap). */
+static void xlog_archive_name(const xLogThreadState* st, char* out, size_t cap) {
+    const char* path = st->path;
+    size_t plen = strlen(path);
+    const char* suffix = "";
+    size_t base_len = plen;
+    if (plen >= 4 && strcmp(path + plen - 4, ".log") == 0) {
+        suffix = ".log";
+        base_len = plen - 4;
+    }
+    snprintf(out, cap, "%.*s.%02u%s",
+             (int)base_len, path, st->rotate_seq % 100u, suffix);
+}
+
+/* Close the filled file, rename it aside, and reopen the base path fresh.
+** Called only when file_bytes crosses the cap, so the cost is amortised to ~0. */
+static void xlog_rotate_thread_file(xLogThreadState* st) {
+    if (!st->file) return;
+    fflush(st->file);
+    fclose(st->file);
+    st->file = NULL;
+
+    char archived[600];
+    xlog_archive_name(st, archived, sizeof(archived));
+    /* The ring reuses slots, so the target may already exist. POSIX rename()
+    ** replaces it atomically, but Windows rename() fails if it does -- remove
+    ** first so the roll-over succeeds on both. */
+    remove(archived);
+    rename(st->path, archived);
+    st->rotate_seq++;
+
+    st->file = fopen(st->path, "ab");
+    st->file_bytes = 0;
+    /* If the reopen fails, allow a later write to retry from a clean slate
+    ** instead of silently dropping this thread's file sink forever. */
+    if (!st->file) st->file_open_attempted = 0;
+}
+
+/* Hot-path accountant: add the bytes just written and roll over if over cap. */
+static void xlog_account_file(xLogThreadState* st, size_t bytes) {
+    st->file_bytes += bytes;
+    if (st->file_bytes >= XLOG_MAX_FILE_BYTES) {
+        xlog_rotate_thread_file(st);
+    }
+}
+
 static FILE* xlog_open_thread_file(void) {
     xLogThreadState* st = &g_thread_log;
     if (st->file) return st->file;
@@ -576,6 +649,9 @@ static FILE* xlog_open_thread_file(void) {
     st->file_open_attempted = 1;
     st->file = fopen(st->path, "ab");
     if (st->file) {
+        /* Seed the roll-over counter from any pre-existing content so an
+        ** already-large file rolls promptly instead of growing past the cap. */
+        st->file_bytes = xlog_stream_size(st->file);
         /* Register thread-exit cleanup so a thread that never calls
         ** xlog_clear_thread() (e.g. raw pthread_exit, std::thread join) won't
         ** leak the FD. */
@@ -601,7 +677,9 @@ void xlog_write(int level, const char* level_name, const char* console_tag, cons
     int need_newline = append_newline && (len == 0 || msg[len - 1] != '\n');
 
     if (file) {
-        xlog_emit_to_file(file, &ctx, msg, len, need_newline, xlog_should_flush(level));
+        size_t n = xlog_emit_to_file(file, &ctx, msg, len, need_newline,
+                                     xlog_should_flush(level));
+        xlog_account_file(&g_thread_log, n);
     }
     if (console_enabled) {
         FILE* console = xlog_console_stream(level, ctx.level_name);
@@ -618,6 +696,7 @@ void xlog_write_raw(const char* msg, size_t len) {
         /* Raw writes are caller-driven; preserve the immediate-durability
         ** contract callers relied on (e.g. heartbeat / state dumps). */
         fflush(file);
+        xlog_account_file(&g_thread_log, len);
     }
 }
 
@@ -642,8 +721,9 @@ void xlog_printf(int level, const char* level_name, const char* console_tag, con
     va_end(ap);
 
     if (file) {
-        xlog_emit_to_file(file, &ctx, body.data, body.len, append_newline,
-                          xlog_should_flush(level));
+        size_t n = xlog_emit_to_file(file, &ctx, body.data, body.len,
+                                     append_newline, xlog_should_flush(level));
+        xlog_account_file(&g_thread_log, n);
     }
     if (console_enabled) {
         FILE* console = xlog_console_stream(level, ctx.level_name);

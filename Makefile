@@ -1,3 +1,39 @@
+# =============================================================================
+# xagent / xnet Lua debugging — build & run cheat-sheet
+# xagent / xnet Lua 调试 —— 构建与运行速查
+# -----------------------------------------------------------------------------
+# EN: VS Code-debugging xagent (or any xnet Lua process) needs bin/xnet built
+#     WITH THE DEBUGGER LINKED IN. The default binary is WITH_XDEBUG=0, so
+#     XDEBUG_BOOT=1 becomes a no-op, port 19090 never listens, and VS Code shows
+#     a GBK "connection failed" (WSAECONNREFUSED). Keep HTTPS on — xagent talks
+#     HTTPS to the LLM, so NEVER add nohttps / WITH_HTTPS=0.
+# CN: 用 VS Code 调试 xagent（或任何 xnet Lua 进程）必须用"编进了调试器"的 bin/xnet。
+#     默认二进制是 WITH_XDEBUG=0，此时 XDEBUG_BOOT=1 形同空操作、19090 不监听，
+#     VS Code 会报一串 GBK 乱码的 "connection failed"（连接被拒）。务必保留 HTTPS——
+#     xagent 走 HTTPS 调 LLM，千万别加 nohttps / WITH_HTTPS=0。
+#
+# 1) Build with the debugger / 编进调试器（全量重编，-B 必需：宏改动影响多个编译单元）
+#      mingw32-make -B WITH_XDEBUG=1 xnet      # MinGW（保留 HTTPS 默认开）
+#      build.bat xdebug xnet                   # MSVC（需 VS 开发者命令行）
+#
+# 2) Verify it's compiled in / 确认确实编进去了（不要看 XDEBUG_BOOT，它任何构建都有）
+#      grep -a "xdebug] listening" bin/xnet.exe    # 命中 = 已编进；另可查 "OK xnet-xdebug"
+#
+# 3) Run xagent with the debug server / 带调试服务启动（GUI 必须 WAIT=0）
+#      bin\xnet.exe scripts\xagent\gui.lua XDEBUG_BOOT=1 XDEBUG_PORT=19090 XDEBUG_WAIT=0
+#    EN: WAIT=1 blocks the main Lua state at line 1; since the raygui window is
+#        created in Lua, the window won't appear until you attach+continue.
+#    CN: WAIT=1 会让主 Lua state 停在第一行；raygui 窗口是在 Lua 里创建的，
+#        attach 并"继续"之前窗口根本不显示，看起来像卡死。
+#
+# 4) VS Code attach / 挂接：F5 选 "XAgent Lua Attach :19090"（见 .vscode/launch.json +
+#    tasks.json；preLaunchTask 起 tools/xdebug_dap.exe 桥：4711 <-> 19090）。
+#    调试期间别关 xagent 窗口；关了进程退出，19090 消失，桥会连不上。
+#    注意：之后用不带 xdebug 的命令重编，会重新关掉调试器、覆盖 bin/xnet.exe。
+#
+# Full guide / 完整说明：xnet2lua-docs-cn.md §20（XDEBUG_BOOT/PORT/WAIT、DAP 桥、远程转发）。
+# =============================================================================
+
 LIB_NAME := xnet
 CC ?= gcc
 AR ?= ar
@@ -119,6 +155,17 @@ XNET_EXTRA_LDFLAGS :=
 XNET_BUILD := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)_build$(EXE_EXT)
 XNET_TARGET := $(BIN_DIR)/xnet$(PROGRAM_SUFFIX)$(EXE_EXT)
 
+# Windows: embed the UTF-8 activeCodePage manifest (inlined in xlua/xnet.rc) so
+# all ANSI APIs in the process (Lua io/os/popen, CreateProcessA) speak UTF-8 —
+# non-ASCII paths are otherwise mangled through the system code page (GBK on
+# zh-CN systems).
+ifeq ($(OS),Windows_NT)
+    WINDRES ?= windres
+    XNET_RES_OBJ := $(BIN_DIR)/xnet_res.o
+else
+    XNET_RES_OBJ :=
+endif
+
 # rpmalloc is consumed by everything that uses libxnet.a or compiles xthread.c
 # directly. libxnet.a itself does NOT contain rpmalloc symbols, so xnet adds
 # it here and tests/Makefile adds it for xthread_test.
@@ -182,9 +229,16 @@ $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 
 .PHONY: all xnet xdebug_dap asan asan-test asan-unit asan-run-lua clean $(TEST_TARGETS) run-lua
 
+# Intermediate build artifacts removed after a successful build, leaving only the
+# binaries (+ libxnet.a): the core object dir, the windres object, and the
+# per-binary dependency files dropped by the inline (-MMD) exe builds.
+BUILD_TMP := $(OBJ_DIR) $(XNET_RES_OBJ) $(BIN_DIR)/*_build.d tools/*.d
+
 all: $(TARGET_LIB) $(XNET_TARGET) $(XDEBUG_DAP_TARGET)
+	@$(RM) $(BUILD_TMP)
 
 xnet: $(XNET_TARGET)
+	@$(RM) $(BUILD_TMP)
 
 asan:
 	$(MAKE) -B all $(ASAN_BUILD_ARGS)
@@ -208,9 +262,14 @@ $(TARGET_LIB): $(CORE_OBJS)
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) | $(BIN_DIR)
+ifeq ($(OS),Windows_NT)
+$(XNET_RES_OBJ): xlua/xnet.rc | $(BIN_DIR)
+	$(WINDRES) xlua/xnet.rc $(XNET_RES_OBJ)
+endif
+
+$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) $(XNET_RES_OBJ) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
-	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
+	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(XNET_RES_OBJ) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
 
 $(OBJ_DIR):

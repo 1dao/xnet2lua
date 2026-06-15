@@ -39,7 +39,7 @@ function M.apply(raygui)
     raygui.set_style(D, raygui.TEXT_SPACING,          0x00000001)  -- 1px 字间距
     raygui.set_style(D, raygui.TEXT_PADDING,          0x00000008)  -- 8px 内边距
     raygui.set_style(D, raygui.TEXT_LINE_SPACING,     0x0000000a)  -- 10px 行间距
-    raygui.set_style(D, raygui.LINE_COLOR,            0xe2e5f0ff)  -- 分割线
+    raygui.set_style(D, raygui.LINE_COLOR,            0x9aa6bdff)  -- Group title/separator color
     raygui.set_style(D, raygui.BACKGROUND_COLOR,      0xf5f6faff)  -- 画布背景（极浅灰蓝）
 
     -- ========== BUTTON 按钮微调 ==========

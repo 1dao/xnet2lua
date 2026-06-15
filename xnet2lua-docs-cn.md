@@ -29,6 +29,7 @@
 18. [xnats 跨进程 RPC](#18-xnats-跨进程-rpc)
 19. [热重载协议](#19-热重载协议)
 20. [Lua 调试与 VSCode 调试](#20-lua-调试与-vscode-调试)
+21. [xagent 桌面编码助手](#21-xagent-桌面编码助手)
 
 ---
 
@@ -158,7 +159,6 @@ build.bat clean
 ./bin/xnet demo/xredis_main.lua
 ./bin/xnet demo/xmysql_main.lua
 ./bin/xnet demo/xnats_main.lua SERVER_NAME=game1
-./bin/xnet scripts/xpac/xpac_main.lua
 ```
 
 CLI 的 `KEY=VALUE` 优先于 `xnet.cfg`，但被读取的键必须在 `xnet_main.c` 的 `g_arg_configs[]` 白名单中（新增 Lua 配置项时如果想让它支持命令行覆盖，记得同步更新该数组）。
@@ -3262,3 +3262,49 @@ iOS Simulator 或本机 macOS 通常可以直接使用本机端口。无论哪�
 **5. 当前停住的是哪个线程？**
 
 看 VSCode Call Stack 的线程名，或 Variables 面板里的 `XNet Thread` scope。
+
+---
+
+## 21. xagent 桌面编码助手
+
+`scripts/xagent/` 是构建在本运行时之上的一个完整应用——一个 Claude Code 风格的本地编码助手，交互层用 **raygui 桌面 GUI**（而非终端 TUI）。它是运行时若干核心能力的综合示例：流式 TLS 客户端、协程即 async/await、xthread 子进程下放、tick 驱动的 GUI 与网络 I/O 并行。
+
+### 21.1 运行
+
+```bash
+# 桌面 GUI
+bin/xnet scripts/xagent/gui.lua
+
+# 无头单轮（--print 风格；中文 prompt 用 PROMPT_FILE 走 UTF-8 文件）
+bin/xnet scripts/xagent/main.lua "PROMPT_FILE=问题.txt"
+```
+
+配置见 `scripts/xagent/config.lua`：非敏感项放 `xnet.cfg` 的 `XAGENT_BASE_URL` / `XAGENT_MODEL` / `XAGENT_AUTH_STYLE`，密钥放 **gitignore 的** `xagent.local.cfg` 的 `XAGENT_AUTH_TOKEN`。默认对接 Anthropic Messages API，已验证可直连 DeepSeek 的 `/anthropic` 兼容端点。
+
+### 21.2 它如何用到运行时
+
+| 运行时能力 | xagent 用法 |
+|---|---|
+| `xnet.connect_tls` + 内置 CA | 直连 LLM 的 HTTPS 端点 |
+| 流式分包（raw `on_data`） | `llm/sse.lua` 去 chunked + 解 SSE，边到边解析 |
+| 协程 + 异步回调 | agent 主循环是协程：发起异步 HTTPS 后 `yield`，SSE 回调里 `resume` |
+| `xthread` 工作线程 | 阻塞 `io.popen` 下放到 worker（`proc/`），结果 `post` 回主线程 `resume` |
+| tick 循环（`__update`） | 每 tick 画一帧 raygui，同 tick 泵 xpoll/xtimer，流式与渲染并行 |
+| `xutils.json` / `scan_dir` / base64 / sha | 请求-响应编解码、文件工具、图片 base64 |
+| UTF-8 manifest（见 §2） | GUI/子进程的中文路径全链路 UTF-8 |
+
+### 21.3 能力一览
+
+- **流式对话** + 工具回合（`tool_use` → `tool_result` 多轮）；瞬时网络故障自动重试
+- **12 个工具**：Read / Write / Edit / MultiEdit / LS / Glob / Grep / Bash / WebFetch / MemoryWrite / TodoWrite / Skill
+- **上下文管理**：基于真实 usage 锚定的 token 预算 + 两级压缩（接近上限时先清理旧工具输出，再 LLM 摘要并保留成对的近期消息）
+- **会话**：JSON 持久化（`~/.xagent/sessions`）、改名/删除、按工作目录分组、恢复续聊
+- **项目记忆**：向上查找 `AGENT.md` / `CLAUDE.md` 注入系统提示；`MemoryWrite` 工具追加
+- **Skills**：发现 `<用户|项目>/.xagent/skills/<名>/SKILL.md`，清单注入系统提示，模型用 `Skill` 工具调用、用户用 `/<名> [参数]` 调用；`paths` 字段支持触达文件后条件激活
+- **GUI**：虚拟化流式转录、Markdown、彩色 emoji、多套主题、历史侧栏、目录选择、**图片粘贴（多模态输入）**、上下文用量计量、`/compact` `/context` 等斜杠命令
+
+### 21.4 深入
+
+- 详细设计（架构 / 分阶段路线 / 逐模块映射）：`xagent_design_v1.md`
+- 与 easy-agent 的功能对照：`xagent_功能对照.md`；源码对照：`xagent_源码对照.md`
+- 离线测试：`tests/lua/xagent_{llm,tools,session,context,skills}_spec.lua`（66 例，`make -C tests unit-lua`）
