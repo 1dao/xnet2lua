@@ -94,10 +94,9 @@ void xjs_watch_end(void) {
     g_watch_armed = 0;
 }
 
-/* Location-transparent actor reference: pack the owning thread id (high 8 bits;
-** XTHR_MAX < 256) and the thread-local actor id (low 24 bits) into one int.
-** send() routes on the ref alone, so callers never track the target thread
-** separately. The default actor of a thread has local id 0. */
+/* Compact (thread, local-actor) key used internally by the name registry: high
+** 8 bits = thread id (XTHR_MAX < 256), low 24 bits = thread-local actor id.
+** The JS layer addresses actors as [thread, actor]; this is just storage. */
 #define XJS_REF_MAKE(thr, local)  (((int32_t)(thr) << 24) | ((int32_t)(local) & 0xFFFFFF))
 #define XJS_REF_THREAD(ref)       (((int32_t)(ref) >> 24) & 0xFF)
 #define XJS_REF_LOCAL(ref)        ((int32_t)(ref) & 0xFFFFFF)
@@ -472,26 +471,28 @@ static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
     return post_frame(ctx, target_id, 0, 1, argc, argv);
 }
 
-/* send(actorRef, ...msg): deliver to the actor named by a location-transparent
-** ref (from spawn()/selfActor()). The ref carries the target thread, so the
-** caller does not track it separately. */
+/* send(threadId, actorId, ...msg): deliver msg to a specific actor on a thread.
+** The C layer is a dumb transport; the actor messaging layer (xactor.mjs) builds
+** its RPC/cast envelope inside ...msg. */
 static JSValue js_xthread_send(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
     (void)this_val;
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "xthread.send: actorRef expected");
+    if (argc < 2) {
+        return JS_ThrowTypeError(ctx, "xthread.send: threadId and actorId expected");
     }
-    int32_t ref = 0;
-    if (JS_ToInt32(ctx, &ref, argv[0]) < 0) return JS_EXCEPTION;
-    return post_frame(ctx, XJS_REF_THREAD(ref), XJS_REF_LOCAL(ref), 1, argc, argv);
+    int32_t target_id = 0, to_actor = 0;
+    if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
+    if (JS_ToInt32(ctx, &to_actor, argv[1]) < 0) return JS_EXCEPTION;
+    return post_frame(ctx, target_id, to_actor, 2, argc, argv);
 }
 
-/* selfActor(): the location-transparent ref of the calling actor. */
+/* selfActor(): the calling actor's thread-local id (0 = the thread's default
+** actor). Combine with xthread.currentId() to form a [thread, actor] address. */
 static JSValue js_xthread_self_actor(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
     XJSActor *a = xjs_actor(ctx);
-    return JS_NewInt32(ctx, XJS_REF_MAKE(xthread_current_id(), a ? a->actor_id : 0));
+    return JS_NewInt32(ctx, a ? a->actor_id : 0);
 }
 
 /* spawn(scriptPath): create a new actor (JSContext) on THIS thread, run its
@@ -561,7 +562,7 @@ static JSValue js_xthread_spawn(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(nctx, init);
     JS_FreeValue(nctx, def);
 
-    return JS_NewInt32(ctx, XJS_REF_MAKE(xthread_current_id(), id));
+    return JS_NewInt32(ctx, id);   /* thread-local id; address = [currentId(), id] */
 }
 
 /* disposeActor(actorId): run a spawned actor's __uninit and free it. Local to
@@ -626,8 +627,18 @@ static JSValue js_xthread_set_memory_limit(JSContext *ctx, JSValueConst this_val
     return JS_UNDEFINED;
 }
 
-/* registerName(name): bind a process-global name to the calling actor's ref so
-** others can find it by name. Returns the ref. */
+/* Build a [threadId, actorId] address array (xactor.mjs's address shape). */
+static JSValue make_addr(JSContext *ctx, int32_t ref) {
+    JSValue addr = JS_NewArray(ctx);
+    JS_SetPropertyUint32(ctx, addr, 0, JS_NewInt32(ctx, XJS_REF_THREAD(ref)));
+    JS_SetPropertyUint32(ctx, addr, 1, JS_NewInt32(ctx, XJS_REF_LOCAL(ref)));
+    return addr;
+}
+
+/* registerName(name): bind a process-global name to the calling actor so others
+** (on any thread) can find it by name. Returns the actor's [thread, actor]
+** address. A cross-thread name registry is a genuine C-layer capability — JS
+** actors are shared-nothing and cannot share one. */
 static JSValue js_xthread_register_name(JSContext *ctx, JSValueConst this_val,
                                         int argc, JSValueConst *argv) {
     (void)this_val;
@@ -638,10 +649,10 @@ static JSValue js_xthread_register_name(JSContext *ctx, JSValueConst this_val,
     int32_t ref = XJS_REF_MAKE(xthread_current_id(), a ? a->actor_id : 0);
     name_set(name, ref);
     JS_FreeCString(ctx, name);
-    return JS_NewInt32(ctx, ref);
+    return make_addr(ctx, ref);
 }
 
-/* whereis(name): the ref bound to a name, or null. Resolves across threads. */
+/* whereis(name): the [thread, actor] address bound to a name, or null. */
 static JSValue js_xthread_whereis(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv) {
     (void)this_val;
@@ -651,7 +662,7 @@ static JSValue js_xthread_whereis(JSContext *ctx, JSValueConst this_val,
     int32_t ref = 0;
     int found = name_get(name, &ref);
     JS_FreeCString(ctx, name);
-    return found ? JS_NewInt32(ctx, ref) : JS_NULL;
+    return found ? make_addr(ctx, ref) : JS_NULL;
 }
 
 /* unregisterName(name): drop a name binding. */

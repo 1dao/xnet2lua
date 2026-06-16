@@ -9,10 +9,11 @@ let bug = false;
 export default {
   __init() {
     xtimer.init(16);
+    const me = xthread.currentId();
     const N = 64;
     for (let i = 0; i < N; i++) {
-      const c = xthread.spawn("demo/xjs_actor_child.mjs");   // c is a location-transparent ref
-      xthread.send(c, "die");
+      const c = xthread.spawn("demo/xjs_actor_child.mjs");   // c is the thread-local actor id
+      xthread.send(me, c, "die");
     }
     xtimer.add(250, () => { xthread.stop(bug ? 1 : 0); }, 1);
   },

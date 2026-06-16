@@ -8,10 +8,11 @@ export default {
   __init() {
     xtimer.init(16);
     xthread.setDeadline(100);             // 100ms CPU budget per actor turn
+    const me = xthread.currentId();
     const spinner = xthread.spawn("demo/xjs_actor_spin.mjs");
     const worker = xthread.spawn("demo/xjs_actor_spin.mjs");
-    xthread.send(spinner, "spin");        // runaway; watchdog must break it
-    xthread.send(worker, "ping");         // must still be serviced afterwards
+    xthread.send(me, spinner, "spin");    // runaway; watchdog must break it
+    xthread.send(me, worker, "ping");     // must still be serviced afterwards
     xtimer.add(1500, () => xthread.stop(pong ? 0 : 1), 1);
   },
   __thread_handle(msg) {

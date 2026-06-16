@@ -6,9 +6,9 @@ export default {
   __init() {
     xtimer.init(16);
     xthread.spawn("demo/xjs_actor_named.mjs");   // registers "worker" in its __init
-    const ref = xthread.whereis("worker");        // location-transparent lookup
-    if (ref === null) { xthread.stop(2); return; }
-    xthread.send(ref, "ping");
+    const addr = xthread.whereis("worker");       // -> [thread, actor], or null
+    if (addr === null) { xthread.stop(2); return; }
+    xthread.send(addr[0], addr[1], "ping");
     xtimer.add(120, () => xthread.stop(pong ? 0 : 1), 1);
   },
   __thread_handle(msg) { if (msg === "pong") pong = true; },
