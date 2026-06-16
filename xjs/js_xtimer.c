@@ -146,7 +146,9 @@ static void timer_callback_bridge(void *ud) {
         t->handle = NULL;
     }
 
+    xjs_watch_begin();
     JSValue ret = JS_Call(ctx, cb, self, 1, (JSValueConst *)&self);
+    xjs_watch_end();
     if (JS_IsException(ret)) {
         xjs_dump_error_with_prefix(ctx, "xtimer callback: ");
     } else {

@@ -14,6 +14,15 @@
 #include "../3rd/quickjs/quickjs-libc.h"
 #include "../xmacro.h"
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#endif
+
 #ifndef countof
 #define countof(x) ((int)(sizeof(x) / sizeof((x)[0])))
 #endif
@@ -53,7 +62,120 @@ typedef struct XJSActorSlot {
 static XJS_TLS JSContext   *g_thread_ctx = NULL;   /* default actor (id 0) */
 static XJS_TLS JSRuntime   *g_thread_rt = NULL;    /* runtime for spawning */
 static XJS_TLS XJSActorSlot *g_actor_slots = NULL; /* registry: id -> ctx */
+static XJS_TLS XJSActorSlot *g_dead_actors = NULL; /* disposed, awaiting deferred teardown */
 static XJS_TLS int          g_next_actor_id = 1;
+
+/* Soft watchdog: a per-thread CPU deadline for one actor "turn" (one message
+** handler / timer / callback). The interrupt handler is installed once per
+** runtime and trips when an armed turn overruns its budget, throwing
+** InterruptError into the runaway actor without touching the thread's other
+** actors. budget_ms == 0 disables it. */
+static XJS_TLS int64_t g_watch_budget_ms = 0;
+static XJS_TLS int64_t g_watch_deadline  = 0;
+static XJS_TLS int     g_watch_armed     = 0;
+
+static int xjs_watch_interrupt(JSRuntime *rt, void *opaque) {
+    (void)rt; (void)opaque;
+    return (g_watch_armed && (int64_t)time_clock_ms() > g_watch_deadline) ? 1 : 0;
+}
+
+void xjs_watch_install(JSRuntime *rt) {
+    JS_SetInterruptHandler(rt, xjs_watch_interrupt, NULL);
+}
+
+void xjs_watch_begin(void) {
+    if (g_watch_budget_ms > 0) {
+        g_watch_deadline = (int64_t)time_clock_ms() + g_watch_budget_ms;
+        g_watch_armed = 1;
+    }
+}
+
+void xjs_watch_end(void) {
+    g_watch_armed = 0;
+}
+
+/* Location-transparent actor reference: pack the owning thread id (high 8 bits;
+** XTHR_MAX < 256) and the thread-local actor id (low 24 bits) into one int.
+** send() routes on the ref alone, so callers never track the target thread
+** separately. The default actor of a thread has local id 0. */
+#define XJS_REF_MAKE(thr, local)  (((int32_t)(thr) << 24) | ((int32_t)(local) & 0xFFFFFF))
+#define XJS_REF_THREAD(ref)       (((int32_t)(ref) >> 24) & 0xFF)
+#define XJS_REF_LOCAL(ref)        ((int32_t)(ref) & 0xFFFFFF)
+
+/* Process-global actor name registry (name -> ref), so an actor on any thread
+** can find another by name without knowing where it lives. Lock-protected
+** because it is read/written across OS threads. */
+typedef struct XJSName { char *name; int32_t ref; struct XJSName *next; } XJSName;
+static XJSName *g_names = NULL;
+
+#ifdef _WIN32
+static CRITICAL_SECTION g_name_cs;
+static INIT_ONCE g_name_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK name_cs_init(PINIT_ONCE o, PVOID p, PVOID *c) {
+    (void)o; (void)p; (void)c; InitializeCriticalSection(&g_name_cs); return TRUE;
+}
+static void name_lock(void) {
+    InitOnceExecuteOnce(&g_name_once, name_cs_init, NULL, NULL);
+    EnterCriticalSection(&g_name_cs);
+}
+static void name_unlock(void) { LeaveCriticalSection(&g_name_cs); }
+#else
+static pthread_mutex_t g_name_mtx = PTHREAD_MUTEX_INITIALIZER;
+static void name_lock(void) { pthread_mutex_lock(&g_name_mtx); }
+static void name_unlock(void) { pthread_mutex_unlock(&g_name_mtx); }
+#endif
+
+static void name_set(const char *name, int32_t ref) {
+    name_lock();
+    for (XJSName *n = g_names; n; n = n->next) {
+        if (strcmp(n->name, name) == 0) { n->ref = ref; name_unlock(); return; }
+    }
+    XJSName *n = (XJSName *)malloc(sizeof(*n));
+    if (n) {
+        size_t len = strlen(name) + 1;
+        n->name = (char *)malloc(len);
+        if (!n->name) { free(n); name_unlock(); return; }
+        memcpy(n->name, name, len);
+        n->ref = ref;
+        n->next = g_names;
+        g_names = n;
+    }
+    name_unlock();
+}
+
+static int name_get(const char *name, int32_t *out) {
+    int found = 0;
+    name_lock();
+    for (XJSName *n = g_names; n; n = n->next) {
+        if (strcmp(n->name, name) == 0) { *out = n->ref; found = 1; break; }
+    }
+    name_unlock();
+    return found;
+}
+
+static void name_remove(const char *name) {
+    name_lock();
+    for (XJSName **pp = &g_names; *pp; pp = &(*pp)->next) {
+        if (strcmp((*pp)->name, name) == 0) {
+            XJSName *n = *pp; *pp = n->next; free(n->name); free(n); break;
+        }
+    }
+    name_unlock();
+}
+
+/* Drop every name bound to a now-dead actor's ref (called from teardown). */
+static void name_remove_ref(int32_t ref) {
+    name_lock();
+    XJSName **pp = &g_names;
+    while (*pp) {
+        if ((*pp)->ref == ref) {
+            XJSName *n = *pp; *pp = n->next; free(n->name); free(n);
+        } else {
+            pp = &(*pp)->next;
+        }
+    }
+    name_unlock();
+}
 
 static XJSActorSlot *actor_slot(int id) {
     for (XJSActorSlot *s = g_actor_slots; s; s = s->next) {
@@ -95,6 +217,7 @@ static void actor_unregister(int id) {
 ** context. The slot must already be unlinked from the registry. */
 static void actor_teardown(XJSActorSlot *s) {
     JSContext *c = s->ctx;
+    name_remove_ref(XJS_REF_MAKE(xthread_current_id(), s->id));  /* drop its names */
     if (c && JS_IsObject(s->def)) {
         JSValue uninit = JS_GetPropertyStr(c, s->def, "__uninit");
         if (JS_IsFunction(c, uninit)) {
@@ -112,20 +235,35 @@ static void actor_teardown(XJSActorSlot *s) {
     s->ctx = NULL;
 }
 
-/* Free every spawned actor (id >= 1) and drop its slot. Called on thread
-** teardown before the default context is freed. */
-void xjs_xthread_free_spawned(void) {
-    XJSActorSlot **pp = &g_actor_slots;
-    while (*pp) {
-        XJSActorSlot *s = *pp;
-        if (s->id >= 1) {
-            *pp = s->next;
-            actor_teardown(s);
-            free(s);
-        } else {
-            pp = &s->next;
-        }
+/* Run deferred teardown for actors disposed since the last reap. Called by the
+** runner at a safe point — no actor handler is on the stack — so freeing a
+** self-disposed actor's context cannot pull the ground out from under it. */
+void xjs_xthread_reap_dead(void) {
+    while (g_dead_actors) {
+        XJSActorSlot *s = g_dead_actors;
+        g_dead_actors = s->next;
+        actor_teardown(s);   /* __uninit may dispose more -> prepended to g_dead_actors */
+        free(s);
     }
+}
+
+/* Free every spawned actor (id >= 1) and drop its slot. Called on thread
+** teardown before the default context is freed. Re-scans from the head each
+** pass so an __uninit that spawns/disposes can't corrupt the walk. */
+void xjs_xthread_free_spawned(void) {
+    xjs_xthread_reap_dead();
+    for (;;) {
+        XJSActorSlot **pp = &g_actor_slots, *target = NULL;
+        for (; *pp; pp = &(*pp)->next) {
+            if ((*pp)->id >= 1) { target = *pp; break; }
+        }
+        if (!target) break;
+        *pp = target->next;       /* unlink before teardown */
+        actor_teardown(target);
+        free(target);
+        xjs_xthread_reap_dead();  /* drain anything disposed during __uninit */
+    }
+    xjs_xthread_reap_dead();
 }
 
 void xjs_xthread_set_thread_rt(JSRuntime *rt) { g_thread_rt = rt; }
@@ -201,7 +339,9 @@ static int call_thread_handler(JSContext *ctx, JSValueConst handler,
         JS_FreeValue(ctx, func);
         return 0;
     }
+    xjs_watch_begin();
     JSValue ret = JS_Call(ctx, func, handler, argc, argv);
+    xjs_watch_end();
     JS_FreeValue(ctx, func);
     if (JS_IsException(ret)) {
         xjs_dump_error_with_prefix(ctx, "xthread handler: ");
@@ -332,26 +472,26 @@ static JSValue js_xthread_post(JSContext *ctx, JSValueConst this_val,
     return post_frame(ctx, target_id, 0, 1, argc, argv);
 }
 
-/* send(target, toActor, ...msg): deliver to a specific actor on target thread. */
+/* send(actorRef, ...msg): deliver to the actor named by a location-transparent
+** ref (from spawn()/selfActor()). The ref carries the target thread, so the
+** caller does not track it separately. */
 static JSValue js_xthread_send(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv) {
     (void)this_val;
-    if (argc < 2) {
-        return JS_ThrowTypeError(ctx, "xthread.send: target_id and actor_id expected");
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "xthread.send: actorRef expected");
     }
-    int32_t target_id = 0;
-    int32_t to_actor = 0;
-    if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
-    if (JS_ToInt32(ctx, &to_actor, argv[1]) < 0) return JS_EXCEPTION;
-    return post_frame(ctx, target_id, to_actor, 2, argc, argv);
+    int32_t ref = 0;
+    if (JS_ToInt32(ctx, &ref, argv[0]) < 0) return JS_EXCEPTION;
+    return post_frame(ctx, XJS_REF_THREAD(ref), XJS_REF_LOCAL(ref), 1, argc, argv);
 }
 
-/* selfActor(): the actor id of the context making the call. */
+/* selfActor(): the location-transparent ref of the calling actor. */
 static JSValue js_xthread_self_actor(JSContext *ctx, JSValueConst this_val,
                                      int argc, JSValueConst *argv) {
     (void)this_val; (void)argc; (void)argv;
     XJSActor *a = xjs_actor(ctx);
-    return JS_NewInt32(ctx, a ? a->actor_id : 0);
+    return JS_NewInt32(ctx, XJS_REF_MAKE(xthread_current_id(), a ? a->actor_id : 0));
 }
 
 /* spawn(scriptPath): create a new actor (JSContext) on THIS thread, run its
@@ -421,7 +561,7 @@ static JSValue js_xthread_spawn(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(nctx, init);
     JS_FreeValue(nctx, def);
 
-    return JS_NewInt32(ctx, id);
+    return JS_NewInt32(ctx, XJS_REF_MAKE(xthread_current_id(), id));
 }
 
 /* disposeActor(actorId): run a spawned actor's __uninit and free it. Local to
@@ -434,12 +574,16 @@ static JSValue js_xthread_dispose_actor(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt32(ctx, &id, argv[0]) < 0) return JS_EXCEPTION;
     if (id < 1) return JS_FALSE;   /* never dispose the default actor */
 
+    /* Unlink from the live registry so no further messages route here, then
+    ** defer __uninit + context free to the next reap. A handler may dispose its
+    ** OWN actor; tearing it down now would free the context out from under the
+    ** running JS frame (use-after-free). */
     for (XJSActorSlot **pp = &g_actor_slots; *pp; pp = &(*pp)->next) {
         if ((*pp)->id == id) {
             XJSActorSlot *s = *pp;
-            *pp = s->next;          /* unlink before teardown */
-            actor_teardown(s);
-            free(s);
+            *pp = s->next;            /* unlink from live registry */
+            s->next = g_dead_actors;  /* queue for deferred teardown */
+            g_dead_actors = s;
             return JS_TRUE;
         }
     }
@@ -457,6 +601,69 @@ static JSValue js_xthread_set_queue_max(JSContext *ctx, JSValueConst this_val,
     if (JS_ToInt32(ctx, &target_id, argv[0]) < 0) return JS_EXCEPTION;
     if (JS_ToInt32(ctx, &max_size, argv[1]) < 0) return JS_EXCEPTION;
     return JS_NewBool(ctx, xthread_set_queue_max(target_id, max_size) == 0);
+}
+
+/* setDeadline(ms): soft-watchdog CPU budget for one actor turn on this thread.
+** 0 disables. A handler that overruns is interrupted (InterruptError) without
+** freezing the thread's other actors. */
+static JSValue js_xthread_set_deadline(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv) {
+    (void)this_val;
+    int32_t ms = 0;
+    if (argc >= 1 && JS_ToInt32(ctx, &ms, argv[0]) < 0) return JS_EXCEPTION;
+    g_watch_budget_ms = ms < 0 ? 0 : ms;
+    return JS_UNDEFINED;
+}
+
+/* setMemoryLimit(bytes): cap this thread's runtime heap (shared by all its
+** actors). <=0 means unlimited. */
+static JSValue js_xthread_set_memory_limit(JSContext *ctx, JSValueConst this_val,
+                                           int argc, JSValueConst *argv) {
+    (void)this_val;
+    int64_t bytes = 0;
+    if (argc >= 1 && JS_ToInt64(ctx, &bytes, argv[0]) < 0) return JS_EXCEPTION;
+    JS_SetMemoryLimit(JS_GetRuntime(ctx), bytes > 0 ? (size_t)bytes : (size_t)-1);
+    return JS_UNDEFINED;
+}
+
+/* registerName(name): bind a process-global name to the calling actor's ref so
+** others can find it by name. Returns the ref. */
+static JSValue js_xthread_register_name(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "xthread.registerName: name expected");
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    XJSActor *a = xjs_actor(ctx);
+    int32_t ref = XJS_REF_MAKE(xthread_current_id(), a ? a->actor_id : 0);
+    name_set(name, ref);
+    JS_FreeCString(ctx, name);
+    return JS_NewInt32(ctx, ref);
+}
+
+/* whereis(name): the ref bound to a name, or null. Resolves across threads. */
+static JSValue js_xthread_whereis(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "xthread.whereis: name expected");
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    int32_t ref = 0;
+    int found = name_get(name, &ref);
+    JS_FreeCString(ctx, name);
+    return found ? JS_NewInt32(ctx, ref) : JS_NULL;
+}
+
+/* unregisterName(name): drop a name binding. */
+static JSValue js_xthread_unregister_name(JSContext *ctx, JSValueConst this_val,
+                                          int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_ThrowTypeError(ctx, "xthread.unregisterName: name expected");
+    const char *name = JS_ToCString(ctx, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    name_remove(name);
+    JS_FreeCString(ctx, name);
+    return JS_UNDEFINED;
 }
 
 static JSValue thread_stats_object(JSContext *ctx, int id) {
@@ -609,6 +816,7 @@ static void xjs_thread_on_update(xThread *thr) {
     if (xpoll_inited()) {
         xpoll_poll(wait_ms);
     }
+    xjs_xthread_reap_dead();   /* safe point: run deferred actor teardowns */
 }
 
 static void xjs_thread_on_cleanup(xThread *thr) {
@@ -819,6 +1027,15 @@ static const JSCFunctionListEntry xthread_funcs[] = {
     JS_CFUNC_DEF("rpc", 3, js_xthread_rpc),
     JS_CFUNC_DEF("setQueueMax", 2, js_xthread_set_queue_max),
     JS_CFUNC_DEF("set_queue_max", 2, js_xthread_set_queue_max),
+    JS_CFUNC_DEF("setDeadline", 1, js_xthread_set_deadline),
+    JS_CFUNC_DEF("set_deadline", 1, js_xthread_set_deadline),
+    JS_CFUNC_DEF("setMemoryLimit", 1, js_xthread_set_memory_limit),
+    JS_CFUNC_DEF("set_memory_limit", 1, js_xthread_set_memory_limit),
+    JS_CFUNC_DEF("registerName", 1, js_xthread_register_name),
+    JS_CFUNC_DEF("register_name", 1, js_xthread_register_name),
+    JS_CFUNC_DEF("whereis", 1, js_xthread_whereis),
+    JS_CFUNC_DEF("unregisterName", 1, js_xthread_unregister_name),
+    JS_CFUNC_DEF("unregister_name", 1, js_xthread_unregister_name),
     JS_CFUNC_DEF("stats", 1, js_xthread_stats),
     JS_CFUNC_DEF("allStats", 0, js_xthread_all_stats),
     JS_CFUNC_DEF("all_stats", 0, js_xthread_all_stats),

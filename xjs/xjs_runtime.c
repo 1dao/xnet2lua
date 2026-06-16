@@ -14,6 +14,7 @@ JSRuntime *xjs_new_runtime(void) {
     JS_SetModuleLoaderFunc2(rt, NULL, js_module_loader,
                             js_module_check_attributes, NULL);
     JS_SetHostPromiseRejectionTracker(rt, js_std_promise_rejection_tracker, NULL);
+    xjs_watch_install(rt);   /* soft-watchdog interrupt handler (L2) */
     return rt;
 }
 

@@ -301,6 +301,7 @@ static void main_update(MainJSData *data) {
     }
     int residual = main_auto_drive(data->tick_ms);
     xthread_update(residual);
+    xjs_xthread_reap_dead();   /* safe point: run deferred actor teardowns */
 }
 
 static void main_uninit(MainJSData *data) {

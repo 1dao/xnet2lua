@@ -55,6 +55,13 @@ void xjs_xthread_release_context(JSContext *ctx);
 void xjs_xthread_set_thread_ctx(JSContext *ctx);
 void xjs_xthread_set_thread_rt(JSRuntime *rt);
 void xjs_xthread_free_spawned(void);
+void xjs_xthread_reap_dead(void);
+
+/* Soft watchdog (L2 fault isolation). Install once per runtime; arm/disarm
+** around each actor-JS entry so a runaway turn is interrupted, not the thread. */
+void xjs_watch_install(JSRuntime *rt);
+void xjs_watch_begin(void);
+void xjs_watch_end(void);
 
 extern JSClassID g_xjs_conn_class_id;
 extern JSClassID g_xjs_listener_class_id;
