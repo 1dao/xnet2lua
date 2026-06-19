@@ -543,17 +543,13 @@ router.reg('get', '/api/auth/oauth/:provider/start', function(req)
             '/api/auth/oauth/' .. provider .. '/callback'
     end
 
-    local auth_url = pcfg.auth_url
-        .. (pcfg.auth_url:find('?', 1, true) and '&' or '?')
-        .. auth.url_encode_query({
-            response_type         = 'code',
-            client_id             = pcfg.client_id,
-            redirect_uri          = pcfg.redirect_uri,
-            scope                 = pcfg.scope,
-            state                 = state,
-            code_challenge        = challenge,
-            code_challenge_method = 'S256',
-        })
+    local auth_url, auth_url_err = auth.build_authorize_url(pcfg, {
+        redirect_uri   = pcfg.redirect_uri,
+        scope          = pcfg.scope,
+        state          = state,
+        code_challenge = challenge,
+    })
+    if not auth_url then return oauth_error(auth_url_err or 'authorization URL', 500) end
     return {
         status = 302,
         body = '',
@@ -604,29 +600,18 @@ router.reg('get', '/api/auth/oauth/:provider/callback', function(req)
     end
 
     -- Exchange authorization code for access_token (+ id_token if provided).
-    local tok_err, tok_resp = ctx.async_http_call({
-        method  = 'POST',
-        url     = pcfg.token_url,
-        headers = {
-            ['Content-Type'] = 'application/x-www-form-urlencoded',
-            ['Accept']       = 'application/json',
-        },
-        body = auth.form_encode({
-            grant_type    = 'authorization_code',
-            code          = code,
-            client_id     = pcfg.client_id,
-            client_secret = pcfg.client_secret,
-            redirect_uri  = pcfg.redirect_uri,
-            code_verifier = verifier,
-        }),
-        timeout_ms = 8000,
-    })
-    if tok_err then return oauth_error('token exchange: ' .. tostring(tok_err), 502, q.next) end
-    if not tok_resp or tok_resp.status < 200 or tok_resp.status >= 300 then
-        return oauth_error('token http ' .. tostring(tok_resp and tok_resp.status), 502, q.next)
-    end
-    local tok = xutils.json_unpack(tok_resp.body or '')
-    if type(tok) ~= 'table' or not tok.access_token then
+    local tok, tok_err = auth.exchange_code(pcfg, {
+        code          = code,
+        redirect_uri  = pcfg.redirect_uri,
+        code_verifier = verifier,
+    }, ctx.async_http_call)
+    if not tok then
+        if tok_err and tok_err.kind == 'transport' then
+            return oauth_error('token exchange: ' .. tostring(tok_err.message), 502, q.next)
+        end
+        if tok_err and (tok_err.kind == 'http' or tok_err.kind == 'oauth') then
+            return oauth_error('token http ' .. tostring(tok_err.status), 502, q.next)
+        end
         return oauth_error('token response missing access_token', 502, q.next)
     end
     local access_token = tostring(tok.access_token)
