@@ -12,8 +12,15 @@
 -- XAGENT_AUTH_TOKEN when no XAGENT_AUTH_TOKEN{N} is set. M.load_profiles()
 -- returns the whole list (the GUI shows one tab per profile); M.load() returns
 -- just the base profile (the headless main.lua and tests use this).
+--
+-- Profiles ALSO come from ~/.xagent/models.json — models the user adds in the
+-- GUI settings page (each { name, base_url, model, auth_style, api_key }). These
+-- are tagged source='json' (cfg-defined ones are source='cfg') so the GUI can
+-- offer delete only for the user-managed ones. Tokens live in the user's home
+-- dir, never in the repo.
 
 local xutils = require('xutils')
+local fs     = dofile('scripts/core/share/xfs.lua')
 
 local M = {}
 
@@ -76,8 +83,79 @@ local function name_profiles(profiles)
     return profiles
 end
 
+-- ── user-managed models (~/.xagent/models.json) ────────────────────────────
+function M.models_file()
+    return (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/models.json'
+end
+
+-- Auto-derive the auth header style from the endpoint. Anthropic and the common
+-- /anthropic-compatible gateways (DeepSeek, Volcengine ark, …) all use x-api-key,
+-- so that's the default; the user can hand-edit models.json for bearer.
+function M.infer_auth_style(_url)
+    return 'x-api-key'
+end
+
+-- Read the user-added models. Tolerant of either a bare array or { models=[…] }.
+function M.load_user_models()
+    local data = fs.read_file(M.models_file())
+    if not data then return {} end
+    local ok, t = pcall(xutils.json_unpack, data)
+    if not ok or type(t) ~= 'table' then return {} end
+    local arr = (type(t.models) == 'table') and t.models or t
+    local out = {}
+    if type(arr) == 'table' then
+        for _, m in ipairs(arr) do
+            if type(m) == 'table' and (m.base_url or m.model) then
+                out[#out + 1] = {
+                    name       = m.name,
+                    base_url   = m.base_url,
+                    model      = m.model,
+                    auth_style = m.auth_style or M.infer_auth_style(m.base_url),
+                    api_key    = m.api_key,
+                    verify     = true,
+                }
+            end
+        end
+    end
+    return out
+end
+
+local function save_user_models(list)
+    local clean = {}
+    for _, m in ipairs(list) do
+        clean[#clean + 1] = { name = m.name, base_url = m.base_url,
+            model = m.model, auth_style = m.auth_style, api_key = m.api_key }
+    end
+    fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
+    return fs.write_file(M.models_file(), xutils.json_pack({ models = clean }))
+end
+
+-- Append a user model. m = { name?, base_url, model, api_key?, auth_style? }.
+function M.add_user_model(m)
+    local list = M.load_user_models()
+    list[#list + 1] = {
+        name       = (m.name and m.name ~= '') and m.name or m.model,
+        base_url   = m.base_url,
+        model      = m.model,
+        auth_style = (m.auth_style and m.auth_style ~= '') and m.auth_style
+            or M.infer_auth_style(m.base_url),
+        api_key    = (m.api_key and m.api_key ~= '') and m.api_key or nil,
+    }
+    return save_user_models(list)
+end
+
+-- Remove the user model at 1-based `index` (its position within models.json).
+function M.delete_user_model(index)
+    local list = M.load_user_models()
+    if not list[index] then return false end
+    table.remove(list, index)
+    return save_user_models(list)
+end
+
 -- Return the full list of configured profiles (always ≥1: the base profile,
--- which defaults to Anthropic when nothing is configured).
+-- which defaults to Anthropic when nothing is configured). cfg-defined profiles
+-- come first (tagged source='cfg'), then user models from models.json
+-- (source='json', with json_index = their slot for delete).
 function M.load_profiles()
     -- Best-effort: pull in the gitignored secrets file if present. Values
     -- already loaded (xnet.cfg, argv) keep priority, so this only adds keys.
@@ -100,9 +178,21 @@ function M.load_profiles()
         if not p then break end                         -- first empty slot stops the scan
         profiles[#profiles + 1] = p
     end
+    for _, p in ipairs(profiles) do p.source = 'cfg' end
+
+    -- Append user-added models. Their token falls back to the shared one too.
+    for i, m in ipairs(M.load_user_models()) do
+        m.source = 'json'
+        m.json_index = i
+        m.api_key = m.api_key or shared_token
+        profiles[#profiles + 1] = m
+    end
+
     -- Nothing configured at all → fall back to the base default (Anthropic),
     -- so there is always at least one profile.
-    if #profiles == 0 then profiles[1] = build('', shared_token) end
+    if #profiles == 0 then
+        local p = build('', shared_token); p.source = 'cfg'; profiles[1] = p
+    end
     return name_profiles(profiles)
 end
 

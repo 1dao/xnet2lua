@@ -88,6 +88,11 @@ local S = {
     tab_picker = false,        -- the "+" new-tab model-picker popup is open
     plus_x = 0,                -- screen x of the "+" button (picker anchor)
     next_tab_id = 1,
+    -- settings page: theme/model dropdowns + the add-model form
+    dd_open = nil,             -- which dropdown is open: nil | 'theme' | 'model'
+    dd_anchor = nil,           -- { x, y, w } of the open dropdown button
+    model_sel = 1,             -- selected profile index in the model dropdown
+    add_model = nil,           -- the add-model form state while it's open
     -- tool permission mode: 'write' = auto-run (default), 'ask' = confirm each
     -- state-changing tool before it runs. The parked await lives per-tab.
     mode = 'write',
@@ -182,6 +187,17 @@ local function draw_x(x, y, w, h, col, r)
             col[1], col[2], col[3], col[4] or 255)
         raygui.draw_rectangle(math.floor(cx + d - 1), math.floor(cy - d - 1), 2, 2,
             col[1], col[2], col[3], col[4] or 255)
+    end
+end
+
+-- Small hand-drawn caret (▼ / ▲) centered at (cx, cy) — the dropdown indicator.
+-- Hand-drawn for the same reason as draw_x: triangle glyphs aren't reliable here.
+local function draw_caret(cx, cy, col, up)
+    for k = 0, 3 do
+        local w = 7 - 2 * k
+        local row = up and (3 - k) or k
+        raygui.draw_rectangle(math.floor(cx - w / 2), math.floor(cy - 2 + row),
+            math.max(1, w), 1, col[1], col[2], col[3], col[4] or 255)
     end
 end
 
@@ -995,7 +1011,7 @@ local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached 
 local function update_completion_menu()
     S.menu = nil
     local tab = T()
-    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker then return end
+    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model then return end
     local menu = complete.compute(tab.input, completion_deps)
     if not menu then S.menu_dismissed_for = nil; return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
@@ -1161,6 +1177,121 @@ local function draw_tab_picker(W, H)
     end
 end
 
+-- ── settings page: dropdowns + add-model form ──────────────────────────────
+local function reload_profiles()
+    S.profiles = config.load_profiles()
+    if S.model_sel < 1 then S.model_sel = 1 end
+    if S.model_sel > #S.profiles then S.model_sel = #S.profiles end
+end
+
+-- A dropdown trigger: a button + a caret. Records its anchor while open so the
+-- popup list (drawn on top of everything at frame end) knows where to appear.
+local function dropdown_button(id, x, y, w, h, current)
+    local open = (S.dd_open == id)
+    local clicked = raygui.button(x, y, w, h, '  ' .. sanitize_label(current or '（无）'))
+    local col = (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
+    draw_caret(x + w - 14, y + h / 2, col, open)
+    if clicked then S.dd_open = open and nil or id end
+    if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
+end
+
+-- Draw the open dropdown's list (theme or model) over the rest of the UI.
+local function draw_dropdown_overlays()
+    if not S.dd_open or not S.dd_anchor then return end
+    raygui.unlock()                       -- background was locked while a dropdown is open
+    if S.sidebar ~= 'settings' then S.dd_open = nil; return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.dd_open = nil; return
+    end
+    local items = {}
+    if S.dd_open == 'theme' then
+        for _, t in ipairs(THEMES) do items[#items + 1] = { label = t, cur = (t == S.theme) } end
+    elseif S.dd_open == 'model' then
+        for i, p in ipairs(S.profiles or {}) do
+            items[#items + 1] = { label = p.name or p.model or '?', cur = (i == S.model_sel) }
+        end
+    end
+    if #items == 0 then S.dd_open = nil; return end
+    local a = S.dd_anchor
+    local row_h = FONT_SIZE + 10
+    local px, pw, py = a.x, a.w, a.y + a.h + 2
+    local ph = 6 + #items * row_h
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 252)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(px, py, 3, ph, ac[1], ac[2], ac[3], 255)
+    for i, it in ipairs(items) do
+        local ry = py + 3 + (i - 1) * row_h
+        if raygui.button(px + 4, ry, pw - 8, row_h - 3,
+                (it.cur and '● ' or '   ') .. sanitize_label(it.label)) then
+            if S.dd_open == 'theme' then apply_theme(it.label)
+            elseif S.dd_open == 'model' then S.model_sel = i end
+            S.dd_open = nil
+        end
+    end
+end
+
+local function open_add_model()
+    S.dd_open = nil
+    S.add_model = { name = '', url = 'https://', model = '', token = '',
+                    name_e = false, url_e = false, model_e = false, token_e = false, err = nil }
+end
+
+-- A centered modal to add a model (persisted to ~/.xagent/models.json). Only
+-- URL + 模型ID are required; auth_style is auto (x-api-key). Esc / 取消 closes.
+local function draw_add_model_modal(W, H)
+    local f = S.add_model
+    if not f then return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.add_model = nil; return
+    end
+    local mw, mh = 520, 300
+    local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
+    raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
+    raygui.label(mx + 16, my + 12, mw - 32, 24, '新增模型（鉴权方式自动 = x-api-key）')
+
+    local pad, lblw = 16, 84
+    local fx = mx + pad + lblw + 8
+    local fw = mw - (pad + lblw + 8) - pad
+    local rh, row = 30, my + 48
+    local function fld(label, id)
+        raygui.label(mx + pad, row + 4, lblw, 22, label)
+        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
+        row = row + rh + 6
+    end
+    fld('名称', 'name')
+    fld('API地址', 'url')
+    fld('模型ID', 'model')
+    fld('Token', 'token')
+
+    if f.err then
+        local ec = { 220, 90, 90, 255 }
+        raygui.draw_rectangle(mx + pad, row, 6, 6, ec[1], ec[2], ec[3], 255)
+        raygui.label(mx + pad + 12, row - 4, mw - 2 * pad - 12, 22, f.err)
+    end
+
+    if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
+        local url = (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local model = (f.model or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if url == '' or url == 'https://' or model == '' then
+            f.err = '请至少填写 API地址 和 模型ID'
+        else
+            config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
+                base_url = url, model = model,
+                api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '') })
+            reload_profiles()
+            S.model_sel = #S.profiles      -- select the model just added
+            S.add_model = nil
+            if T() then T().status = '已添加模型' end
+        end
+    end
+    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then S.add_model = nil end
+end
+
 local function __init()
     S.profiles = config.load_profiles()
     assert(xnet.init())
@@ -1248,8 +1379,8 @@ local function __update()
     -- directory dialog open: freeze the UI underneath (raygui controls via
     -- lock; custom-drawn transcript/list wheel via flags). Unlocked again just
     -- before the dialog itself is drawn at the end of the frame.
-    if S.dir_dialog then raygui.lock() end
-    tab.view.lock_input = S.dir_dialog or nil
+    if S.dir_dialog or S.add_model or S.dd_open then raygui.lock() end
+    tab.view.lock_input = (S.dir_dialog or S.add_model or S.dd_open) or nil
 
     -- top bar: title/status + context meter + settings + history toggles
     S.frame = S.frame + 1
@@ -1463,20 +1594,39 @@ local function __update()
                 raygui.end_scissor()
             end
         else -- settings
-            raygui.label(10, TOP + 6, SIDEBAR_W - 20, 22, '配色方案')
-            local by = TOP + 38
-            for _, t in ipairs(THEMES) do
-                local lbl = (t == S.theme) and ('●  ' .. t) or ('    ' .. t)
-                if raygui.button(10, by, SIDEBAR_W - 20, 32, lbl) then apply_theme(t) end
-                by = by + 38
-            end
-            raygui.label(12, by + 8, SIDEBAR_W - 24, 22, '当前模型: ' .. (tab.cfg and tab.cfg.name or '?'))
-            by = by + 32
-            raygui.label(12, by, SIDEBAR_W - 24, 22, '已配置模型（顶部 + 可新建标签）:')
-            by = by + 26
-            for _, p in ipairs(S.profiles or {}) do
-                raygui.label(20, by, SIDEBAR_W - 28, 20, '· ' .. sanitize_label(p.name or p.model or '?'))
-                by = by + 22
+            local pad = 12
+            -- 配色方案 dropdown
+            raygui.label(pad, TOP + 6, SIDEBAR_W - 2 * pad, 22, '配色方案')
+            dropdown_button('theme', pad, TOP + 30, SIDEBAR_W - 2 * pad, 30, S.theme)
+
+            -- 模型 dropdown + 添加 按钮（添加打开表单，可填 URL/Token）
+            local my0 = TOP + 74
+            raygui.label(pad, my0, SIDEBAR_W - 2 * pad, 22, '模型')
+            local nprof = #(S.profiles or {})
+            if S.model_sel < 1 then S.model_sel = 1 end
+            if S.model_sel > nprof then S.model_sel = math.max(1, nprof) end
+            local selp = (S.profiles or {})[S.model_sel]
+            local addw = 56
+            local ddw = SIDEBAR_W - 2 * pad - addw - 6
+            dropdown_button('model', pad, my0 + 24, ddw, 30, selp and (selp.name or selp.model) or '（无）')
+            if raygui.button(pad + ddw + 6, my0 + 24, addw, 30, '添加') then open_add_model() end
+
+            -- selected model details (+ delete for user-added ones)
+            local dy = my0 + 64
+            if selp then
+                local function det(s) raygui.label(pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
+                det('地址: ' .. sanitize_label(selp.base_url or '?'))
+                det('模型: ' .. sanitize_label(selp.model or '?'))
+                det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
+                det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
+                det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))
+                if selp.source == 'json' and selp.json_index then
+                    dy = dy + 4
+                    if raygui.button(pad, dy, 120, 28, '删除此模型') then
+                        config.delete_user_model(selp.json_index)
+                        reload_profiles()
+                    end
+                end
             end
         end
     end
@@ -1523,7 +1673,7 @@ local function __update()
     local submitted, new_edit
     tab.input, new_edit, submitted = raygui.textbox_multi(
         lx + 8, iy, W - lx - 16, input_h, tab.input,
-        (not S.dir_dialog) and tab.input_edit or false, true)
+        (not S.dir_dialog and not S.add_model and not S.dd_open) and tab.input_edit or false, true)
 
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
@@ -1617,6 +1767,15 @@ local function __update()
             tab.status = 'ready'
         end
     end
+
+    -- add-model modal: drawn LAST, after unlocking (same pattern as the dialog).
+    if S.add_model then
+        raygui.unlock()
+        draw_add_model_modal(W, H)
+    end
+
+    -- open dropdown list: topmost overlay; unlocks the background it was drawn over.
+    draw_dropdown_overlays()
 
     raygui.finish()
 end
