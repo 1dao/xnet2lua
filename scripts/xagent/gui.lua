@@ -1196,8 +1196,10 @@ local function dropdown_button(id, x, y, w, h, current)
 end
 
 -- Draw the open dropdown's list (theme or model) over the rest of the UI.
-local function draw_dropdown_overlays()
-    if not S.dd_open or not S.dd_anchor then return end
+-- `was_open` is S.dd_open as of frame start (before any control could toggle it),
+-- so the click that OPENS the dropdown this frame isn't read as an outside-click.
+local function draw_dropdown_overlays(was_open)
+    if not S.dd_open or not S.dd_anchor then S.dd_prev_down = false; return end
     raygui.unlock()                       -- background was locked while a dropdown is open
     if S.sidebar ~= 'settings' then S.dd_open = nil; return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
@@ -1228,6 +1230,21 @@ local function draw_dropdown_overlays()
             elseif S.dd_open == 'model' then S.model_sel = i end
             S.dd_open = nil
         end
+    end
+
+    -- Dismiss on a press that lands outside both the list and its trigger button.
+    -- The background is locked, so this click is consumed purely to close (it does
+    -- not also activate whatever sits underneath). Press-EDGE only (down this
+    -- frame, up last), and gated on `was_open` so the opening click — which is a
+    -- press over the trigger that this same frame set S.dd_open — never self-closes.
+    local down = (raygui.mouse_down and raygui.mouse_down()) or false
+    local press = down and not S.dd_prev_down
+    S.dd_prev_down = down
+    if was_open and press and S.dd_open then
+        local mx, my = raygui.get_mouse()
+        local in_list = mx >= px and mx <= px + pw and my >= py and my <= py + ph
+        local in_trig = mx >= a.x and mx <= a.x + a.w and my >= a.y and my <= a.y + a.h
+        if not in_list and not in_trig then S.dd_open = nil end
     end
 end
 
@@ -1375,6 +1392,11 @@ local function __update()
 
     local W, H = raygui.screen_size()
     raygui.begin()
+
+    -- Capture the dropdown's open-state BEFORE any control this frame can toggle
+    -- it: the click that OPENS a dropdown must not also be read as the outside-
+    -- click that closes it (see draw_dropdown_overlays).
+    local dd_open_at_start = S.dd_open
 
     -- directory dialog open: freeze the UI underneath (raygui controls via
     -- lock; custom-drawn transcript/list wheel via flags). Unlocked again just
@@ -1775,7 +1797,7 @@ local function __update()
     end
 
     -- open dropdown list: topmost overlay; unlocks the background it was drawn over.
-    draw_dropdown_overlays()
+    draw_dropdown_overlays(dd_open_at_start)
 
     raygui.finish()
 end
