@@ -114,6 +114,7 @@ SOCKET_T xsock_connect(char *err, const char *addr, int port, int flags) {
         xsock_format_error(err, "socket creation failed");
         return INVALID_SOCKET_VAL;
     }
+    socket_set_cloexec(s);
 
     if (flags & XSOCK_CONNECT_NONBLOCK) {
         if (xsock_set_nonblock(err, s) != XSOCK_OK) {
@@ -180,6 +181,7 @@ SOCKET_T xsock_listen(char *err, const char *bindaddr, int port) {
     SOCKET_T s = socket(domain, SOCK_STREAM, 0);
     if (s == INVALID_SOCKET_VAL) { xsock_format_error(err, "socket creation failed"); return s; }
 
+    socket_set_cloexec(s);
     socket_set_reuseaddr(s);
 
     if (is_unix) {
@@ -226,6 +228,7 @@ SOCKET_T xsock_accept(char *err, SOCKET_T s, char *ip, int *port) {
         }
         break;
     }
+    socket_set_cloexec(fd);
 
     if (sa.ss_family == AF_INET) {
         struct sockaddr_in *s4 = (struct sockaddr_in *)&sa;
