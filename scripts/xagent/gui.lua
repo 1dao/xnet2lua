@@ -25,9 +25,9 @@ local session       = require('xagent.session.session')
 local transcript    = require('xagent.ui.transcript')
 local markdown      = require('xagent.ui.markdown')
 local complete      = require('xagent.ui.complete')
-local text          = dofile('scripts/core/share/xtext.lua')
-local fs            = dofile('scripts/core/share/xfs.lua')
-local async         = dofile('scripts/core/share/xasync.lua')
+local text          = dofile('scripts/core/share/xtext.lua') ---@type xtext
+local fs            = dofile('scripts/core/share/xfs.lua') ---@type xfs
+local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
 local api_log       = require('xagent.llm.api_log')
 
 registry.register(require('xagent.tools.read'))

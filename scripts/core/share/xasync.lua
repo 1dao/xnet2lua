@@ -7,6 +7,7 @@
 -- `resolve(...)`, which resumes us. The values passed to resolve become await's
 -- return values. Dependency-free; any thread can `dofile` it.
 
+---@class xasync
 local M = {}
 
 local pack = table.pack
