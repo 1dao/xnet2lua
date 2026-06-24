@@ -628,6 +628,7 @@ router.reg('get', '/api/auth/oauth/:provider/callback', function(req)
             headers = { ['Authorization'] = 'Bearer ' .. access_token,
                         ['Accept']        = 'application/json' },
             timeout_ms = 5000,
+            proxy   = pcfg.proxy,
         })
         if not u_err and u_resp and u_resp.status == 200 then
             userinfo = xutils.json_unpack(u_resp.body or '')

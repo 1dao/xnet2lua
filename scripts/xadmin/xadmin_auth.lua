@@ -238,6 +238,11 @@ function M.load_oauth_provider(name)
         redirect_uri = env('XADMIN_OAUTH_' .. U .. '_REDIRECT_URI'),
         issuer       = env('XADMIN_OAUTH_' .. U .. '_ISSUER'),
         username_field = env('XADMIN_OAUTH_' .. U .. '_USERNAME_FIELD') or 'sub',
+        -- Outbound proxy for this IdP's discovery/token/userinfo calls. Per
+        -- provider (XADMIN_OAUTH_<NAME>_PROXY), falling back to a global
+        -- XADMIN_HTTP_PROXY. Empty = direct. Lets a CN deployment reach Google
+        -- via socks5h://127.0.0.1:1080 while a LAN IdP stays direct.
+        proxy        = env('XADMIN_OAUTH_' .. U .. '_PROXY') or env('XADMIN_HTTP_PROXY'),
         client_auth   = 'body',
         token_encoding= 'form',
     }

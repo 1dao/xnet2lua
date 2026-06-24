@@ -112,6 +112,7 @@ static inline size_t packet_consumed_return(lua_State* L, int idx, size_t max_le
 #if XNET_WITH_HTTPS
 int l_xnet_attach_tls(lua_State* L);
 int l_xnet_connect_tls(lua_State* L);
+int l_xnet_connect_tls_fd(lua_State* L);
 void lua_xnet_tls_register(lua_State* L);
 #endif
 

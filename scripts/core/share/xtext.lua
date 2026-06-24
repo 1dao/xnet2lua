@@ -1,6 +1,7 @@
 -- xtext.lua — text hygiene + small string helpers shared across modules.
 -- Dependency-free and stateless; any thread can `dofile` it.
 
+---@class xtext
 local M = {}
 
 local REPLACEMENT = '\239\191\189'   -- U+FFFD as UTF-8

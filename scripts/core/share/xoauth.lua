@@ -152,6 +152,7 @@ function M.discover_oidc(provider, http_call)
     local url = provider.issuer:gsub('/+$', '') .. '/.well-known/openid-configuration'
     local ok, err, response = pcall(http_call, {
         method = 'GET', url = url, timeout_ms = 5000, decompress = true,
+        proxy = provider.proxy,
     })
     if not ok then return nil, 'oidc discovery: ' .. tostring(err) end
     if err then return nil, 'oidc discovery: ' .. tostring(err) end
@@ -240,6 +241,7 @@ local function token_request(provider, values, http_call)
     local ok, err, response = pcall(http_call, {
         method = 'POST', url = provider.token_url, headers = headers, body = body,
         timeout_ms = provider.token_timeout_ms or 8000,
+        proxy = provider.proxy,
     })
     if not ok then return nil, token_error('transport', tostring(err)) end
     if err then return nil, token_error('transport', tostring(err)) end
@@ -302,6 +304,7 @@ function M.revoke_token(provider, request, http_call)
     local ok, err, response = pcall(http_call, {
         method = 'POST', url = provider.revoke_url, headers = headers, body = body,
         timeout_ms = provider.token_timeout_ms or 8000,
+        proxy = provider.proxy,
     })
     if not ok then return nil, token_error('transport', tostring(err)) end
     if err then return nil, token_error('transport', tostring(err)) end

@@ -996,6 +996,7 @@ static const luaL_Reg xnet_funcs[] = {
 #if XNET_WITH_HTTPS
     { "attach_tls", l_xnet_attach_tls },
     { "connect_tls", l_xnet_connect_tls },
+    { "connect_tls_fd", l_xnet_connect_tls_fd },
 #endif
     { NULL, NULL }
 };

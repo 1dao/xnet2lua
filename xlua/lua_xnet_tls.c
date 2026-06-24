@@ -1000,6 +1000,94 @@ int l_xnet_connect_tls(lua_State* L) {
     return 1;
 }
 
+/* xnet.connect_tls_fd(fd, handler, host [, port [, tls_config]])
+** Performs a CLIENT-mode TLS handshake on an ALREADY-CONNECTED socket fd, then
+** behaves exactly like a connection from connect_tls. Unlike connect_tls it does
+** NOT open a new socket (the fd is adopted as-is); unlike attach_tls it runs a
+** client handshake (SNI + CA verify) rather than a server one. This is the seam
+** a proxy client uses: open a plaintext TCP connection, complete the SOCKS5 /
+** HTTP-CONNECT tunnel handshake in Lua, surrender the fd via conn:detach(), then
+** upgrade it to TLS here with server_name = the real origin host.
+**
+** `host` is used for SNI and certificate-name verification (cfg.server_name
+** overrides it if set). The fd is adopted: on any setup error it is closed.
+** Returns the TLS connection userdata, or nil + error string. */
+int l_xnet_connect_tls_fd(lua_State* L) {
+    SOCKET_T fd = (SOCKET_T)luaL_checkinteger(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    const char* host = luaL_checkstring(L, 3);
+    int port = (int)luaL_optinteger(L, 4, 0);
+    int cfg_idx = lua_istable(L, 5) ? 5 : 0;
+
+    if (fd == INVALID_SOCKET_VAL) {
+        lua_pushnil(L);
+        lua_pushstring(L, "invalid fd");
+        return 2;
+    }
+
+    char err[XSOCK_ERR_LEN] = {0};
+    if (xsock_set_nonblock(err, fd) != XSOCK_OK) {
+        xsock_close(fd);
+        lua_pushnil(L);
+        lua_pushstring(L, err[0] ? err : "set nonblock failed");
+        return 2;
+    }
+
+    LuaTlsConn* c = (LuaTlsConn*)lua_newuserdata(L, sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    c->L = main_lua_state(L);
+    c->fd = fd;
+    c->self_ref = LUA_NOREF;
+    c->handler_ref = LUA_NOREF;
+    c->closed = false;
+    c->handshake_done = false;
+    /* The fd is already connected (the proxy tunnel is up), so there is no
+    ** pending TCP connect to wait on: go straight to the TLS handshake. */
+    c->connecting = false;
+    c->max_packet = 16u * 1024u * 1024u;
+    c->max_send = 10u * 1024u * 1024u + 4u;
+    strncpy(c->host, host, sizeof(c->host) - 1);
+    c->host[sizeof(c->host) - 1] = '\0';
+    strncpy(c->peer_ip, host, sizeof(c->peer_ip) - 1);
+    c->peer_ip[sizeof(c->peer_ip) - 1] = '\0';
+    c->peer_port = port;
+
+    luaL_getmetatable(L, LUA_XNET_TLS_META);
+    lua_setmetatable(L, -2);
+
+    int tls_top = lua_gettop(L);
+    int rc = tls_setup_client_context(L, c, cfg_idx);
+    if (rc != 0) {
+        const char* msg = lua_tostring(L, -1);
+        char saved[256];
+        snprintf(saved, sizeof(saved), "%s", msg ? msg : "tls setup failed");
+        lua_settop(L, tls_top);
+        tls_free_crypto(c);
+        xsock_close(fd);
+        c->fd = INVALID_SOCKET_VAL;
+        c->closed = true;
+        lua_pushnil(L);
+        lua_pushstring(L, saved);
+        return 2;
+    }
+    lua_settop(L, tls_top);
+
+    ref_from_stack(L, 2, &c->handler_ref);
+    lua_pushvalue(L, -1);
+    c->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+    /* fd is connected already: only READABLE is needed to drive the handshake. */
+    if (tls_arm_read(c) != 0) {
+        tls_close_internal(c, "poll_error", false);
+        lua_pushnil(L);
+        lua_pushstring(L, "xpoll_add_event failed");
+        return 2;
+    }
+
+    tls_drive_handshake(c);
+    return 1;
+}
+
 static int l_tls_fd(lua_State* L) {
     LuaTlsConn* c = check_tls_conn(L, 1);
     if (!c || c->closed || c->fd == INVALID_SOCKET_VAL) lua_pushnil(L);
