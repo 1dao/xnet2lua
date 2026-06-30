@@ -43,10 +43,20 @@ registry.register(require('xagent.tools.memory_write'))
 registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
 
-local skills = require('xagent.skills')
+local skills    = require('xagent.skills')
+local open_url  = require('xagent.ui.open_url')
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local FONT_SIZE = 22
+
+-- Per-turn output cap. A bigger cap is free — you only pay for tokens actually
+-- produced — but a TOO-SMALL cap silently breaks big outputs: an AetherViz
+-- single-file page needs ~6k–15k tokens, and at 4096 the model can't emit it in
+-- one turn (it stalls / gets truncated). 8192 fits a focused page and is broadly
+-- supported; raise XAGENT_MAX_TOKENS if your model allows more (NOTE: it applies
+-- to every turn, so a value above the model's limit will fail all requests).
+local MAX_TOKENS = tonumber(xutils.get_config('XAGENT_MAX_TOKENS'))
+    or tonumber(os.getenv('XAGENT_MAX_TOKENS')) or 8192
 
 -- Pre-seed common glyphs so streaming text doesn't keep rebuilding the font
 -- atlas (every rebuild re-rasterizes the whole texture and makes ALL text —
@@ -58,7 +68,7 @@ local function preseed_charset()
     range(0x4E00, 0x9FFF)   -- CJK Unified Ideographs (common Chinese)
     range(0x3000, 0x303F)   -- CJK symbols & punctuation
     range(0xFF00, 0xFFEF)   -- fullwidth forms
-    range(0x2018, 0x2026)   -- quotes / dashes / bullet / ellipsis
+    range(0x2010, 0x2027)   -- hyphens / en+em dashes (—, U+2014) / quotes / bullet / ellipsis
     range(0x2190, 0x21B5)   -- arrows
     range(0x2200, 0x22FF)   -- mathematical operators (≈ ≠ ≤ ≥ ∞ ∑ √ ∈ …)
     range(0x25A0, 0x25FF)   -- geometric shapes (○ ● ◦ ■ □ ▲ ▶ …)
@@ -255,6 +265,35 @@ local function add(tab, role, text)
     return e
 end
 
+-- Transient "thinking…" line shown in the transcript while a turn is busy but
+-- nothing has appeared yet — including the long, INVISIBLE stretch where a big
+-- tool argument (e.g. a whole HTML document) streams into the tool call. It's
+-- a normal entry kept as the LAST item, with dots animating off S.frame; removed
+-- the instant real content (text or a tool card) shows up, or the turn ends.
+local function clear_thinking(tab)
+    local th = tab.thinking
+    if not th then return end
+    for i = #tab.entries, 1, -1 do
+        if tab.entries[i] == th then table.remove(tab.entries, i); break end
+    end
+    tab.thinking = nil
+end
+
+local function update_thinking(tab)
+    -- Waiting for output: busy, nothing streaming yet, not parked on a
+    -- permission prompt (that has its own UI).
+    if not (tab.busy and not tab.cur and not tab.pending_confirm) then
+        clear_thinking(tab); return
+    end
+    local text = 'thinking' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
+    if tab.thinking and tab.entries[#tab.entries] == tab.thinking then
+        tab.thinking.text = text                 -- already last: just refresh dots
+    else
+        clear_thinking(tab)                      -- a new entry got appended after it
+        tab.thinking = add(tab, 'thinking', text)
+    end
+end
+
 -- forward declarations (referenced before their definitions below)
 local new_session, new_tab, close_tab, select_tab
 
@@ -339,9 +378,9 @@ local function on_event(tab, ev)
         -- did_micro alone is silent — it's background housekeeping near the
         -- context limit, not something to announce in the transcript.
     elseif ev.type == 'done' then
-        flush_tail(tab); tab.busy = false; tab.status = 'ready'
+        flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = 'ready'
     elseif ev.type == 'error' then
-        flush_tail(tab); add(tab, 'error', 'ERROR: ' .. tostring(ev.error)); tab.busy = false; tab.status = 'error'
+        flush_tail(tab); clear_thinking(tab); add(tab, 'error', 'ERROR: ' .. tostring(ev.error)); tab.busy = false; tab.status = 'error'
     end
 end
 
@@ -771,7 +810,7 @@ local function load_history_item(it)
     if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
     s2.tools = registry.to_api_params()
     s2.system = system_prompt.build({ cwd = s2.cwd, project_md = project_md.load(s2.cwd) })
-    s2.max_tokens = 4096
+    s2.max_tokens = MAX_TOKENS
     s2.confirm = make_confirm(tab, s2)
     tab.sess = s2
     tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
@@ -820,7 +859,7 @@ function new_session()
     tab.sess = session.new({
         cfg = tab.cfg, cwd = cwd, tools = registry.to_api_params(),
         system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
-        max_tokens = 4096,
+        max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
     tab.entries = {}
@@ -854,11 +893,12 @@ function new_tab(cfg, cwd)
     S.next_tab_id = S.next_tab_id + 1
     tab.view.bg = S.view_bg
     tab.view.on_copy = S.on_copy
+    tab.view.on_link = S.on_link
     skills.bootstrap(cwd)   -- align the (global) project skills with this tab's dir
     tab.sess = session.new({
         cfg = cfg, cwd = cwd, tools = registry.to_api_params(),
         system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
-        max_tokens = 4096,
+        max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
     S.tabs[#S.tabs + 1] = tab
@@ -1331,10 +1371,22 @@ local function __init()
     end
     S.on_copy = copy_entry
 
+    -- Click a URL in the transcript to open it in the default browser.
+    -- Restrict to web/file schemes for safety.
+    local function open_link(url)
+        local scheme = tostring(url or ''):match('^(%a[%w%+%.%-]*)://')
+        if scheme == 'http' or scheme == 'https' or scheme == 'file' then
+            open_url.open(url)
+            if T() then T().status = '已打开链接 ↗' end
+        end
+    end
+    S.on_link = open_link
+
     -- A second view renders the selected API-log record's request/response detail.
     S.log_view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui,
         emoji_tex = S.emoji_tex, anchor_top = true })
     S.log_view.on_copy = copy_entry
+    S.log_view.on_link = open_link
 
     -- Apply the saved (or default) color theme (sets S.view_bg for new tabs).
     local saved = fs.read_file(THEME_FILE)
@@ -1406,6 +1458,7 @@ local function __update()
 
     -- top bar: title/status + context meter + settings + history toggles
     S.frame = S.frame + 1
+    update_thinking(tab)   -- maintain the transient "thinking…" transcript line
     local hb = S.header_bg
     raygui.draw_rectangle(0, 0, W, HEADER_H, hb[1], hb[2], hb[3], hb[4])
     local status_text = tab.status

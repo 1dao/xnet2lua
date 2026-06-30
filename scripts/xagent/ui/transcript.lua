@@ -79,8 +79,35 @@ M.role_colors = {
     tool_result = { 150, 150, 162, 255 },
     error       = { 240, 105, 105, 255 },
     system      = { 150, 150, 162, 255 },
+    thinking    = { 130, 140, 155, 255 },   -- transient "thinking…" placeholder
 }
 local function role_color(role) return M.role_colors[role] or M.role_colors.assistant end
+
+-- Clickable links: bare URLs in the text (e.g. a plain http://… address) are
+-- drawn in this color + underlined and open on click.
+M.link_color = { 96, 170, 255, 255 }
+
+-- find_links(s) -> { { s=byte_start, e=byte_end, url=string }, … } for each
+-- scheme://… run in `s`. URL chars are ASCII, so byte offsets are also valid
+-- UTF-8 boundaries (safe for s:sub on mixed CJK lines). Trailing sentence
+-- punctuation is trimmed so "…：http://x/y.html。" links just the URL.
+local TRAIL = '[%)%]%}>,%.;:!%?，。、）】！？”’]+$'
+local function find_links(s)
+    local out, init = {}, 1
+    s = tostring(s or '')
+    while true do
+        local a, b = s:find('%a[%w%+%.%-]*://%S+', init)
+        if not a then break end
+        local url = s:sub(a, b)
+        local trimmed = url:gsub(TRAIL, '')
+        if #trimmed > 0 then
+            out[#out + 1] = { s = a, e = a + #trimmed - 1, url = trimmed }
+        end
+        init = b + 1
+    end
+    return out
+end
+M.find_links = find_links   -- exposed for tests
 
 -- ── the view (needs the global `raygui`) ───────────────────────────────────
 local View = {}
@@ -294,6 +321,13 @@ function View:draw(entries, x, y, w, h)
     -- bit wider than the thin bar, so it's easy to find/grab) or while dragging.
     local hot = mx >= sb_x - 12 and mx <= x + w and my >= y and my <= y + h
     local down = (rg.mouse_down and rg.mouse_down()) or false
+    -- Link click edges, captured before self.prev_down is overwritten below.
+    -- A click = press AND release on the same link rect (so drags/scrolls don't
+    -- fire). Record where the press began + whether it started on the scrollbar.
+    local link_released = (self.prev_down and not down)
+    if down and not self.prev_down then
+        self.press_x, self.press_y, self._press_on_sb = mx, my, hot
+    end
     if max_scroll > 0 and not self.lock_input then
         local th, ty, trange = thumb_geom()
         if down and not self.prev_down and hot then            -- press edge
@@ -331,6 +365,8 @@ function View:draw(entries, x, y, w, h)
     local bg = self.bg
     rg.draw_rectangle(x, y, w, h, bg[1], bg[2], bg[3], bg[4])
     rg.begin_scissor(x + 1, y + 1, w - 2, h - 2)
+    local frame_links = {}                 -- clickable URL rects drawn this frame
+    local measure = self.on_link and self:measure_fn() or nil
     local first = math.max(1, math.floor(self.scroll / self.line_h))
     for i = first, total do
         local ly = y + pad + (i - 1) * self.line_h - self.scroll
@@ -347,9 +383,33 @@ function View:draw(entries, x, y, w, h)
                 rg.draw_rectangle(x + pad - 3, ly - 1, width + 6, self.line_h, r.bg[1], r.bg[2], r.bg[3], r.bg[4])
             end
             self:draw_line(r.text, x + pad, ly, r.color)
+            -- Overdraw any URLs in link color + underline, and record a rect so a
+            -- click on it opens the link. Same glyphs over the same pixels, so it
+            -- just recolors; alignment uses the emoji-aware measure_fn.
+            if measure then
+                for _, lk in ipairs(find_links(r.text)) do
+                    local lx = x + pad + measure(r.text:sub(1, lk.s - 1))
+                    local lw = measure(lk.url)
+                    local LC = M.link_color
+                    rg.draw_text(lk.url, lx, ly, self.font_size, LC[1], LC[2], LC[3], LC[4])
+                    rg.draw_rectangle(lx, ly + self.font_size + 1, lw, 1, LC[1], LC[2], LC[3], LC[4])
+                    frame_links[#frame_links + 1] = { x = lx, y = ly, w = lw, h = self.line_h, url = lk.url }
+                end
+            end
         end
     end
     rg.end_scissor()
+
+    -- Fire a link click: press and release both landed on the same rect, the
+    -- press didn't start on the scrollbar, and no modal is overlaying us.
+    if link_released and self.on_link and not self.lock_input and not self._press_on_sb then
+        local px, py = self.press_x or -1, self.press_y or -1
+        for _, lk in ipairs(frame_links) do
+            local over_rel = mx >= lk.x and mx <= lk.x + lk.w and my >= lk.y and my <= lk.y + lk.h
+            local over_pre = px >= lk.x and px <= lk.x + lk.w and py >= lk.y and py <= lk.y + lk.h
+            if over_rel and over_pre then self.on_link(lk.url); break end
+        end
+    end
 
     -- scrollbar track + thumb — only while hovered (hot) or being dragged
     if max_scroll > 0 and (hot or self.sb_drag) then
