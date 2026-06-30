@@ -49,14 +49,16 @@ local open_url  = require('xagent.ui.open_url')
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local FONT_SIZE = 22
 
--- Per-turn output cap. A bigger cap is free — you only pay for tokens actually
--- produced — but a TOO-SMALL cap silently breaks big outputs: an AetherViz
--- single-file page needs ~6k–15k tokens, and at 4096 the model can't emit it in
--- one turn (it stalls / gets truncated). 8192 fits a focused page and is broadly
--- supported; raise XAGENT_MAX_TOKENS if your model allows more (NOTE: it applies
--- to every turn, so a value above the model's limit will fail all requests).
+-- Starting per-turn output cap. A bigger cap is free — you only pay for tokens
+-- actually produced — but a TOO-SMALL cap silently breaks big outputs: an
+-- AetherViz single-file page (Three.js + KaTeX + heavy CSS) can run ~10k+ tokens
+-- and at 8192 the tool_use JSON gets truncated mid-stream (→ unparseable args).
+-- 16384 fits those pages; if the model is STILL cut off the loop auto-escalates
+-- max_tokens up to the model's output ceiling (see loop.MAX_TOKENS_CEILING).
+-- Override the start value with XAGENT_MAX_TOKENS (NOTE: must stay ≤ the model's
+-- hard output limit, or every request fails).
 local MAX_TOKENS = tonumber(xutils.get_config('XAGENT_MAX_TOKENS'))
-    or tonumber(os.getenv('XAGENT_MAX_TOKENS')) or 8192
+    or tonumber(os.getenv('XAGENT_MAX_TOKENS')) or 16384
 
 -- Pre-seed common glyphs so streaming text doesn't keep rebuilding the font
 -- atlas (every rebuild re-rasterizes the whole texture and makes ALL text —
@@ -377,6 +379,18 @@ local function on_event(tab, ev)
         end
         -- did_micro alone is silent — it's background housekeeping near the
         -- context limit, not something to announce in the transcript.
+    elseif ev.type == 'truncated_retry' then
+        -- The turn was cut off at max_tokens mid-output; the loop is re-running it
+        -- with a larger cap. Drop the partial assistant text so the re-stream
+        -- doesn't duplicate it; keep the turn busy (thinking dots continue).
+        if tab.cur then
+            for i = #tab.entries, 1, -1 do
+                if tab.entries[i] == tab.cur then table.remove(tab.entries, i); break end
+            end
+        end
+        tab.text_tail = ''; tab.cur = nil
+        tab.status = string.format('输出较大，提升上限重试 (%s→%s)',
+            tostring(ev.from or '?'), tostring(ev.to or '?'))
     elseif ev.type == 'done' then
         flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = 'ready'
     elseif ev.type == 'error' then

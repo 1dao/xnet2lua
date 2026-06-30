@@ -32,7 +32,15 @@ function M.run(content_blocks, ctx, on_event)
 
             local tool = registry.find(block.name)
             local res
-            if not tool then
+            if type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
+                -- The streamed tool arguments did not arrive as valid JSON, so we
+                -- never got real fields. Surface the actual parse error (with the
+                -- byte position) so the model can fix its arguments — NOT a
+                -- misleading "<field> is required" that it just retries forever.
+                res = { content = 'Error: tool arguments were not valid JSON ('
+                    .. tostring(input._error) .. '). Arguments must be a single '
+                    .. 'valid JSON object; re-send this tool call.', is_error = true }
+            elseif not tool then
                 res = { content = 'Error: unknown tool "' .. tostring(block.name) .. '"', is_error = true }
             elseif ctx and ctx.confirm and not is_read_only(tool)
                    and ctx.confirm({ name = block.name, input = input }) == false then

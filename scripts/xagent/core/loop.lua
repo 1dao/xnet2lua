@@ -16,6 +16,13 @@ local M = {}
 M.MAX_TURNS = 50
 local DEFAULT_MAX_TOKENS = 4096
 
+-- Upper bound for the max_tokens auto-escalation (see the streaming loop in
+-- M.run). max_tokens is a ceiling billed on ACTUAL output, not a reservation, so
+-- raising it costs nothing until the model actually produces more — but it MUST
+-- stay at or below the model's hard output limit or the API rejects the request.
+-- 32000 is safe for current Opus/Sonnet; override per-call via opts.max_tokens_ceiling.
+M.MAX_TOKENS_CEILING = 32000
+
 -- One streaming turn. Streams text out via on_text; returns (result, err).
 local function stream_turn(cfg, params, on_text, on_tool_use_start)
     return async.await(function(resolve)
@@ -91,17 +98,34 @@ function M.run(opts)
             last_usage, anchor = nil, nil   -- post-compaction: re-estimate from scratch
         end
 
-        local result, err = stream_turn(
-            opts.cfg,
-            {
-                messages = messages,
-                system = opts.system,
-                tools = opts.tools,
-                max_tokens = opts.max_tokens or DEFAULT_MAX_TOKENS,
-            },
-            function(delta) emit({ type = 'text', text = delta }) end,
-            function(id, name) emit({ type = 'tool_use_start', id = id, name = name }) end
-        )
+        -- Stream the turn, escalating max_tokens if the model gets cut off
+        -- mid-output (stop_reason == 'max_tokens'). A tool_use whose JSON argument
+        -- is truncated can't be parsed (→ a broken _raw input); a truncated text
+        -- answer is just incomplete. Either way we DISCARD the truncated attempt
+        -- and re-stream with a doubled cap, up to the model's output ceiling. The
+        -- cost is only the (rare) wasted attempt, since max_tokens bills on actual
+        -- output. The 'truncated_retry' event lets the UI drop the partial output
+        -- so the re-stream doesn't duplicate it.
+        local eff_max = opts.max_tokens or DEFAULT_MAX_TOKENS
+        local ceiling = math.max(eff_max, opts.max_tokens_ceiling or M.MAX_TOKENS_CEILING)
+        local result, err
+        while true do
+            result, err = stream_turn(
+                opts.cfg,
+                {
+                    messages = messages,
+                    system = opts.system,
+                    tools = opts.tools,
+                    max_tokens = eff_max,
+                },
+                function(delta) emit({ type = 'text', text = delta }) end,
+                function(id, name) emit({ type = 'tool_use_start', id = id, name = name }) end
+            )
+            if err or result.stop_reason ~= 'max_tokens' or eff_max >= ceiling then break end
+            local new_max = math.min(eff_max * 2, ceiling)
+            emit({ type = 'truncated_retry', from = eff_max, to = new_max, turn = turn })
+            eff_max = new_max
+        end
 
         if err then
             emit({ type = 'error', error = err })

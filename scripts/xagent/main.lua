@@ -89,6 +89,10 @@ local function make_printer()
                 out(string.format('\27[90m[context ~%d/%d tok (%.0f%%) %s]\27[0m\n',
                     b.estimated, b.context_window, b.percent * 100, b.state))
             end
+        elseif ev.type == 'truncated_retry' then
+            if streaming then out('\n'); streaming = false end
+            out(string.format('\27[35m[output cut off at %s tok — retrying at %s]\27[0m\n',
+                tostring(ev.from), tostring(ev.to)))
         elseif ev.type == 'done' then
             if streaming then out('\n'); streaming = false end
             out('\n\27[90m--- done (' .. tostring(ev.stop_reason) .. ') ---\27[0m\n')
