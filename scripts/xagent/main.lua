@@ -33,7 +33,9 @@ registry.register(require('xagent.tools.web_fetch'))
 registry.register(require('xagent.tools.memory_write'))
 registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
+registry.register(require('xagent.tools.viz_publish'))
 local skills = require('xagent.skills')
+local viz    = require('xagent.viz')
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local function out(s) io.write(s); io.flush() end
@@ -114,6 +116,16 @@ local function __init()
     local ok, err = subprocess.setup()
     if not ok then io.stderr:write('subprocess setup failed: ' .. tostring(err) .. '\n'); xthread.stop(2); return end
 
+    -- Start the local viz static server (best-effort; the viz_publish tool falls
+    -- back to file:// if it can't come up).
+    local vport, verr = viz.ensure_server()
+    if vport then
+        out(string.format('\27[90m[viz] serving %s on http://%s:%d/\27[0m\n',
+            viz.paths.root(), viz.paths.host(), vport))
+    elseif verr then
+        io.stderr:write('[viz] static server not started: ' .. tostring(verr) .. '\n')
+    end
+
     -- Prompt resolution. On Windows, non-ASCII argv is mangled by the console
     -- code page (GBK), so Chinese/Unicode prompts MUST come from a UTF-8 file
     -- via PROMPT_FILE=path (or wait for the GUI, which is UTF-8 native).
@@ -185,5 +197,8 @@ return {
     __tick_ms = 10,
     __thread_handle = router.handle,
     __init = __init,
-    __uninit = function() if xnet and xnet.uninit then xnet.uninit() end end,
+    __uninit = function()
+        viz.server.stop()
+        if xnet and xnet.uninit then xnet.uninit() end
+    end,
 }
