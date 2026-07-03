@@ -87,6 +87,7 @@ LUA_API int luaopen_xutils(lua_State *L);
 LUA_API int luaopen_xtimer(lua_State *L);
 LUA_API int luaopen_xcompress(lua_State *L);
 LUA_API int luaopen_xshared(lua_State *L);
+LUA_API int luaopen_xrecord(lua_State *L);
 
 /* xshared registry lifecycle (xshared.c) -- dicts are created from Lua at boot
 ** and live in a process-global registry; free them once at shutdown.
@@ -204,6 +205,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xshared", luaopen_xshared, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xrecord", luaopen_xrecord, 1);
     lua_pop(L, 1);
 }
 
