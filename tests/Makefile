@@ -138,7 +138,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xhttp_router_test.lua \
 	demo/xhttp_main.lua \
 	demo/xhttp_ws_main.lua \
-	demo/xhttp_client_main.lua
+	demo/xhttp_client_main.lua \
+	demo/xrecord_main.lua
 
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \

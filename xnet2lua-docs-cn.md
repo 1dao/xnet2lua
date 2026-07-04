@@ -19,6 +19,7 @@
 9. [cmsgpack 模块——MessagePack 序列化](#9-cmsgpack-模块messagepack-序列化)
 10. [xutils 模块——工具函数](#10-xutils-模块工具函数)
 10A. [xcompress 模块——压缩与校验和](#10a-xcompress-模块压缩与校验和)
+10B. [xrecord 模块——通用紧凑记录池](#10b-xrecord-模块通用紧凑记录池)
 11. [配置文件](#11-配置文件)
 12. [线程 ID 常量表](#12-线程-id-常量表)
 13. [完整示例：TCP 服务器](#13-完整示例tcp-服务器)
@@ -1760,6 +1761,67 @@ d:close()
 | `xcompress.adler32(...)` / `adler32_update(current, ...)` | 计算或增量更新 Adler-32 |
 
 解压 API 的 `max_out` 是强制输出上限；处理外部输入时应使用明确上限，避免压缩包造成不受控的内存增长。完整冒烟示例见 `demo/xcompress_main.lua` 和 `demo/xhttp_compress_main.lua`。
+
+---
+
+## 10B. xrecord 模块——通用紧凑记录池
+
+`xrecord` 用于存放大量同结构的游戏对象（道具、任务……）：数据存在一整块预分配的 C 数组里，而不是每个对象一张 Lua table。只有池子 handle 本身是 Lua 对象，单条记录通过调用方自己生成的 `int64` id 寻址（DB 主键、`(player_id << 24 | local_seq)` 等），永远不会成为 Lua GC 可见的对象。每个 xnet 工作线程都有自己独立的 Lua state，所以 **handle 不能跨线程共享**。
+
+**推荐布局：schema 建一次，每个玩家一个池子。** 用 `xrecord.schema(fields, pk)` 把布局建一次——比如在线程 init 时——之后用 `schema:new(capacity)` 给每个玩家开一个轻量池子。共享 schema 意味着字段名字符串和偏移计算只付一次，而不是每个玩家的池子都重新解析一遍。schema 会指定一个**主键列**（`pk`，默认 `"id"`）承载每条记录的 id：`create`/`load_all` 从 `record[pk]` 读 id，`save_all` 再把 id 写回——id 只存在于索引里、不是存储字段，所以 `set` 永远改不坏它。池子会钉住它的 schema（只要还有池子在用，schema 就不会被回收）；退出时是干净的整体销毁——`save_all()` 整个池子再 `close()`。每个池子自带的固定开销（各自的 id→slot 映射）会被玩家数放大，但槽位总量和共享大池子一样；每线程几千个 handle userdata，相比它替代掉的几十万张对象 table 仍可忽略。
+
+```lua
+local xrecord = require("xrecord")
+
+-- 只建一次（比如线程 init 时）：共享 schema（主键列默认 "id"）
+local item_schema = xrecord.schema({
+    { name = "hp",   type = "int"    },  -- int8/int16/int32/int(64)/float/bool/string
+    { name = "name", type = "string" },
+    { name = "dead", type = "bool"   },
+})
+
+-- 每个玩家登录时：在共享 schema 之上开一个轻量池子
+local items = item_schema:new(16)        -- 初始容量小，按需自动扩容
+items:load_all({                          -- DB 行 -> 池子，一次调用
+    { id = 2001, hp = 50, name = "shield" },
+    { id = 2002, hp = 30, name = "dagger" },
+})
+
+items:create({ id = 2003, hp = 40, name = "bow" })  -- upsert 一条记录
+items:create(2004)                        -- 仅占用一个 id（字段清零）
+items:set(2001, "hp", 100)               -- 单字段运行时写入
+local hp = items:get(2001, "hp")
+if items:has(2002) then items:destroy(2002) end     -- 删除一条记录
+
+-- 退出：整个池子 save -> Lua table -> DB，然后释放
+local rows = items:save_all()            -- 不需要 id 列表；然后 cmsgpack/json 序列化后落库
+items:close()                             -- 立即释放池子的 C 内存
+
+-- 一次性便捷写法（一次调用建一个私有 schema + 池子）：
+-- local pool = xrecord.create(fields_table, capacity, pk)
+```
+
+| 接口 | 说明 |
+|---|---|
+| `xrecord.schema(fields, pk?)` | 把共享布局建一次，返回 schema。`pk` 指定承载每条记录 id 的主键列名（默认 `"id"`，不能同时是某个字段）。在线程 init 时创建，供这种对象类型的所有池子复用 |
+| `schema:new(capacity)` | 在 schema 之上开一个池子，预分配 `capacity` 个槽位（仅*初始*大小，会自动扩容）。池子会钉住 schema 使其保持存活 |
+| `xrecord.create(fields, capacity, pk?)` | 一次性便捷写法：一次调用建一个私有 schema 和其上的池子（等价于 `xrecord.schema(fields, pk):new(capacity)`） |
+| `handle:create(id \| record)` | 创建（upsert）一条记录。传整数时用清零字段占用该 id；传 `{ [pk] = id, field = value, ... }` table 时从主键列读出 id、占用它并写入其余字段。id 已存在也没关系（用 table 调 create 会更新它）——这把"一次设置多个字段"也合并进来了。字段值非法会抛 Lua error |
+| `handle:destroy(id)` | 删除一条记录；不存在时返回 `false, "id not bound"` |
+| `handle:has(id)` | 查询 id 当前是否有记录 |
+| `handle:set(id, field, value)` / `get(id, field, ...)` | 写单个字段 / 读一个**或多个**字段（`get(id, "hp", "name")` 按参数顺序逐个返回值——多字段形式把单次调用固定开销摊薄，比分开调快约 2 倍）。字段名不存在或值与字段类型/范围不符会抛 Lua error；id 不存在时返回 `false`/`nil` + `"id not bound"` |
+| `handle:load_all({ record, ... })` | 一次调用批量创建一个 k-v 记录数组（登录路径）——每个元素在主键列带着自己的 id；数据有问题时会抛出 Lua error 指明具体是第几条记录/哪个字段，因为数据源是自己的 DB，不是需要容错的客户端输入 |
+| `handle:load_rows(fields, values)` | 直接吃文本协议 DB 结果的列式登录快路径（比如 xmysql 的 `result.fields` + `result.values`）：`fields` 是列名数组，`values` 是位置字符串行数组（`nil` = SQL NULL）。按列名定位主键列、每个 id 在 C 里全 64 位解析，并把每个字符串单元格按 schema 字段类型转换——不建 k-v table，也不用手写"字符串→数字"那一趟。schema 里没有的列会被忽略。直接从 DB 加载时优先用它而不是 `load_all` |
+| `handle:save_all()` / `save_all({ ids })` | `load_all` 的退出/存盘对偶。无参时保存**整个池子**（每玩家一个池子时退出就用这个）；传入 id 数组则只保存这个子集（比如只导出 dirty 的记录），没有记录的 id 会被跳过。返回记录 table 数组，可直接 cmsgpack/json 后落库；每个元素都在主键列带着自己的 id，所以 `handle:load_all(handle:save_all())` 是恒等往返 |
+| `handle:close()` | 立即释放池子的 C 内存，不用等 GC——每玩家一个池子时的退出销毁。幂等；已关闭的池子行为等同空池 |
+
+`create()` 发现初始 `capacity` 用完了会自动扩容（翻倍），而不是直接报错——容量估少了的后果从"这个功能彻底不能用"降级成"多一次 realloc"。这一层没有上限。
+
+**id 取值范围（重要）。** 记录 id 在 C 里是 `int64`，但跨 Lua 边界时是 Lua number——LuaJIT 的 number 是 double，只在 **2^53** 以内精确。每个 id 必须 ≤ 2^53（`9,007,199,254,740,991`），否则从 Lua 侧就寻址不回来（`get`/`set`/`has`/`save_all` 都要把 id 过一遍 double；`load_rows` 虽然在 C 里用 `strtoll` 精确解析 id，但 > 2^53 的值之后从 Lua 仍然够不到）。对 `(player_id << N | local_seq)` 这类复合 id，选 `N` 让整个值落在 2^53 内。**推荐 `player_id << 24 | local_seq`**——`player_id` 29 位（up to `536,870,911` 账号）、`local_seq` 24 位（每玩家 up to `16,777,215`），max id 正好 `2^53 − 1`。铸造 id 的地方对两个上限都加断言，避免溢出后悄悄冲突。
+
+字段类型 `int8`/`int16`/`int32`/`int`（64 位）/`float` 按各自类型的自然对齐紧凑打包（不是统一按 8 字节填充），所以窄类型在大量记录的场景下能真正省内存。数值跨越 Lua 边界时统一按普通 Lua number 处理，与字段实际宽度无关；写入时会按字段声明的宽度做范围检查：写入 int 字段的非整数值、超出宽度范围的数值（比如往 `int8` 字段写 `300`，或往 `float` 写超过 `FLT_MAX` 的值）、以及写入 float 的 NaN/Inf，都会**直接报错，而不是静默截断、clamp 或变成 ±Inf**——业务层捕获到这类错误应当当成"数据非法"的信号处理（比如把发出这个请求的客户端踢下线），而不是想办法兼容它。`string` 字段是变长的，多次写入之间、以及 `destroy` 后槽位被复用时都会尽量复用已分配的内存。
+
+这套方案用"单次读写变慢"（比原生 Lua table 字段访问慢一个数量级，绝对值仍是几十纳秒级别）换"彻底消除单个对象的 GC 压力"：记录本身不管有多少条，在 Lua GC 眼里都是 0 字节，而等价的 Lua table 大约要占 ~150 字节/条——只有池子 handle 是 GC 对象（每玩家一个池子时每线程几千个，取代它们本要产生的几十万张 table）。只有在真正的规模量级下（每线程存活对象数以万计甚至更多）才划算——如果只是几百个对象，直接用 Lua table 更简单，GC 开销也不是瓶颈。完整冒烟示例见 `demo/xrecord_main.lua`。
 
 ---
 
