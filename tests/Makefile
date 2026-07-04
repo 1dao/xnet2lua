@@ -141,6 +141,8 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/http_client_spec.lua \
 	tests/lua/websocket_spec.lua \
 	tests/lua/xutils_crypto_spec.lua \
+	tests/lua/xoauth_spec.lua \
+	tests/lua/xadmin_oauth_spec.lua \
 	tests/lua/xagent_llm_spec.lua \
 	tests/lua/xagent_tools_spec.lua \
 	tests/lua/xagent_session_spec.lua \
@@ -160,7 +162,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xhttp_main.lua \
 	demo/gate_admit_main.lua \
 	demo/xhttp_ws_main.lua \
-	demo/xhttp_client_main.lua
+	demo/xhttp_client_main.lua \
+	demo/xrecord_main.lua
 
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \

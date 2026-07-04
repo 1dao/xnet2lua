@@ -110,6 +110,20 @@ static inline int socket_set_reuseaddr(SOCKET_T sock) {
 #endif
 }
 
+/* Mark a socket close-on-exec so it is not leaked into child processes
+** spawned via popen/os.execute (fork+exec). Without this a long-lived child
+** inherits the listening/connection fd and keeps the port occupied after the
+** server process is killed. No-op on Windows: CreateProcess does not inherit
+** handles unless bInheritHandles is explicitly TRUE. */
+static inline void socket_set_cloexec(SOCKET_T sock) {
+#ifndef _WIN32
+    int flags = fcntl(sock, F_GETFD, 0);
+    if (flags != -1) fcntl(sock, F_SETFD, flags | FD_CLOEXEC);
+#else
+    (void)sock;
+#endif
+}
+
 static inline void socket_set_keepalive(SOCKET_T sock, int idle_sec, int interval_sec, int times) {
     int keepalive = 1;
     setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepalive, sizeof(keepalive));

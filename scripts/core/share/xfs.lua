@@ -1,6 +1,7 @@
 -- xfs.lua — small filesystem helpers (Lua io can't mkdir / find home).
 -- Dependency-free; any thread can `dofile` it.
 
+---@class xfs
 local M = {}
 
 local SEP = package.config:sub(1, 1)

@@ -15,10 +15,26 @@ function M.char_budget()
     return DEFAULT_BUDGET_CHARS
 end
 
+-- Truncate to `max` CHARACTERS (not bytes). Must cut on a UTF-8 boundary: a
+-- byte-offset cut can split a multibyte char (e.g. CJK = 3 bytes), and the
+-- resulting invalid UTF-8 makes the whole prompt fail to JSON-encode (empty
+-- body → opaque 400). See [[json-pack-nil-on-invalid-utf8]].
 local function truncate(desc, max)
-    if #desc <= max then return desc end
+    desc = tostring(desc or '')
+    local nchars = utf8 and utf8.len(desc) or nil
+    if not nchars then
+        -- Not valid UTF-8 (or no utf8 lib): fall back to a byte cut, but keep
+        -- only the leading bytes that are themselves ASCII so we can't split a
+        -- multibyte sequence.
+        if #desc <= max then return desc end
+        if max <= 1 then return '…' end
+        local s = desc:sub(1, max - 1):gsub('[\128-\255]+$', '')
+        return (s:gsub('%s+$', '')) .. '…'
+    end
+    if nchars <= max then return desc end
     if max <= 1 then return '…' end
-    return (desc:sub(1, max - 1):gsub('%s+$', '')) .. '…'
+    local cut = utf8.offset(desc, max) or (#desc + 1)   -- byte start of char #max
+    return (desc:sub(1, cut - 1):gsub('%s+$', '')) .. '…'
 end
 
 local function line_for(skill, desc_max)

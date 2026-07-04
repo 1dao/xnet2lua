@@ -139,8 +139,43 @@ function M.new_decoder(cb)
             if b and b.type == 'tool_use' then
                 local acc = self.tool_json[i] or ''
                 if acc ~= '' then
-                    local ok2, parsed = pcall(xutils.json_unpack, acc)
-                    b.input = (ok2 and type(parsed) == 'table') and parsed or { _raw = acc }
+                    local ok2, parsed, perr = pcall(xutils.json_unpack, acc)
+                    if ok2 and type(parsed) == 'table' then
+                        b.input = parsed
+                    else
+                        -- Parse failed. DON'T swallow the reason: json_unpack
+                        -- returns (nil, "json unpack error at <pos>: <msg>"); a
+                        -- raised error comes back as parsed. Keep both _raw and
+                        -- _error so tools_run can surface the real cause to the
+                        -- model instead of a misleading "X is required" (which
+                        -- the model just blindly retries → infinite loop).
+                        local reason = (not ok2) and tostring(parsed)
+                            or tostring(perr or 'invalid json')
+                        b.input = { _raw = acc, _error = reason }
+                        -- Diagnostic dump (latest failure) for root-causing: the
+                        -- offending byte region around err.pos reveals invalid
+                        -- UTF-8 vs. an unescaped control char vs. truncation.
+                        pcall(function()
+                            local f = io.open('tool_json_fail.txt', 'wb')
+                            if not f then return end
+                            f:write('tool: ', tostring(b.name), '\n')
+                            f:write('error: ', reason, '\n')
+                            f:write('acc_len: ', tostring(#acc), '\n')
+                            local pos = tonumber(reason:match('at (%d+)'))
+                            if pos and pos >= 1 then
+                                local a = math.max(1, pos - 80)
+                                local z = math.min(#acc, pos + 80)
+                                f:write('context[', a, '..', z, ']:\n', acc:sub(a, z), '\n')
+                                f:write('hex around pos ', pos, ':\n')
+                                for k = math.max(1, pos - 16), math.min(#acc, pos + 16) do
+                                    f:write(string.format('%02X ', acc:byte(k)))
+                                end
+                                f:write('\n')
+                            end
+                            f:write('--- full acc ---\n', acc, '\n')
+                            f:close()
+                        end)
+                    end
                 end
             end
 

@@ -19,6 +19,7 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 9. cmsgpack Module — MessagePack Serialization  
 10. xutils Module — Utility Functions  
 10A. xcompress Module — Compression and Checksums
+10B. xrecord Module — Schema-Defined Compact Record Pools
 11. Configuration Files  
 12. Thread ID Constants  
 13. Complete Example: TCP Server  
@@ -1769,6 +1770,67 @@ d:close()
 | `xcompress.adler32(...)` / `adler32_update(current, ...)` | Compute or incrementally update Adler-32 |
 
 The `max_out` argument on decompression APIs is a mandatory output bound. Use an explicit cap for external input to avoid unbounded memory growth from compressed data. Complete smoke examples live in `demo/xcompress_main.lua` and `demo/xhttp_compress_main.lua`.
+
+---
+
+## 10B. xrecord Module — Schema-Defined Compact Record Pools
+
+`xrecord` stores large numbers of same-shaped game objects (items, quests, ...) as a flat, preallocated C array instead of one Lua table per object. Only the pool handle is a Lua object; individual records are addressed by a caller-minted `int64` id (DB primary key, `(player_id << 24 | local_seq)`, ...) and never become Lua-GC-visible objects themselves. Each xnet worker thread has its own Lua state, so a handle is **not** safe to share across threads.
+
+**Recommended layout: one shared schema built once, one pool per player.** Build the layout with `xrecord.schema(fields, pk)` once — e.g. at thread init — then make a lightweight pool per player with `schema:new(capacity)`. Sharing the schema means its field-name strings and offset computation are paid once, not re-parsed for every player's pool. The schema names a **primary-key column** (`pk`, default `"id"`) that carries each record's id: `create`/`load_all` read the id from `record[pk]`, and `save_all` writes it back — the id lives only in the index, not as a stored field, so `set` can never corrupt it. A pool pins its schema (so the schema can't be collected while any pool over it lives), and logout is a clean teardown: `save_all()` the whole pool then `close()` it. The fixed per-pool overhead (each pool's own id→slot map) is multiplied by the player count, but the total slot count is the same as a shared pool, and a couple thousand handle userdata per thread is still negligible next to hundreds of thousands of per-object tables.
+
+```lua
+local xrecord = require("xrecord")
+
+-- ONCE, at thread init: build the shared schema (pk column defaults to "id")
+local item_schema = xrecord.schema({
+    { name = "hp",   type = "int"    },  -- int8/int16/int32/int(64)/float/bool/string
+    { name = "name", type = "string" },
+    { name = "dead", type = "bool"   },
+})
+
+-- per player, at login: a lightweight pool over the shared schema
+local items = item_schema:new(16)        -- small initial capacity, grows as needed
+items:load_all({                          -- DB rows -> pool, one call
+    { id = 2001, hp = 50, name = "shield" },
+    { id = 2002, hp = 30, name = "dagger" },
+})
+
+items:create({ id = 2003, hp = 40, name = "bow" })  -- upsert one record
+items:create(2004)                        -- just reserve an id (fields zeroed)
+items:set(2001, "hp", 100)               -- single-field runtime write
+local hp = items:get(2001, "hp")
+if items:has(2002) then items:destroy(2002) end     -- remove a record
+
+-- logout: save the whole pool -> Lua tables -> DB, then free it
+local rows = items:save_all()            -- no id list needed; then cmsgpack/json + save
+items:close()                             -- release the pool's C memory immediately
+
+-- one-off convenience (builds a private schema + pool in one call):
+-- local pool = xrecord.create(fields_table, capacity, pk)
+```
+
+| API | Purpose |
+|---|---|
+| `xrecord.schema(fields, pk?)` | Build the shared layout once; returns a schema. `pk` names the primary-key column carrying each record's id (default `"id"`, must not also be a field). Create at thread init, reuse for every pool of that object type |
+| `schema:new(capacity)` | Make a pool over the schema, preallocating `capacity` slots (*initial* size only; it grows automatically). The pool pins the schema so it stays alive |
+| `xrecord.create(fields, capacity, pk?)` | One-off convenience: build a private schema and a pool over it in a single call (equivalent to `xrecord.schema(fields, pk):new(capacity)`) |
+| `handle:create(id \| record)` | Reserve (upsert) a record. An integer reserves that id with zeroed fields; a `{ [pk] = id, field = value, ... }` table reads the id from its pk column, reserves it, and sets the other fields. An existing id is fine (create-with-table updates it) — this folds in "set several fields at once". Bad field data raises a Lua error |
+| `handle:destroy(id)` | Remove a record; `false, "id not bound"` if absent |
+| `handle:has(id)` | Whether `id` currently has a record |
+| `handle:set(id, field, value)` / `get(id, field, ...)` | Write one field / read one **or more** fields (`get(id, "hp", "name")` returns one value per field — the multi-field form amortizes the per-call overhead, ~2x faster than separate calls). Unknown field name or a value that violates the field's type/range raises a Lua error; a missing id returns `false`/`nil` + `"id not bound"` |
+| `handle:load_all({ record, ... })` | Bulk-create an array of keyed records in one call (login path) — each carries its id in the pk column; raises a Lua error naming the offending record/field on bad data, since the source is your own trusted DB, not a client |
+| `handle:load_rows(fields, values)` | Columnar login fast path straight off a text-protocol DB result (e.g. xmysql's `result.fields` + `result.values`): `fields` is the column-name array, `values` an array of positional string rows (`nil` = SQL NULL). Locates the pk column by name, parses each id in C (full 64-bit), and coerces every string cell to its schema field's type — no keyed Lua table is built and no hand-written string→number pass is needed. Columns absent from the schema are ignored. Prefer this over `load_all` when loading straight from the DB |
+| `handle:save_all()` / `save_all({ ids })` | Logout/save counterpart to `load_all`. No-arg saves the **whole pool** (the natural per-player logout); passing an id array saves just that subset (e.g. only the dirty records), skipping ids with no record. Returns an array of record tables ready for cmsgpack/json + a DB write; each carries its id in the pk column, so `handle:load_all(handle:save_all())` is an identity round-trip |
+| `handle:close()` | Free the pool's C memory immediately instead of waiting for GC — the per-player logout teardown. Idempotent; a closed pool behaves as empty |
+
+`create()` grows the pool (doubling capacity) instead of failing once the initial `capacity` is used up, so a low initial estimate degrades into an extra `realloc()`, not an outage where nobody can pick up a new item/quest. There is no upper limit at this layer.
+
+**Id range (important).** A record id is `int64` in C, but it crosses the Lua boundary as a Lua number — under LuaJIT a number is a double, exact only up to **2^53**. Keep every id ≤ 2^53 (`9,007,199,254,740,991`) or it cannot be addressed back from Lua (`get`/`set`/`has`/`save_all` all round-trip it through a double; `load_rows` parses ids in C with `strtoll`, but a value > 2^53 is still unreachable from Lua afterward). For a composite `(player_id << N | local_seq)` id, choose `N` so the whole value stays under 2^53. **Recommended: `player_id << 24 | local_seq`** — 29 bits of `player_id` (up to `536,870,911` accounts) and 24 bits of `local_seq` (up to `16,777,215` per player), with a maximum id of exactly `2^53 − 1`. Assert both bounds where you mint ids so an overflow can't silently collide.
+
+Field types: `int8`/`int16`/`int32`/`int` (64-bit) and `float` are packed at each type's natural alignment (not padded to a uniform width), so the narrow widths are a real memory saving at high record counts. Numeric values cross the Lua boundary as ordinary Lua numbers regardless of field width; writes range-check against the field's declared width and reject fractional values into an int field, magnitudes outside the width (e.g. `300` into an `int8` field, or a value past `FLT_MAX` into a `float`), and NaN/Inf into a `float`, all as a **hard error rather than clamping, truncating, or turning into ±Inf** — treat a caught error here as a bad-data signal (e.g. kick the client that sent it), not something to silently coerce. `string` fields are variable length and reuse their allocation across writes and across slot reuse after `destroy`.
+
+This trades slower per-field access (roughly an order of magnitude versus a raw Lua table field, still tens of nanoseconds) for removing per-object GC pressure entirely: the records themselves cost 0 bytes of Lua-GC-visible memory regardless of count, versus ~150 bytes/record for equivalent Lua tables — only the pool handles are GC objects (a couple thousand per thread with one pool per player, versus the hundreds of thousands of tables they replace). Only worth it at real scale (tens of thousands of live objects per thread or more) — for a few hundred objects a plain Lua table is simpler and the GC cost is not the bottleneck. Complete smoke example: `demo/xrecord_main.lua`.
 
 ---
 

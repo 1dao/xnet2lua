@@ -49,6 +49,36 @@ spec.describe('edit_core.apply_edit', function()
         spec.equal((pcall(edit_core.apply_edit, 'x', { old_string = '', new_string = 'y' })), false)
         spec.equal((pcall(edit_core.apply_edit, 'x', { old_string = 'x', new_string = 'x' })), false)
     end)
+
+    -- The Read tool LF-normalizes what the model sees, so an old_string copied
+    -- from a CRLF file arrives as LF. The match must still succeed against the
+    -- raw \r\n bytes, and the replacement must keep the file's CRLF endings.
+    spec.it('matches an LF old_string against a CRLF file (multi-line)', function()
+        local crlf = 'line1\r\nline2\r\nline3\r\n'
+        local r = edit_core.apply_edit(crlf,
+            { old_string = 'line1\nline2', new_string = 'lineA\nlineB' })
+        spec.equal(r.replacements, 1)
+        spec.equal(r.content, 'lineA\r\nlineB\r\nline3\r\n')   -- inserted text is CRLF too
+    end)
+
+    spec.it('keeps CRLF endings on a single-line edit in a CRLF file', function()
+        local r = edit_core.apply_edit('#include <malloc.h>\r\nint main(){}\r\n',
+            { old_string = 'malloc.h', new_string = 'stdlib.h' })
+        spec.equal(r.content, '#include <stdlib.h>\r\nint main(){}\r\n')
+    end)
+
+    spec.it('matches a CRLF old_string against an LF file (reverse case)', function()
+        local r = edit_core.apply_edit('a\nb\nc\n',
+            { old_string = 'a\r\nb', new_string = 'x\r\ny' })
+        spec.equal(r.content, 'x\ny\nc\n')                     -- normalized to the file's LF
+    end)
+
+    spec.it('still errors when the text is genuinely absent in a CRLF file', function()
+        local ok, err = pcall(edit_core.apply_edit, 'line1\r\nline2\r\n',
+            { old_string = 'nope\nmissing', new_string = 'y' })
+        spec.equal(ok, false)
+        spec.contains(err, 'not found')
+    end)
 end)
 
 spec.describe('glob_match', function()

@@ -36,6 +36,21 @@ local function run_tests()
     local r3 = subprocess.run({ cmd = pwd, cwd = 'scripts/xagent' })
     check('cwd honored', trim(r3.stdout):lower():find('xagent', 1, true) ~= nil, trim(r3.stdout))
 
+    -- 4) timeout: a long command must be killed at the soft timeout and come
+    --    back as a real result (exit 124), not a transport "rpc timeout".
+    local long = IS_WIN and 'ping -n 30 127.0.0.1' or 'sleep 30'
+    local t0 = os.time()
+    local r4 = subprocess.run({ cmd = long, timeout_ms = 3000 })
+    local elapsed = os.time() - t0
+    check('timeout returns a result', r4.ok, 'ok=' .. tostring(r4.ok) .. ' err=' .. tostring(r4.err))
+    check('timeout exit 124', r4.exit_code == 124, 'exit=' .. tostring(r4.exit_code))
+    check('timeout killed promptly', elapsed < 12, 'elapsed=' .. elapsed .. 's')
+
+    -- 5) the worker survives a timeout (it used to wedge for the whole session).
+    local r5 = subprocess.run({ cmd = 'echo still-alive' })
+    check('worker survives timeout', r5.ok and r5.stdout:find('still-alive', 1, true) ~= nil,
+        'ok=' .. tostring(r5.ok) .. ' out=' .. trim(r5.stdout))
+
     out(string.format('\n[subprocess] %s (%d failures)\n', fails == 0 and 'ALL PASS' or 'FAILED', fails))
     xthread.stop(fails == 0 and 0 or 1)
 end

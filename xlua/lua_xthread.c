@@ -98,6 +98,7 @@ LUALIB_API int luaopen_xutils(lua_State* L);
 LUALIB_API int luaopen_xtimer(lua_State* L);
 LUALIB_API int luaopen_xcompress(lua_State* L);
 LUALIB_API int luaopen_xshared(lua_State* L);
+LUALIB_API int luaopen_xrecord(lua_State* L);
 
 /* ============================================================================
 ** Registry keys (per lua_State)
@@ -1202,6 +1203,7 @@ static const luaL_Reg k_thread_modules[] = {
     { "xtimer",    luaopen_xtimer },
     { "xcompress", luaopen_xcompress },
     { "xshared",   luaopen_xshared },
+    { "xrecord",   luaopen_xrecord },
     { NULL, NULL }
 };
 

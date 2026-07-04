@@ -789,6 +789,9 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
         }
         fcntl(fds[0], F_SETFL, O_NONBLOCK);
         fcntl(fds[1], F_SETFL, O_NONBLOCK);
+        /* close-on-exec: don't leak the wakeup pair into popen/exec children */
+        fcntl(fds[0], F_SETFD, fcntl(fds[0], F_GETFD, 0) | FD_CLOEXEC);
+        fcntl(fds[1], F_SETFD, fcntl(fds[1], F_GETFD, 0) | FD_CLOEXEC);
 #endif
         /* Register the read-end in the poll instance */
         if (xpoll_add_event((SOCKET_T)fds[1], XPOLL_READABLE,
