@@ -30,6 +30,7 @@ typedef void (*xChannelConnectProc)(xChannel* ch, void* ud);
 typedef size_t (*xChannelPacketProc)(xChannel* ch, const char* data, size_t len, void* ud);
 
 typedef void (*xChannelCloseProc)(xChannel* ch, const char* reason, void* ud);
+typedef void (*xChannelEofProc)(xChannel* ch, const char* reason, void* ud);
 
 /* recv_transform runs AFTER framing slices a packet and BEFORE packet_cb.
 ** send_transform runs BEFORE xchannel_send_packet prepends the length header.
@@ -63,11 +64,12 @@ typedef struct xChannelConfig {
     xChannelConnectProc connect_cb;
     xChannelPacketProc  packet_cb;
     xChannelCloseProc   close_cb;
+    xChannelEofProc     eof_cb;
 
     void*               userdata;
 } xChannelConfig;
 
-#define XCHANNEL_CONFIG_INIT { XCHANNEL_FRAME_RAW, 0, NULL, NULL, NULL, NULL }
+#define XCHANNEL_CONFIG_INIT { XCHANNEL_FRAME_RAW, 0, NULL, NULL, NULL, NULL, NULL }
 
 xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg);
 void      xchannel_destroy(xChannel* ch);
@@ -75,6 +77,8 @@ void      xchannel_destroy(xChannel* ch);
 SOCKET_T  xchannel_fd(xChannel* ch);
 bool      xchannel_is_closed(xChannel* ch);
 bool      xchannel_is_connected(xChannel* ch);
+bool      xchannel_is_read_closed(xChannel* ch);
+bool      xchannel_is_write_closed(xChannel* ch);
 
 void      xchannel_set_userdata(xChannel* ch, void* ud);
 void*     xchannel_get_userdata(xChannel* ch);
@@ -109,6 +113,17 @@ int       xchannel_attach(xChannel* ch);
 int       xchannel_attach_connect(xChannel* ch);
 void      xchannel_detach(xChannel* ch);
 
+/* Explicit read-side flow control for proxy/tunnel use.
+** pause_read suspends READABLE (already-buffered input is kept untouched).
+** resume_read flushes the buffered input back through packet_cb and, unless the
+** consumer re-pauses from within that callback, re-arms reads. is_read_paused
+** reports the current state. All three are no-ops / safe on a closed channel
+** and safe to call repeatedly. Only affects the read direction; the write side
+** (and its flush) keeps running while reads are paused. */
+void      xchannel_pause_read(xChannel* ch);
+int       xchannel_resume_read(xChannel* ch);
+bool      xchannel_is_read_paused(xChannel* ch);
+
 /* Detach from xpoll and surrender ownership of the underlying fd to the
 ** caller. Returns the original fd, or INVALID_SOCKET_VAL if the channel is
 ** already closed. After this call:
@@ -128,6 +143,7 @@ int       xchannel_send_file_raw(xChannel* ch,
                                   long long offset, long long length);
 void      xchannel_close(xChannel* ch, const char* reason);
 int       xchannel_close_after_flush(xChannel* ch, const char* reason);
+int       xchannel_shutdown_write_after_flush(xChannel* ch, const char* reason);
 
 #ifdef __cplusplus
 }
