@@ -7,6 +7,9 @@
 **   xutils.json_null          -> sentinel for JSON null
 **   xutils.load_config(path)  -> true | false,err
 **   xutils.get_config(key[, default]) -> value | default | nil
+**   xutils.get_int(key[, default])    -> integer | nil   (default: integer)
+**   xutils.get_double(key[, default]) -> number | nil    (default: number)
+**   xutils.get_string(key[, default]) -> string | nil    (default: string)
 **   xutils.scan_dir(path)     -> { { path=..., rel=... }, ... } | nil,err
 */
 
@@ -487,6 +490,60 @@ static int l_util_get_config(lua_State *L) {
         return 1;
     }
     lua_pushnil(L);
+    return 1;
+}
+
+/* Typed getters validate the default (arg 2) against their return type up
+** front, so a wrongly typed default fails loudly even when the key exists and
+** the default goes unused. nil (or absent) means "no default" -> return nil. */
+static int xu_has_default(lua_State *L) {
+    return lua_gettop(L) >= 2 && !lua_isnil(L, 2);
+}
+
+static int l_util_get_int(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    int has_def = xu_has_default(L);
+    lua_Integer def = has_def ? luaL_checkinteger(L, 2) : 0;
+    const char *value = xargs_get(key);
+    if (value && value[0]) {
+        char *end = NULL;
+        long long n = strtoll(value, &end, 0);   /* base 0: 10, 0x.., 0.. */
+        if (end != value && *end == '\0') {
+            lua_pushinteger(L, (lua_Integer)n);
+            return 1;
+        }
+    }
+    if (has_def) lua_pushinteger(L, def); else lua_pushnil(L);
+    return 1;
+}
+
+static int l_util_get_double(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    int has_def = xu_has_default(L);
+    lua_Number def = has_def ? luaL_checknumber(L, 2) : 0;
+    const char *value = xargs_get(key);
+    if (value && value[0]) {
+        char *end = NULL;
+        double d = strtod(value, &end);
+        if (end != value && *end == '\0') {
+            lua_pushnumber(L, (lua_Number)d);
+            return 1;
+        }
+    }
+    if (has_def) lua_pushnumber(L, def); else lua_pushnil(L);
+    return 1;
+}
+
+static int l_util_get_string(lua_State *L) {
+    const char *key = luaL_checkstring(L, 1);
+    int has_def = xu_has_default(L);
+    if (has_def) luaL_checkstring(L, 2);   /* coerces numbers in place */
+    const char *value = xargs_get(key);
+    if (value) {
+        lua_pushstring(L, value);
+        return 1;
+    }
+    if (has_def) lua_pushvalue(L, 2); else lua_pushnil(L);
     return 1;
 }
 
@@ -1048,6 +1105,9 @@ static const luaL_Reg xutils_funcs[] = {
     { "json_unpack",  l_util_json_unpack },
     { "load_config",  l_util_load_config },
     { "get_config",   l_util_get_config },
+    { "get_int",      l_util_get_int },
+    { "get_double",   l_util_get_double },
+    { "get_string",   l_util_get_string },
     { "scan_dir",     l_util_scan_dir },
 
     /* hashes: raw digest + lowercase-hex variant */
