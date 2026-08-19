@@ -12,7 +12,7 @@ do return end
 -- per-thread queues. xthread provides:
 --   * messaging  -- post (fire-and-forget) and rpc (request/reply, coroutine)
 --   * threads    -- create_thread / shutdown_thread, current_id, stats
---   * logging    -- log_* helpers routed to the central log thread
+--   * logging    -- log_* helpers writing to this thread's log file
 -- Wire formats (handled for you):
 --   POST  ->  pack(nil,          pt, args...)        handler(nil, pt, args...)
 --   RPC   ->  pack(reply_router, co_id, 0, pt, ...)  handler(reply_router, co_id, sk, pt, ...)
@@ -20,7 +20,7 @@ do return end
 -- 队列传递 cmsgpack 编码的消息来通信。xthread 提供：
 --   * 消息    —— post（即发即忘）与 rpc（请求/应答，基于协程）
 --   * 线程    —— create_thread / shutdown_thread、current_id、stats
---   * 日志    —— 路由到中央日志线程的 log_* 辅助函数
+--   * 日志    —— 写入本线程日志文件的 log_* 辅助函数
 -- 线缆格式（已为你处理）见上方英文注释。
 
 ---@class xthread
@@ -116,18 +116,22 @@ function xthread.all_stats() end
 -- Logging / 日志
 --
 -- log_* take a printf-style format plus args (string.format), or any value(s)
--- joined by tabs when the first arg is not a format string. They route to the
--- central log thread unless log_init() has marked this thread as logging
--- locally. Calling log_init() also redirects global print() to log_info and
--- io.stderr:write to log_error.
+-- joined by tabs when the first arg is not a format string. Records are written
+-- by the calling thread: to its own file after log_init(), otherwise to the
+-- shared process log. Calling log_init() also redirects global print() to
+-- log_info and io.stderr:write to log_error.
 -- log_* 接受 printf 风格的格式串加参数（string.format）；当首参非格式串时，多个值以
--- 制表符拼接。日志默认路由到中央日志线程，除非 log_init() 已将本线程标记为本地写日志。
--- 调用 log_init() 还会把全局 print() 重定向到 log_info，io.stderr:write 重定向到
--- log_error。
+-- 制表符拼接。日志由调用线程自己写出：调过 log_init() 的写自己的文件，否则写进程主
+-- 日志。调用 log_init() 还会把全局 print() 重定向到 log_info，io.stderr:write 重定向
+-- 到 log_error。
 -- ===========================================================================
 
----Mark the current thread for local logging and register its log label.
----把当前线程标记为本地写日志，并注册其日志标签。
+---Mark the current thread for local logging and give it its own log file
+---(logs/<server_name>_<thread>_<seq>.log). Threads that never call this write
+---to the main log file instead, and no file is created for them.
+---把当前线程标记为本地写日志，并为它单独生成日志文件
+---（logs/<server_name>_<线程>_<序号>.log）。没调用过的线程写入主日志文件，
+---不会为它生成任何文件。
 ---@return boolean ok True on success; false + error otherwise. / 成功返回 true；否则返回 false + 错误。
 ---@return string? err Error message on failure. / 失败时的错误信息。
 function xthread.log_init() end

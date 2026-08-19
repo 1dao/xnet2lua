@@ -713,7 +713,7 @@ xthread.log_error("request failed: %s", tostring(err))
 
 | 方法 | 用途 |
 |---|---|
-| `xthread.log_init()` | 在当前 Lua 线程启用本线程独立日志文件，文件名使用线程创建时注册的名称 |
+| `xthread.log_init()` | 在当前 Lua 线程启用本线程独立日志文件，文件名使用线程创建时注册的名称；不调用则不会为该线程生成任何日志文件 |
 | `xthread.log_verbose(...)` | verbose 日志 |
 | `xthread.log_debug(...)` | debug 日志 |
 | `xthread.log_info(...)` | info 日志 |
@@ -746,11 +746,27 @@ xthread.log_info("user", user, "score", score)
 
 **推荐初始化策略：**
 
-- 主线程调用 `xthread.log_init()`，让主线程拥有自己的日志文件。
-- 业务 worker 线程如果需要独立排查，也在自己的 `__init` 中调用 `xthread.log_init()`。
+- 主线程无需任何操作就拥有主日志文件（即进程日志）；在主线程调用 `xthread.log_init()` 只是让它的 Lua 日志直接落盘，而不是先投递再写。
+- 业务 worker 线程如果需要独立排查，在自己的 `__init` 中调用 `xthread.log_init()`。**只有调用过的线程才会生成自己的日志文件**：没调用的线程一行也不写，磁盘上不会出现它的空文件。
 - 启动配置摘要、reload、正常退出等重要生命周期信息推荐用 `xthread.log_system(...)`。
-- Redis / MySQL / NATS / HTTP 等服务类线程通常不要调用 `xthread.log_init`。这些线程里的 Lua 日志默认会先在本线程拼成完整日志记录，再投递到 main 线程，由 main 线程写入主日志文件。
+- Redis / MySQL / NATS / HTTP 等服务类线程通常不要调用 `xthread.log_init`。这些线程的日志（Lua 的 `log_*` 和 C 层的 `started`/`stopped`、xpoll 错误）都由本线程直接写进主日志文件，xlog 内部用一把锁保证整条记录不串行交错，行内仍带 `[G10:xmysql-worker]` 这样的线程标签。不再经过投递到 main 线程的队列：少一次 malloc 和一次跨线程搬运，队列拥塞时也不会丢日志，同线程的 C 日志和 Lua 日志顺序也不会互相错位。
 - 服务类线程的业务异常优先返回给请求方，由请求方在自己的上下文里写日志；只有内部错误或无法归属到请求方的异常，才建议 post 到 main 线程统一记录。
+
+**日志文件命名：**
+
+```
+logs/<进程名>_<线程>_<序号>.log
+
+logs/xnet_main_001.log          -- 主日志（未设置 SERVER_NAME）
+logs/game1_main_001.log         -- SERVER_NAME=game1
+logs/game1_xmysql_001.log       -- 线程名 'xmysql-worker'
+logs/game1_gate_06_001.log      -- 线程名 'gate-worker-06'
+logs/game1_t012_001.log         -- 未命名线程，回退成 tNNN
+```
+
+- 进程名取 `SERVER_NAME`，未设置时为 `xnet`。
+- 线程段取线程注册时的名字：分隔符统一成 `_`，无意义的 `worker` 段会被去掉；线程没有名字时才回退成 `t<线程 id>`。日志行内的线程标签仍是完整名字（`[G10:xmysql-worker]`）。
+- 序号从 `001` 开始，写满 `LOG_MAX_FILE_MB`（默认 2048，即 2 GiB）后继续写 `002`、`003`……旧文件不改名，重启后会接着写最后一个未写满的文件。
 
 ### 4.9 队列背压与线程统计
 
@@ -2657,11 +2673,16 @@ bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_DEV_NO_AU
 # → 浏览器直接进控制台；curl 任意接口免认证
 ```
 
-### 17.17 MySQL 注意事项（caching_sha2）
+### 17.17 MySQL 认证（caching_sha2）
 
-xadmin 内置的纯 Lua MySQL 客户端**不支持** `caching_sha2_password` 的首次“完整认证”（MySQL 8 默认，含 `root`）。账号缓存为冷（服务器重启后未登录过）时连接会被关闭，初始化报 `cannot reach database: ... caching_sha2_password ...`（明确快速失败，不再是误导性的 `rpc timeout`）。
+纯 Lua MySQL 客户端支持 `caching_sha2_password`（MySQL 8 默认）的两条路径：
 
-解决：用 `mysql_native_password` 账号（`ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'`），或先用 mysql CLI 登录一次焐热缓存。
+- **快速认证**：账号在服务端密码缓存里时走 SHA-256 scramble，无额外开销。
+- **完整认证**：缓存为冷时（服务器重启后首次登录、新建账号、刚改过密码）服务端会要求完整认证。客户端向服务端索取 RSA 公钥，把「密码 + 结尾 NUL 再与本次连接的 nonce 循环异或」的结果用 RSAES-OAEP（SHA-1）加密后发过去。加解密由 `scripts/core/share/xrsa.lua`（纯 Lua RSA 公钥运算）完成——运行时链接了 mbedTLS 但没有把 RSA 导出到 Lua，而 MySQL 的 TLS 是先握手后升级的 STARTTLS 形式，`xnet.connect_tls` 用不上。
+
+因此**不再需要** `mysql_native_password`，MySQL 8.4（该插件默认禁用）和 9.x（已移除）都能直连。
+
+代价：完整认证会在该连接上做一次 2048 位 RSA 公钥运算，实测约 20ms，只发生在冷缓存的连接建立阶段。`xrsa.lua` 缺失时快速认证照常工作，只有完整认证会失败并给出可读报错。
 
 ---
 

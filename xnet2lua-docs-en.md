@@ -738,7 +738,7 @@ Available APIs:
 
 | Method | Purpose |
 |---|---|
-| `xthread.log_init()` | Enable an independent log file for the current Lua thread, using the name registered when the thread was created |
+| `xthread.log_init()` | Enable an independent log file for the current Lua thread, using the name registered when the thread was created. A thread that never calls it never gets a file of its own |
 | `xthread.log_verbose(...)` | verbose log |
 | `xthread.log_debug(...)` | debug log |
 | `xthread.log_info(...)` | info log |
@@ -775,20 +775,48 @@ logs.
 
 **Recommended initialization policy:**
 
-- Call `xthread.log_init()` in the main thread so it owns its own log
-  file.
+- The main thread owns the main log file (the process log) without doing
+  anything; calling `xthread.log_init()` there only makes its own Lua logs go
+  straight to disk instead of being posted first.
 - Business worker threads may call `xthread.log_init()` from
-  their `__init` when independent per-worker logs are useful.
+  their `__init` when independent per-worker logs are useful. **Only threads
+  that called it get a file of their own** -- a thread that never logs locally
+  leaves no empty file behind.
 - Use `xthread.log_system(...)` for startup configuration summaries, reload, and
   normal shutdown lifecycle messages.
 - Service threads such as Redis / MySQL / NATS / HTTP usually should not call
-  `xthread.log_init`. Their Lua logs are formatted in the service thread and
-  then posted to the main thread, where the main thread writes them to the main
-  log file.
+  `xthread.log_init`. Their records -- Lua `log_*` and C-level logs
+  (`started`/`stopped`, xpoll errors) alike -- are written to the main log file
+  by the thread itself, with one lock inside xlog keeping whole records from
+  interleaving, still tagged with the originating thread
+  (`[G10:xmysql-worker]`). Nothing is posted to the main thread any more: one
+  malloc and one cross-thread hop less per record, no log loss when a queue is
+  congested, and C and Lua records from one thread can no longer land out of
+  order.
 - Service-thread business errors should preferably be returned to the request
   caller, and the caller should log them in its own context. Internal errors or
   errors that cannot be attributed to a request can be posted to the main thread
   for centralized logging.
+
+**Log file naming:**
+
+```
+logs/<process>_<thread>_<seq>.log
+
+logs/xnet_main_001.log          -- main log (no SERVER_NAME set)
+logs/game1_main_001.log         -- SERVER_NAME=game1
+logs/game1_xmysql_001.log       -- thread named 'xmysql-worker'
+logs/game1_gate_06_001.log      -- thread named 'gate-worker-06'
+logs/game1_t012_001.log         -- unnamed thread, falls back to tNNN
+```
+
+- The process part is `SERVER_NAME`, or `xnet` when unset.
+- The thread part comes from the name the thread registered: separators become
+  `_` and the noise `worker` token is dropped. Only an unnamed thread falls back
+  to `t<thread id>`. Log lines still carry the full name (`[G10:xmysql-worker]`).
+- The sequence starts at `001`; once a file reaches `LOG_MAX_FILE_MB`
+  (default 2048, i.e. 2 GiB) logging moves on to `002`, `003`, ... Old files are
+  never renamed, and a restart resumes the last file that still has room.
 
 ### 4.9 Queue Backpressure and Thread Stats
 
@@ -2658,11 +2686,16 @@ bin/xnet.exe scripts/xadmin/xadmin_main.lua SERVER_NAME=xadmin1 XADMIN_DEV_NO_AU
 # → browser goes straight to the console; curl any endpoint with no auth
 ```
 
-### 17.17 MySQL note (caching_sha2)
+### 17.17 MySQL authentication (caching_sha2)
 
-xadmin's built-in pure-Lua MySQL client does **not** support `caching_sha2_password` first-time "full authentication" (the MySQL 8 default, including `root`). With a cold auth cache (the account hasn't logged in since the server started) the connection is closed and setup reports `cannot reach database: ... caching_sha2_password ...` (a clear, fast failure — no longer a misleading `rpc timeout`).
+The pure-Lua MySQL client supports both paths of `caching_sha2_password` (the MySQL 8 default):
 
-Fix: use a `mysql_native_password` account (`ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'`), or warm the cache by logging in once with the mysql CLI.
+- **Fast authentication**: a SHA-256 scramble, used whenever the account sits in the server's password cache. No extra cost.
+- **Full authentication**: demanded by the server when that cache is cold — first login after a server restart, a new account, or one whose password just changed. The client asks the server for its RSA public key and sends the password (with its terminating NUL, XORed against the repeating per-connection nonce) encrypted with RSAES-OAEP/SHA-1. The RSA work lives in `scripts/core/share/xrsa.lua`, a pure-Lua public-key implementation: the runtime links mbedTLS but exposes no RSA to Lua, and MySQL's TLS is STARTTLS-style (greeting first, then upgrade), which `xnet.connect_tls` cannot do.
+
+So `mysql_native_password` is **no longer required**. MySQL 8.4 (where that plugin is disabled by default) and 9.x (where it is gone) both connect directly.
+
+Cost: one 2048-bit RSA public-key operation per connection, measured at ~20ms, and only on the cold-cache path. If `xrsa.lua` is absent, fast authentication still works and only full authentication fails, with a readable error.
 
 ---
 

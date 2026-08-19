@@ -64,8 +64,6 @@
 #define XLUA_TLS __thread
 #endif
 
-static XLUA_TLS int _log_local = 0;
-
 #if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
 static void luaL_requiref(lua_State* L, const char* modname,
                           lua_CFunction openf, int glb) {
@@ -977,91 +975,17 @@ static int l_current_id(lua_State* L) {
     return 1;
 }
 
-typedef struct {
-    size_t len;
-    char msg[1];
-} XThreadLogPayload;
-
-static void xthread_log_post_task(xThread* thr, void* arg, int arg_len) {
-    (void)thr;
-    if (!arg || arg_len < (int)offsetof(XThreadLogPayload, msg)) return;
-    XThreadLogPayload* payload = (XThreadLogPayload*)arg;
-    size_t cap = (size_t)arg_len - offsetof(XThreadLogPayload, msg);
-    size_t len = payload->len <= cap ? payload->len : cap;
-    xlog_write_raw(payload->msg, len);
-}
-
-static size_t xthread_log_record_cap(size_t header) {
-    size_t cap = (size_t)XLOG_RECORD_MAX_BYTES;
-    size_t post_cap = header < (size_t)INT_MAX ? (size_t)INT_MAX - header : 0u;
-
-    if (cap == 0u || cap > post_cap) cap = post_cap;
-    if (cap == 0u) cap = 1u;
-    return cap;
-}
-
-static int xthread_log_post_to_main(lua_State* L, int level, const char* level_name) {
+/* Write the record straight to this thread's sink: its own file after
+** log_init(), otherwise the shared process log (xlog takes the lock). Nothing
+** is posted to the main thread -- one path keeps C and Lua records from the
+** same thread in order, and drops the per-record malloc the old queue needed. */
+static int xthread_log(lua_State* L, int level, const char* level_name, const char* console_tag) {
     size_t len = 0;
     const char* msg = luaL_optlstring(L, 1, "", &len);
     int append_newline = lua_isnoneornil(L, 2) ? 1 : lua_toboolean(L, 2);
-    if (!xlog_is_enabled(level)) {
-        lua_pushboolean(L, 1);
-        return 1;
-    }
-
-    size_t header = offsetof(XThreadLogPayload, msg);
-    size_t newline_len = (append_newline && (len == 0 || msg[len - 1] != '\n')) ? 1u : 0u;
-    size_t max_record_cap = xthread_log_record_cap(header);
-    size_t record_cap = max_record_cap;
-    size_t total_alloc;
-    size_t record_len;
-    size_t total;
-    char stack_payload[offsetof(XThreadLogPayload, msg) + XLOG_RECORD_STACK_BYTES + 1u];
-    int heap_payload = 1;
-
-    if (len <= ((size_t)-1) - 256u - newline_len) {
-        size_t wanted = 256u + len + newline_len;
-        if (wanted < record_cap) record_cap = wanted;
-    }
-    total_alloc = header + record_cap + 1u;
-
-    XThreadLogPayload* payload = (XThreadLogPayload*)malloc(total_alloc);
-    if (!payload) {
-        record_cap = (size_t)XLOG_RECORD_STACK_BYTES;
-        if (record_cap == 0u) record_cap = 1u;
-        if (record_cap > max_record_cap) {
-            record_cap = max_record_cap;
-        }
-        payload = (XThreadLogPayload*)stack_payload;
-        heap_payload = 0;
-    }
-
-    record_len = xlog_format(level, level_name, msg, len, append_newline,
-                             payload->msg, record_cap + 1u);
-    if (record_len > record_cap) record_len = record_cap;
-    payload->len = record_len;
-    total = header + record_len;
-
-    int err = xthread_post_reply(XTHR_MAIN, xthread_log_post_task, payload, total);
-    if (heap_payload) free(payload);
-
-    lua_pushboolean(L, err == 0);
-    if (err != 0) {
-        lua_pushfstring(L, "xthread.log: post to main failed (err=%d)", err);
-        return 2;
-    }
+    xlog_write(level, level_name, console_tag, msg, len, append_newline);
+    lua_pushboolean(L, 1);
     return 1;
-}
-
-static int xthread_log(lua_State* L, int level, const char* level_name, const char* console_tag) {
-    if (_log_local) {
-        size_t len = 0;
-        const char* msg = luaL_optlstring(L, 1, "", &len);
-        int append_newline = lua_isnoneornil(L, 2) ? 1 : lua_toboolean(L, 2);
-        xlog_write(level, level_name, console_tag, msg, len, append_newline);
-        return 0;
-    }
-    return xthread_log_post_to_main(L, level, level_name);
 }
 
 static int l_xthread_log_enabled(lua_State* L) {
@@ -1105,7 +1029,10 @@ static int l_xthread_log_init(lua_State* L) {
     name = xthread_get_name(thr);
     lua_xthread_format_log_label(thread_label, sizeof(thread_label), id, name);
     xlog_set_thread(id, name, thread_label);
-    _log_local = 1;
+    /* Claim a log file for this thread. Without this call the thread keeps
+    ** writing into the shared process log, which is why an idle worker no
+    ** longer leaves an empty file of its own behind. */
+    xlog_enable_thread_file();
     lua_pushboolean(L, 1);
     return 1;
 }

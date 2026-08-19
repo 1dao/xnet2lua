@@ -12,6 +12,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -179,31 +180,79 @@ static void test_xtimer_lifecycle(xTestState* st) {
     XTEST_TRUE(st, g_timer_count >= 4);
 }
 
-static void test_xlog_formatting(xTestState* st) {
-    xtest_suite("xlog formatting and levels");
+static int test_file_exists(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+/* Reads the whole file into `buf`; leaves it empty when the file is absent. */
+static void test_read_file(const char* path, char* buf, size_t cap) {
+    FILE* f = fopen(path, "rb");
+    size_t n;
+    buf[0] = '\0';
+    if (!f) return;
+    n = fread(buf, 1, cap - 1u, f);
+    buf[n] = '\0';
+    fclose(f);
+}
+
+static void test_xlog_levels_and_files(xTestState* st) {
+    /* Own process name so nothing collides with the real logs; console off so
+    ** only the file sink is exercised. Every record is an error because WARN
+    ** and above flush, which makes the bytes readable straight away. */
+    const char* shared_log = "logs/xtest9_main_001.log";
+    const char* thread_log = "logs/xtest9_demo_001.log";
+    const char* unnamed_log = "logs/xtest9_t007_001.log";
+    char buf[4096];
+
+    xtest_suite("xlog levels and log-file naming");
 
     xlog_set_level(XLOG_LEVEL_INFO);
     XTEST_EQ_INT(st, xlog_get_level(), XLOG_LEVEL_INFO);
     XTEST_FALSE(st, xlog_is_enabled(XLOG_LEVEL_DEBUG));
     XTEST_TRUE(st, xlog_is_enabled(XLOG_LEVEL_ERROR));
 
+    remove(shared_log);
+    remove(thread_log);
+    remove(unnamed_log);
+    xlog_init("logs", "xtest9", 0);
+
+    /* Opening is lazy: configuring the logger creates nothing. */
+    XTEST_FALSE(st, test_file_exists(shared_log));
+
+    /* A thread that never claimed a file writes to the process log. */
     xlog_set_thread(42, "worker/demo", "T42:worker");
-
-    char buf[256];
-    size_t need = xlog_format(XLOG_LEVEL_INFO, XLOG_LEVEL_NAME_INFO,
-                              "hello", 5, 1, buf, sizeof(buf));
-    XTEST_TRUE(st, need > 0);
-    XTEST_CONTAINS(st, buf, "[INFO]");
+    xloge("shared-line");
+    XTEST_FALSE(st, test_file_exists(thread_log));
+    XTEST_TRUE(st, test_file_exists(shared_log));
+    test_read_file(shared_log, buf, sizeof(buf));
+    XTEST_CONTAINS(st, buf, "[ERRR]");
     XTEST_CONTAINS(st, buf, "[T42:worker]");
-    XTEST_CONTAINS(st, buf, "hello\n");
+    XTEST_CONTAINS(st, buf, "shared-line");
 
-    char small[8];
-    need = xlog_format(XLOG_LEVEL_WARN, XLOG_LEVEL_NAME_WARN,
-                       "abcdef", 6, 0, small, sizeof(small));
-    XTEST_TRUE(st, need >= 6);
-    XTEST_TRUE(st, small[sizeof(small) - 1] == '\0');
+    /* After claiming one, records go to that file only -- and the file name
+    ** drops the "worker" token from "worker/demo". */
+    xlog_enable_thread_file();
+    xloge("own-line");
+    XTEST_TRUE(st, test_file_exists(thread_log));
+    test_read_file(thread_log, buf, sizeof(buf));
+    XTEST_CONTAINS(st, buf, "own-line");
+    test_read_file(shared_log, buf, sizeof(buf));
+    XTEST_NULL(st, strstr(buf, "own-line"));
 
+    /* An unnamed thread falls back to the numeric tNNN form. */
     xlog_clear_thread();
+    xlog_set_thread(7, NULL, NULL);
+    xlog_enable_thread_file();
+    xloge("unnamed-line");
+    XTEST_TRUE(st, test_file_exists(unnamed_log));
+
+    xlog_uninit();
+    remove(shared_log);
+    remove(thread_log);
+    remove(unnamed_log);
     xlog_set_level(XLOG_LEVEL_VERBOSE);
 }
 
@@ -238,7 +287,7 @@ int main(void) {
     test_xargs_config_file(&st);
     test_xheapmin_ordering(&st);
     test_xtimer_lifecycle(&st);
-    test_xlog_formatting(&st);
+    test_xlog_levels_and_files(&st);
     test_xpoll_lifecycle(&st);
 
     return xtest_summary(&st);

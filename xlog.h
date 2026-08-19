@@ -16,9 +16,10 @@
 #define XLOG_RECORD_MAX_BYTES (1024u * 1024u)
 #endif
 
-/* Per-file size cap. Once the active per-thread log file reaches this many
-** bytes it is archived (renamed with a timestamp) and a fresh file is opened.
-** Default 2 GiB. Override at build time to change the roll-over threshold. */
+/* Per-file size cap. Once the active log file reaches this many bytes the next
+** sequence number is opened ("<base>_001.log" -> "<base>_002.log" -> ...).
+** Default 2 GiB. Override at build time, or at runtime with
+** xlog_set_max_file_bytes() (the runner maps LOG_MAX_FILE_MB onto it). */
 #ifndef XLOG_MAX_FILE_BYTES
 #define XLOG_MAX_FILE_BYTES (2ull * 1024ull * 1024ull * 1024ull)
 #endif
@@ -70,9 +71,15 @@ int  xlog_is_enabled(int level);
 void xlog_printf(int level, const char* level_name, const char* console_tag, const char* fmt, ...);
 void xlog_set_thread(int id, const char* name, const char* thread_label);
 void xlog_clear_thread(void);
-size_t xlog_format(int level, const char* level_name, const char* msg, size_t len, int append_newline, char* buf, size_t cap);
+/* Give the calling thread its own log file. Threads that never call this write
+** to the shared process log instead, so a worker that only ever emits a couple
+** of framework lines no longer leaves an almost-empty file behind. Opening is
+** still lazy: the file appears on the first record actually written. */
+void xlog_enable_thread_file(void);
+/* Roll-over threshold for every log file. 0 restores XLOG_MAX_FILE_BYTES. */
+void xlog_set_max_file_bytes(unsigned long long bytes);
+unsigned long long xlog_get_max_file_bytes(void);
 void xlog_write(int level, const char* level_name, const char* console_tag, const char* msg, size_t len, int append_newline);
-void xlog_write_raw(const char* msg, size_t len);
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -107,6 +114,30 @@ void xlog_android_emit(int level, int android_prio, const char* fmt, ...);
 #define xlogv(fmt, ...) do { if (xlog_is_enabled(XLOG_LEVEL_VERBOSE)) xlog_printf(XLOG_LEVEL_VERBOSE, XLOG_LEVEL_NAME_VERBOSE, XLOG_TAG_VERBOSE, fmt, ##__VA_ARGS__); } while(0)
 #define xlogf(fmt, ...) do { if (xlog_is_enabled(XLOG_LEVEL_FATAL))   xlog_printf(XLOG_LEVEL_FATAL,   XLOG_LEVEL_NAME_FATAL,   XLOG_TAG_FATAL,   fmt, ##__VA_ARGS__); } while(0)
 
+#endif
+
+/* Backward compatibility for legacy call sites (../xproxy shares this header
+** and still calls the upper-case forms). */
+#ifndef XLOGV
+#define XLOGV(...) xlogv(__VA_ARGS__)
+#endif
+#ifndef XLOGD
+#define XLOGD(...) xlogd(__VA_ARGS__)
+#endif
+#ifndef XLOGI
+#define XLOGI(...) xlogi(__VA_ARGS__)
+#endif
+#ifndef XLOGS
+#define XLOGS(...) xlogs(__VA_ARGS__)
+#endif
+#ifndef XLOGW
+#define XLOGW(...) xlogw(__VA_ARGS__)
+#endif
+#ifndef XLOGE
+#define XLOGE(...) xloge(__VA_ARGS__)
+#endif
+#ifndef XLOGF
+#define XLOGF(...) xlogf(__VA_ARGS__)
 #endif
 
 #ifdef __cplusplus
