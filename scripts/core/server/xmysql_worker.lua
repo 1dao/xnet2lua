@@ -6,6 +6,25 @@ local router = dofile('scripts/core/share/xrouter.lua')
 local xutils = require('xutils')   -- C-backed sha1/sha256 (always linked)
 router.set_log_prefix('XMYSQL-WORKER')
 
+-- Loaded lazily, and only on the caching_sha2_password full-authentication path
+-- (see request_public_key). Keeping it out of the startup path means a
+-- deployment that copies this file without scripts/core/share/xrsa.lua still
+-- connects normally to every account whose password cache is warm, and fails
+-- with a readable message rather than a dofile error if it ever needs RSA.
+local xrsa = nil
+local xrsa_err = nil
+local function load_xrsa()
+    if xrsa then return xrsa end
+    if xrsa_err then return nil, xrsa_err end
+    local ok, mod = pcall(dofile, 'scripts/core/share/xrsa.lua')
+    if not ok or type(mod) ~= 'table' or not mod.encrypt_pem then
+        xrsa_err = 'scripts/core/share/xrsa.lua is missing or invalid: ' .. tostring(mod)
+        return nil, xrsa_err
+    end
+    xrsa = mod
+    return xrsa
+end
+
 local config = {
     host = '127.0.0.1',
     port = 3306,
@@ -288,6 +307,21 @@ local function auth_token(plugin, password, seed)
     end
 
     return nil, 'unsupported auth plugin: ' .. tostring(plugin)
+end
+
+-- XOR `s` against `pattern` repeated cyclically. Unlike xor_string above (which
+-- stops at the shorter argument) this covers all of `s`, which is what MySQL's
+-- full-authentication payload needs: the pattern is the 20-byte nonce and `s`
+-- is a password of any length.
+local function xor_cyclic(s, pattern)
+    local plen = #pattern
+    if plen == 0 then return s end
+    local out = {}
+    for i = 1, #s do
+        local p = byte_at(pattern, ((i - 1) % plen) + 1)
+        out[i] = bchr(bit_band(bit_bxor(byte_at(s, i), p), 0xff))
+    end
+    return table.concat(out)
 end
 
 local function hex_string(s)
@@ -597,9 +631,9 @@ end
 local function mark_ready(c)
     c.phase = 'ready'
     c.ready = true
-    print(string.format('[XMYSQL-WORKER] ready[%d] %s@%s:%s db=%s',
+    xthread.log_info('[XMYSQL-WORKER] ready[%d] %s@%s:%s db=%s',
         c.index, config.user, config.host, tostring(config.port),
-        config.database ~= '' and config.database or '(none)'))
+        config.database ~= '' and config.database or '(none)')
     flush_waiting()
 end
 
@@ -607,7 +641,51 @@ local function fail_auth(c, reason)
     -- Non-retryable auth failure: remember it so queued/new requests fail fast
     -- with this reason rather than hanging until the caller's RPC timeout.
     fatal_auth_error = reason
+    xthread.log_error('[XMYSQL-WORKER] auth failed (not retrying): %s', tostring(reason))
     close_conn(c, reason)
+end
+
+-- caching_sha2_password full authentication. The server asks for it (status 4)
+-- whenever the account's password is not in its in-memory cache: first login
+-- after a server restart, a freshly created account, or one whose password just
+-- changed. The fast SHA-256 scramble cannot be checked in that state, so the
+-- server wants the password itself -- cleartext if the connection is TLS or a
+-- unix socket, otherwise RSA-encrypted under the server's public key. This
+-- connection is raw TCP, so we take the RSA path: 0x02 asks for the key.
+local function request_public_key(c, seq)
+    local _, err = load_xrsa()
+    if err then
+        fail_auth(c, 'caching_sha2_password requires full authentication and '
+            .. 'RSA is unavailable: ' .. tostring(err))
+        return
+    end
+    c.awaiting_public_key = true
+    c.conn:send_raw(pack_packet('\2', seq))
+end
+
+local function send_encrypted_password(c, pem, seq)
+    local rsa, err = load_xrsa()
+    if not rsa then
+        fail_auth(c, tostring(err))
+        return
+    end
+    local seed = c.auth_seed or ''
+    if seed == '' then
+        fail_auth(c, 'full authentication requested before any auth nonce arrived')
+        return
+    end
+    -- Password including its terminating NUL, XORed with the nonce: that is what
+    -- the server strips off after decrypting. The nonce is per-connection, so
+    -- the ciphertext cannot be replayed onto another one.
+    local plain = xor_cyclic(config.password .. '\0', seed)
+    local cipher, cerr = rsa.encrypt_pem(pem, plain)
+    if not cipher then
+        fail_auth(c, 'rsa encrypt of password failed: ' .. tostring(cerr))
+        return
+    end
+    xthread.log_info('[XMYSQL-WORKER] full auth[%d]: encrypted password with server key (%d bytes)',
+        c.index, #cipher)
+    c.conn:send_raw(pack_packet(cipher, seq))
 end
 
 local function handle_auth_packet(c, pkt)
@@ -633,14 +711,22 @@ local function handle_auth_packet(c, pkt)
             return
         end
         c.auth_plugin = plugin
-        print(string.format('[XMYSQL-WORKER] auth switch[%d] plugin=%s seed_len=%d',
-            c.index, tostring(plugin), #seed))
+        c.auth_seed = seed
+        xthread.log_info('[XMYSQL-WORKER] auth switch[%d] plugin=%s seed_len=%d',
+            c.index, tostring(plugin), #seed)
         c.conn:send_raw(pack_packet(token, pkt.seq + 1))
         return
     end
     if tag == 0x01 then
+        if c.awaiting_public_key then
+            -- AuthMoreData carrying the server's RSA public key in PEM.
+            c.awaiting_public_key = false
+            send_encrypted_password(c, string.sub(payload, 2), pkt.seq + 1)
+            return
+        end
         local status = byte_at(payload, 2)
         if status == 3 then
+            -- Fast auth succeeded; the OK packet follows on its own.
             return
         end
         if status == 4 then
@@ -648,11 +734,7 @@ local function handle_auth_packet(c, pkt)
                 c.conn:send_raw(pack_packet('', pkt.seq + 1))
                 return
             end
-            fail_auth(c, "MySQL account uses caching_sha2_password and requires "
-                .. "first-time full authentication, which this client does not "
-                .. "support. Use an account with mysql_native_password "
-                .. "(ALTER USER ... IDENTIFIED WITH mysql_native_password BY '...'), "
-                .. "or pre-authenticate once with the mysql CLI to warm the cache.")
+            request_public_key(c, pkt.seq + 1)
             return
         end
     end
@@ -734,9 +816,11 @@ local function connect_one(c)
         c.connecting = false
         c.closed = false
         c.phase = 'handshake'
+        c.awaiting_public_key = false
+        c.auth_seed = nil
         conn:set_framing({ type = 'raw', max_packet = config.max_packet })
-        print(string.format('[XMYSQL-WORKER] connected[%d] %s:%s raw',
-            c.index, tostring(ip), tostring(port)))
+        xthread.log_info('[XMYSQL-WORKER] connected[%d] %s:%s raw',
+            c.index, tostring(ip), tostring(port))
     end
 
     function handler.on_packet(_, data)
@@ -750,10 +834,11 @@ local function connect_one(c)
             if c.phase == 'handshake' then
                 c.handshake = parse_handshake(pkt.payload)
                 c.auth_plugin = c.handshake.plugin
-                print(string.format('[XMYSQL-WORKER] handshake[%d] server=%s plugin=%s seed_len=%d caps=0x%x',
+                c.auth_seed = c.handshake.seed
+                xthread.log_info('[XMYSQL-WORKER] handshake[%d] server=%s plugin=%s seed_len=%d caps=0x%x',
                     c.index, tostring(c.handshake.server_version),
                     tostring(c.handshake.plugin), #c.handshake.seed,
-                    c.handshake.capabilities or 0))
+                    c.handshake.capabilities or 0)
                 local response, err = make_handshake_response(c.handshake)
                 if not response then
                     close_conn(c, err)
@@ -792,14 +877,14 @@ local function connect_one(c)
         elseif not stopping then
             c.retry_at = os.time() + math.max(1, math.floor(config.reconnect_ms / 1000))
         end
-        print(string.format('[XMYSQL-WORKER] close[%d]: %s', c.index, tostring(reason)))
+        xthread.log_warn('[XMYSQL-WORKER] close[%d]: %s', c.index, tostring(reason))
     end
 
     local conn, err = xnet.connect(config.host, config.port, handler)
     if not conn then
         c.connecting = false
         c.retry_at = os.time() + math.max(1, math.floor(config.reconnect_ms / 1000))
-        print(string.format('[XMYSQL-WORKER] connect[%d] failed: %s', c.index, tostring(err)))
+        xthread.log_error('[XMYSQL-WORKER] connect[%d] failed: %s', c.index, tostring(err))
         return
     end
     c.conn = conn
@@ -858,9 +943,9 @@ local function stop_pool(silent)
 end
 
 xthread.register('xmysql_start', function(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
-    print(string.format('[XMYSQL-WORKER] start %s:%s user=%s db=%s pool=%s',
+    xthread.log_system('[XMYSQL-WORKER] start %s:%s user=%s db=%s pool=%s',
         tostring(host), tostring(port), tostring(user),
-        database ~= '' and tostring(database) or '(none)', tostring(pool_size)))
+        database ~= '' and tostring(database) or '(none)', tostring(pool_size))
     start_pool(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
 end)
 
@@ -873,9 +958,9 @@ end)
 -- by the xadmin setup flow so changing DB settings at runtime doesn't require a
 -- thread shutdown (which corrupts other threads' poll state).
 xthread.register('xmysql_restart', function(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
-    print(string.format('[XMYSQL-WORKER] restart (in-place) %s:%s user=%s db=%s',
+    xthread.log_system('[XMYSQL-WORKER] restart (in-place) %s:%s user=%s db=%s',
         tostring(host), tostring(port), tostring(user),
-        database ~= '' and tostring(database) or '(none)'))
+        database ~= '' and tostring(database) or '(none)')
     stop_pool(true)
     start_pool(host, port, user, password, database, pool_size, reconnect_ms, max_packet, charset)
 end)
@@ -897,7 +982,7 @@ xthread.register('xmysql_query', function(sql)
 end)
 
 local function __init()
-    print('[XMYSQL-WORKER] init')
+    xthread.log_info('[XMYSQL-WORKER] init')
     check_hash_impl()
     assert(xnet.init())
 end
@@ -917,7 +1002,7 @@ end
 local function __uninit()
     stop_pool(true)
     xnet.uninit()
-    print('[XMYSQL-WORKER] uninit')
+    xthread.log_info('[XMYSQL-WORKER] uninit')
 end
 
 return {
