@@ -5,6 +5,7 @@ WITH_HTTPS ?= 1
 WITH_RPMALLOC ?= 1
 WITH_XDEBUG ?= 0
 WITH_IO_URING ?= 0
+WITH_XPROC ?= 0
 SANITIZE ?= none
 ifeq ($(OS),Windows_NT)
 ASAN_OPTIONS ?= halt_on_error=1:abort_on_error=1:strict_string_checks=1
@@ -141,6 +142,10 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xhttp_client_main.lua \
 	demo/xrecord_main.lua
 
+ifeq ($(WITH_XPROC),1)
+LUA_TEST_CORE_SCRIPTS += tests/lua/xproc_pipe_test.lua
+endif
+
 LUA_TEST_EXTERNAL_SCRIPTS := \
 	demo/xhttps_main.lua \
 	demo/xhttp_wss_main.lua \
@@ -155,6 +160,7 @@ ROOT_BUILD_ARGS := \
 	WITH_HTTPS="$(WITH_HTTPS)" \
 	WITH_RPMALLOC="$(WITH_RPMALLOC)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
+	WITH_XPROC="$(WITH_XPROC)" \
 	WITH_IO_URING="$(WITH_IO_URING)" \
 	LUA_BACKEND="$(LUA_BACKEND)" \
 	LUAJIT_DIR="$(LUAJIT_DIR)" \
@@ -166,6 +172,7 @@ SELF_ARGS := \
 	CC="$(CC)" \
 	SANITIZE="$(SANITIZE)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
+	WITH_XPROC="$(WITH_XPROC)" \
 	WITH_IO_URING="$(WITH_IO_URING)" \
 	LUA_BACKEND="$(LUA_BACKEND)" \
 	LUAJIT_DIR="$(LUAJIT_DIR)" \

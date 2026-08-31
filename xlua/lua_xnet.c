@@ -451,6 +451,18 @@ static int l_conn_close(lua_State* L) {
     return 1;
 }
 
+/* Queue-preserving close. This is useful whenever the peer must receive all
+** buffered bytes before EOF, notably a child process reading from a socketpair. */
+static int l_conn_close_after_flush(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    const char* reason = luaL_optstring(L, 2, "close_after_flush");
+    int rc = (c->ch && !c->closed)
+        ? xchannel_close_after_flush(c->ch, reason)
+        : -1;
+    lua_pushboolean(L, rc == 0);
+    return 1;
+}
+
 static int l_conn_send(lua_State* L) {
     LuaNetConn* c = check_conn(L, 1);
     size_t len = 0;
@@ -957,11 +969,75 @@ static int l_xnet_close_fd(lua_State* L) {
     return 0;
 }
 
+
+/* ── read-side flow control ────────────────────────────────────────────────
+**
+** xchannel documents pause_read/resume_read as being for proxy and tunnel use,
+** and that is exactly what was missing from Lua. Copying one channel into
+** another -- a child process's stdout into an HTTP response, say -- without it
+** means reading from the fast side as fast as it produces and queueing into the
+** slow side without limit. The send buffer hits its cap, send_raw starts
+** returning "send buffer full", and a caller that writes a framed protocol
+** loses part of a frame rather than merely stalling.
+**
+** With these, the consumer pauses the producing channel while the consuming
+** one is backed up, and resumes when it drains.
+*/
+static int l_conn_pause_read(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    if (c && c->ch && !c->closed) xchannel_pause_read(c->ch);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int l_conn_resume_read(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    if (c && c->ch && !c->closed) xchannel_resume_read(c->ch);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int l_conn_is_read_paused(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    lua_pushboolean(L, (c && c->ch && !c->closed)
+                       ? xchannel_is_read_paused(c->ch) : 0);
+    return 1;
+}
+
+/* conn:stats() -> send_buffered, recv_buffered, bytes_sent, bytes_recv
+**
+** send_buffered is the one that matters for flow control: it is how far behind
+** the socket is, and therefore when to stop feeding it. */
+static int l_conn_stats(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    size_t send_buf = 0, recv_buf = 0;
+    uint64_t sent = 0, recv = 0;
+    if (c && c->ch && !c->closed) {
+        xchannel_get_stats(c->ch, &send_buf, &recv_buf, &sent, &recv);
+    }
+    lua_pushinteger(L, (lua_Integer)send_buf);
+    lua_pushinteger(L, (lua_Integer)recv_buf);
+    lua_pushinteger(L, (lua_Integer)sent);
+    lua_pushinteger(L, (lua_Integer)recv);
+    return 4;
+}
+
+/* conn:set_max_send(bytes) -- raise or lower this channel's send-buffer cap. */
+static int l_conn_set_max_send(lua_State* L) {
+    LuaNetConn* c = check_conn(L, 1);
+    lua_Integer max = luaL_checkinteger(L, 2);
+    luaL_argcheck(L, max >= 0, 2, "max must not be negative");
+    if (c && c->ch && !c->closed) xchannel_set_max_send(c->ch, (size_t)max);
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
 static const luaL_Reg conn_methods[] = {
     { "fd",          l_conn_fd },
     { "peer",        l_conn_peer },
     { "is_closed",   l_conn_is_closed },
     { "close",       l_conn_close },
+    { "close_after_flush", l_conn_close_after_flush },
     { "send",        l_conn_send },
     { "send_raw",    l_conn_send_raw },
     { "send_packet", l_conn_send_packet },
@@ -971,6 +1047,11 @@ static const luaL_Reg conn_methods[] = {
     { "enable_aead", l_conn_enable_aead },
     { "disable_aead", l_conn_disable_aead },
     { "detach",       l_conn_detach },
+    { "pause_read",     l_conn_pause_read },
+    { "resume_read",    l_conn_resume_read },
+    { "is_read_paused", l_conn_is_read_paused },
+    { "stats",          l_conn_stats },
+    { "set_max_send",   l_conn_set_max_send },
     { NULL, NULL }
 };
 

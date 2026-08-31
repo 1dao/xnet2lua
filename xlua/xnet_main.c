@@ -80,6 +80,10 @@ static void luaL_requiref(lua_State* L, const char* modname,
 #define XNET_WITH_HTTPS 0
 #endif
 
+#ifndef XNET_WITH_XPROC
+#define XNET_WITH_XPROC 0
+#endif
+
 LUA_API int luaopen_cmsgpack(lua_State *L);
 LUA_API int luaopen_xthread(lua_State *L);
 LUA_API int luaopen_xnet(lua_State *L);
@@ -88,6 +92,9 @@ LUA_API int luaopen_xtimer(lua_State *L);
 LUA_API int luaopen_xcompress(lua_State *L);
 LUA_API int luaopen_xshared(lua_State *L);
 LUA_API int luaopen_xrecord(lua_State *L);
+#if XNET_WITH_XPROC
+LUA_API int luaopen_xproc(lua_State *L);
+#endif
 
 /* xshared registry lifecycle (xshared.c) -- dicts are created from Lua at boot
 ** and live in a process-global registry; free them once at shutdown.
@@ -209,6 +216,10 @@ static void preload_modules(lua_State* L) {
 
     luaL_requiref(L, "xrecord", luaopen_xrecord, 1);
     lua_pop(L, 1);
+#if XNET_WITH_XPROC
+    luaL_requiref(L, "xproc", luaopen_xproc, 1);
+    lua_pop(L, 1);
+#endif
 }
 
 static void install_stop(lua_State* L) {

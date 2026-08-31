@@ -44,6 +44,7 @@ WITH_IO_URING ?= 0
 WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
 WITH_XDEBUG ?= 0
+WITH_XPROC ?= 0
 # WITH_RPMALLOC=1 (default): route allocs through rpmalloc via xmacro.h,
 #   link 3rd/rpmalloc/rpmalloc.c.
 # WITH_RPMALLOC=0: pass through to libc; useful for ASan/Valgrind/A-B perf.
@@ -105,6 +106,9 @@ else
     TARGET_LIB := lib$(LIB_NAME).a
 endif
 CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c xshared.c xrecord.c
+ifeq ($(WITH_XPROC),1)
+	CORE_SRCS += xproc.c
+endif
 CORE_OBJS := $(addprefix $(OBJ_DIR)/,$(CORE_SRCS:.c=.o))
 CORE_DEPS := $(CORE_OBJS:.o=.d)
 
@@ -123,7 +127,7 @@ else
 	SYS_LDFLAGS += -lpthread -lm
 endif
 
-XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS)
+XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS) -DXNET_WITH_XPROC=$(WITH_XPROC)
 # mbedTLS hash primitives (sha1/sha256/sha512/md5 + platform_util) are
 # self-contained -- no SSL/x509/PSA deps -- so xutils exports them on EVERY
 # build (see xlua/lua_xutils.c). The include path is therefore always needed.
@@ -149,6 +153,9 @@ endif
 XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) $(XNET_CPU_FEATURES_SRC)
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
 XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c xlua/lua_xshared.c xlua/lua_xrecord.c
+ifeq ($(WITH_XPROC),1)
+	XNET_LUA_SRC += xlua/lua_xproc.c
+endif
 XNET_DEBUG_SRC :=
 XNET_LUA_LIB :=
 XNET_EXTRA_LDFLAGS :=
@@ -218,7 +225,7 @@ XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
-TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_XPROC="$(WITH_XPROC)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
 ASAN_BUILD_ARGS := BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)
