@@ -207,15 +207,28 @@ end
 -- HTTP Message Parsers
 -- ============================================================================
 
-function M.parse_request(data, start_pos, opts)
+-- Parse only the request line and headers.
+--
+-- The normal parser deliberately waits for a complete body because most HTTP
+-- handlers want a convenient `req.body` string. Smart-HTTP is different: the
+-- body is a git protocol stream and can be much larger than memory. Keeping
+-- this split here lets a caller validate/route a request once its headers have
+-- arrived, then consume the body incrementally without duplicating the header
+-- grammar.
+--
+-- Returns a request-shaped table plus the first body position. The table has
+-- `content_length` for Content-Length framing, `chunked=true` for chunked
+-- framing, and no `body` field. No body-size limit is applied here; callers
+-- that buffer bodies must keep using parse_request, which enforces its limit.
+function M.parse_request_head(data, start_pos, opts)
     opts = opts or {}
     start_pos = start_pos or 1
-    local max_request_size = opts.max_request_size or (16 * 1024 * 1024)
     local state = opts.state
 
     local header_end = data:find('\r\n\r\n', start_pos, true)
     if not header_end then
-        if #data - start_pos + 1 > max_request_size then
+        local max_header_size = opts.max_header_size or (64 * 1024)
+        if #data - start_pos + 1 > max_header_size then
             return nil, nil, 'request too large'
         end
         return nil, nil, 'incomplete'
@@ -250,56 +263,16 @@ function M.parse_request(data, start_pos, opts)
     end
 
     local body_start = header_end + 4
-    local body = ''
-    local next_pos = body_start
     local transfer_encoding = M.lower(headers['transfer-encoding'])
-    if transfer_encoding:find('chunked', 1, true) then
-        local chunk_body, chunk_next, chunk_err = M.parse_chunked(data, body_start)
-        if chunk_err == 'incomplete' then return nil, nil, 'incomplete' end
-        if chunk_err then return nil, nil, chunk_err end
-        body = chunk_body
-        next_pos = chunk_next
+    local chunked = transfer_encoding:find('chunked', 1, true) ~= nil
+    local content_length
+    if chunked then
+        content_length = nil
     else
-        local content_length = tonumber(headers['content-length'] or '0') or 0
+        content_length = tonumber(headers['content-length'] or '0')
+        if content_length == nil then content_length = -1 end
         if content_length < 0 then
             return nil, nil, 'bad content length'
-        end
-        if content_length > max_request_size then
-            return nil, nil, 'request body too large'
-        end
-        if #data < body_start + content_length - 1 then
-            return nil, nil, 'incomplete'
-        end
-        if content_length > 0 then
-            body = data:sub(body_start, body_start + content_length - 1)
-        end
-        next_pos = body_start + content_length
-    end
-
-    if next_pos - start_pos > max_request_size then
-        return nil, nil, 'request too large'
-    end
-
-    -- Optional: decompress the body in-place when Content-Encoding is one of
-    -- the formats we recognise. Capped by max_decompressed_size to guard
-    -- against zip-bomb-style payloads; default 16x the wire size when not set.
-    local content_encoding = nil
-    local raw_encoding = headers['content-encoding']
-    if opts.decompress and body ~= '' and raw_encoding then
-        local enc = M.lower(raw_encoding)
-        if enc == 'gzip' or enc == 'x-gzip' or enc == 'deflate' then
-            local max_dec = opts.max_decompressed_size
-                or (max_request_size > 0 and max_request_size)
-                or (16 * 1024 * 1024)
-            local plain, err = M.decompress_body(body, enc, max_dec)
-            if not plain then
-                return nil, nil, 'decompress: ' .. tostring(err)
-            end
-            content_encoding = enc
-            body = plain
-            -- Keep the original header value in the table so handlers can see
-            -- it, but null out content-length since the body length changed.
-            headers['content-length'] = tostring(#body)
         end
     end
 
@@ -321,12 +294,77 @@ function M.parse_request(data, start_pos, opts)
         version = version,
         headers = headers,
         header_list = header_list,
-        body = body,
-        content_encoding = content_encoding,  -- nil unless we decompressed
+        body_start = body_start,
+        content_length = content_length,
+        chunked = chunked,
         keep_alive = keep_alive,
         peer_ip = state and state.ip or nil,
         peer_port = state and state.port or nil,
-    }, next_pos
+    }, body_start
+end
+
+function M.parse_request(data, start_pos, opts)
+    opts = opts or {}
+    start_pos = start_pos or 1
+    local max_request_size = opts.max_request_size or (16 * 1024 * 1024)
+    local body = ''
+    local head, body_start, err = M.parse_request_head(data, start_pos, {
+        state = opts.state,
+        max_header_size = opts.max_header_size,
+    })
+    if not head then return nil, body_start, err end
+    local next_pos = body_start
+
+    if head.chunked then
+        local chunk_body, chunk_next, chunk_err = M.parse_chunked(data, body_start)
+        if chunk_err == 'incomplete' then return nil, nil, 'incomplete' end
+        if chunk_err then return nil, nil, chunk_err end
+        body = chunk_body
+        next_pos = chunk_next
+    else
+        local content_length = head.content_length or 0
+        if content_length > max_request_size then
+            return nil, nil, 'request body too large'
+        end
+        if #data < body_start + content_length - 1 then
+            return nil, nil, 'incomplete'
+        end
+        if content_length > 0 then
+            body = data:sub(body_start, body_start + content_length - 1)
+        end
+        next_pos = body_start + content_length
+    end
+
+    if next_pos - start_pos > max_request_size then
+        return nil, nil, 'request too large'
+    end
+
+    -- Optional: decompress the body in-place when Content-Encoding is one of
+    -- the formats we recognise. Capped by max_decompressed_size to guard
+    -- against zip-bomb-style payloads; default 16x the wire size when not set.
+    local content_encoding = nil
+    local raw_encoding = head.headers['content-encoding']
+    if opts.decompress and body ~= '' and raw_encoding then
+        local enc = M.lower(raw_encoding)
+        if enc == 'gzip' or enc == 'x-gzip' or enc == 'deflate' then
+            local max_dec = opts.max_decompressed_size
+                or (max_request_size > 0 and max_request_size)
+                or (16 * 1024 * 1024)
+            local plain, err = M.decompress_body(body, enc, max_dec)
+            if not plain then
+                return nil, nil, 'decompress: ' .. tostring(err)
+            end
+            content_encoding = enc
+            body = plain
+            -- Keep the original header value in the table so handlers can see
+            -- it, but null out content-length since the body length changed.
+            head.headers['content-length'] = tostring(#body)
+        end
+    end
+
+    head.body = body
+    head.content_encoding = content_encoding  -- nil unless we decompressed
+    return head, next_pos
 end
 
 function M.parse_response(data, pos, opts)
