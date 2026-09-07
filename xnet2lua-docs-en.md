@@ -1025,6 +1025,53 @@ if files then
 end
 ```
 
+### 5.9 Directory Operations Without a Shell
+
+```lua
+local entries, err = xutils.list_dir("tmp/")   -- ONE level: { {name=, dir=}, ... }
+local ok, err      = xutils.mkdir_p("a/b/c")   -- creates parents; existing is ok
+local ok, err      = xutils.rmtree("a")        -- recursive; missing path is ok
+```
+
+`list_dir` is the non-recursive counterpart to `scan_dir`, which descends with
+no depth limit and so cannot be pointed at anything that might contain a large
+tree. `rmtree` removes symlinks rather than following them, and clears the
+read-only attribute on Windows — git leaves loose objects read-only, and
+`DeleteFile` refuses those.
+
+These replace `mkdir -p`, `rm -rf` / `rmdir /s /q` and `find -delete` / `del /q`:
+a process per syscall, a different spelling per platform, and a caller-supplied
+path pushed through a quoting layer.
+
+### 5.10 Password Hashing
+
+```lua
+local dk = xutils.pbkdf2_sha256(password, salt, iterations)      -- 32 raw bytes
+local dk = xutils.pbkdf2_sha256(password, salt, iterations, 64)  -- or dkLen bytes
+```
+
+PBKDF2-HMAC-SHA256 (RFC 8018). Built on the same SHA-256 the other hash
+functions here use, which is linked in **every** build configuration —
+deliberately not on `mbedtls_pkcs5_pbkdf2_hmac`, whose `pkcs5.c` and `md.c` are
+only compiled with HTTPS enabled. A password hash that exists or not depending
+on `WITH_HTTPS` is not something a caller can reason about.
+
+Written in Lua the same loop costs about 44 ms at 10000 iterations against 6 ms
+here, because the per-round XOR runs in interpreted code between two C calls.
+
+### 5.11 Working Directory
+
+```lua
+local dir, err = xutils.cwd()   -- absolute path of the process working directory
+```
+
+Lua has no `getcwd`, and the usual workaround — running `pwd` (or `cd` on
+Windows) through a shell and reading the pipe — costs a process and, on Windows,
+is only as correct as the console code page the process happened to inherit: the
+UTF-8 manifest in `xlua/xnet.rc` governs *this* process's ANSI calls, not a
+child's output encoding. `xutils.cwd()` asks the OS directly and has neither
+problem. Returns `nil, err` on failure.
+
 ---
 
 ## 6. Frame Protocols (Packetization Strategy)

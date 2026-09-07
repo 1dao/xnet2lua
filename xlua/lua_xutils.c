@@ -11,6 +11,11 @@
 **   xutils.get_double(key[, default]) -> number | nil    (default: number)
 **   xutils.get_string(key[, default]) -> string | nil    (default: string)
 **   xutils.scan_dir(path)     -> { { path=..., rel=... }, ... } | nil,err
+**   xutils.list_dir(path)     -> { { name=..., dir=... }, ... } | nil,err  (one level)
+**   xutils.mkdir_p(path)      -> true | nil,err
+**   xutils.rmtree(path)       -> true | nil,err
+**   xutils.cwd()              -> string | nil,err
+**   xutils.pbkdf2_sha256(pw, salt, iter [, dklen]) -> raw string | nil,err
 */
 
 #include <math.h>
@@ -20,6 +25,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <errno.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -890,6 +896,376 @@ static int l_util_scan_dir(lua_State *L) {
     return 1;
 }
 
+/* xutils.cwd() -> string | nil, err
+**
+** The process working directory.
+**
+** Lua has no getcwd, and the workaround every caller otherwise reaches for is
+** to run `pwd` (or `cd` on Windows) through a shell and read the pipe. That is
+** a process spawn for a value the OS will hand over for free, and on Windows it
+** is also wrong: this process's ANSI APIs speak UTF-8 because of the manifest
+** in xlua/xnet.rc, but a child's pipe OUTPUT is still the OEM code page, so an
+** install path with non-ASCII in it comes back as mojibake. Asking the API has
+** neither problem.
+**
+** Windows takes the ANSI call deliberately, for the same manifest reason: it
+** already returns UTF-8 here, so there is no wide-char conversion to do.
+*/
+static int l_util_cwd(lua_State *L) {
+#ifdef _WIN32
+    /* Called with 0 it returns the size INCLUDING the terminator; called with a
+    ** buffer it returns the length EXCLUDING it. A directory can be renamed
+    ** between the two calls, so a second result that no longer fits is a
+    ** failure rather than something to truncate. */
+    DWORD need = GetCurrentDirectoryA(0, NULL);
+    if (need == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "GetCurrentDirectory failed");
+        return 2;
+    }
+    char *buf = (char *)malloc(need);
+    if (!buf) {
+        lua_pushnil(L);
+        lua_pushstring(L, "out of memory");
+        return 2;
+    }
+    DWORD got = GetCurrentDirectoryA(need, buf);
+    if (got == 0 || got >= need) {
+        free(buf);
+        lua_pushnil(L);
+        lua_pushstring(L, "GetCurrentDirectory failed");
+        return 2;
+    }
+    lua_pushlstring(L, buf, (size_t)got);
+    free(buf);
+    return 1;
+#else
+    /* Grown rather than fixed at PATH_MAX: PATH_MAX is not defined everywhere,
+    ** and where it is it is not always the real limit. ERANGE is the only error
+    ** worth retrying. */
+    size_t cap = 512;
+    for (;;) {
+        char *buf = (char *)malloc(cap);
+        if (!buf) {
+            lua_pushnil(L);
+            lua_pushstring(L, "out of memory");
+            return 2;
+        }
+        if (getcwd(buf, cap)) {
+            lua_pushstring(L, buf);
+            free(buf);
+            return 1;
+        }
+        int err = errno;
+        free(buf);
+        if (err != ERANGE || cap >= 65536) {
+            lua_pushnil(L);
+            lua_pushstring(L, strerror(err));
+            return 2;
+        }
+        cap *= 2;
+    }
+#endif
+}
+
+/* ==========================================================================
+** Directory operations
+**
+** These three exist because the alternative in Lua is a SHELL: `mkdir -p`,
+** `rm -rf` / `rmdir /s /q`, `find -delete` / `del /q`. Every one of those is a
+** process spawn for a syscall, needs a different spelling per platform, and
+** puts a caller-influenced path through a quoting layer -- which for the
+** recursive delete is the single most dangerous string in a git host.
+** ======================================================================== */
+
+/* Deepest tree rmtree() will walk. Not a real limit for a repository; it is
+** there so a filesystem loop that survives the symlink check below cannot turn
+** into unbounded recursion. */
+#define XU_RMTREE_MAX_DEPTH 128
+
+static int rmtree_walk(const char *path, char *errbuf, size_t errcap, int depth);
+
+static void xu_err(char *errbuf, size_t errcap, const char *what, const char *path) {
+    if (errbuf && errcap) snprintf(errbuf, errcap, "%s: %s", what, path ? path : "?");
+}
+
+#ifdef _WIN32
+static int rmtree_children(const char *dir, char *errbuf, size_t errcap, int depth) {
+    char *pattern = path_join_dup(dir, "*");
+    if (!pattern) return -1;
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    free(pattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        xu_err(errbuf, errcap, "cannot list", dir);
+        return -1;
+    }
+
+    int rc = 0;
+    do {
+        const char *name = fd.cFileName;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+
+        char *full = path_join_dup(dir, name);
+        if (!full) { rc = -1; break; }
+
+        /* A reparse point (junction, symlink) is removed as itself, never
+        ** followed -- following one would delete whatever it aims at. */
+        int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        int is_link = (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+
+        if (is_dir && !is_link) {
+            rc = rmtree_walk(full, errbuf, errcap, depth + 1);
+        } else {
+            /* git leaves loose objects and packfiles read-only, and DeleteFile
+            ** refuses a read-only file. `rmdir /s /q` had the same problem and
+            ** got away with it only because it clears the attribute itself. */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY) {
+                SetFileAttributesA(full, fd.dwFileAttributes & ~(DWORD)FILE_ATTRIBUTE_READONLY);
+            }
+            if (is_dir) {
+                if (!RemoveDirectoryA(full)) { xu_err(errbuf, errcap, "cannot remove link", full); rc = -1; }
+            } else if (!DeleteFileA(full)) {
+                xu_err(errbuf, errcap, "cannot delete", full);
+                rc = -1;
+            }
+        }
+        free(full);
+    } while (rc == 0 && FindNextFileA(h, &fd));
+
+    FindClose(h);
+    return rc;
+}
+#else
+static int rmtree_children(const char *dir, char *errbuf, size_t errcap, int depth) {
+    DIR *dp = opendir(dir);
+    if (!dp) { xu_err(errbuf, errcap, "cannot list", dir); return -1; }
+
+    int rc = 0;
+    struct dirent *ent;
+    while (rc == 0 && (ent = readdir(dp)) != NULL) {
+        const char *name = ent->d_name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+
+        char *full = path_join_dup(dir, name);
+        if (!full) { rc = -1; break; }
+
+        /* lstat, not stat: a symlink to a directory must be unlinked, not
+        ** descended into. */
+        struct stat st;
+        if (lstat(full, &st) != 0) {
+            xu_err(errbuf, errcap, "cannot stat", full);
+            rc = -1;
+        } else if (S_ISDIR(st.st_mode)) {
+            rc = rmtree_walk(full, errbuf, errcap, depth + 1);
+        } else if (unlink(full) != 0) {
+            xu_err(errbuf, errcap, "cannot delete", full);
+            rc = -1;
+        }
+        free(full);
+    }
+
+    closedir(dp);
+    return rc;
+}
+#endif
+
+static int rmtree_walk(const char *path, char *errbuf, size_t errcap, int depth) {
+    if (depth > XU_RMTREE_MAX_DEPTH) {
+        xu_err(errbuf, errcap, "too deep", path);
+        return -1;
+    }
+    if (rmtree_children(path, errbuf, errcap, depth) != 0) return -1;
+#ifdef _WIN32
+    if (!RemoveDirectoryA(path)) { xu_err(errbuf, errcap, "cannot remove", path); return -1; }
+#else
+    if (rmdir(path) != 0) { xu_err(errbuf, errcap, "cannot remove", path); return -1; }
+#endif
+    return 0;
+}
+
+/* xutils.rmtree(path) -> true | nil, err
+**
+** Remove a directory and everything under it. A path that does not exist is
+** success, so the caller does not need an exists-check race.
+**
+** Symlinks are removed, never followed. Callers hand this a path built from
+** user-influenced names, so the one thing it must not do is delete something
+** outside the tree it was pointed at.
+*/
+static int l_util_rmtree(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    if (path[0] == '\0') {
+        lua_pushnil(L);
+        lua_pushstring(L, "rmtree: empty path");
+        return 2;
+    }
+
+    char errbuf[512] = {0};
+#ifdef _WIN32
+    DWORD attr = GetFileAttributesA(path);
+    if (attr == INVALID_FILE_ATTRIBUTES) { lua_pushboolean(L, 1); return 1; }  /* already gone */
+    if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (attr & FILE_ATTRIBUTE_READONLY) {
+            SetFileAttributesA(path, attr & ~(DWORD)FILE_ATTRIBUTE_READONLY);
+        }
+        if (!DeleteFileA(path)) { lua_pushnil(L); lua_pushfstring(L, "cannot delete: %s", path); return 2; }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) { lua_pushboolean(L, 1); return 1; }            /* already gone */
+    if (!S_ISDIR(st.st_mode)) {
+        if (unlink(path) != 0) { lua_pushnil(L); lua_pushfstring(L, "cannot delete: %s", path); return 2; }
+        lua_pushboolean(L, 1);
+        return 1;
+    }
+#endif
+
+    if (rmtree_walk(path, errbuf, sizeof(errbuf), 0) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, errbuf[0] ? errbuf : "rmtree failed");
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* xutils.mkdir_p(path) -> true | nil, err
+**
+** Create a directory and any missing parents. An existing directory is success.
+*/
+static int l_util_mkdir_p(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    size_t n = strlen(path);
+    if (n == 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "mkdir_p: empty path");
+        return 2;
+    }
+
+    char *work = (char *)malloc(n + 1);
+    if (!work) { lua_pushnil(L); lua_pushstring(L, "out of memory"); return 2; }
+    memcpy(work, path, n + 1);
+
+    /* Walk the separators left to right, creating each prefix. EEXIST is the
+    ** normal case for every component but the last. */
+    for (size_t i = 1; i <= n; i++) {
+        char c = work[i];
+        int last = (i == n);
+        if (!last && c != '/' && c != '\\') continue;
+        if (!last) work[i] = '\0';
+
+        /* Nothing to create for a bare root ("/", "//") or a drive ("C:"):
+        ** the first is not ours to make and the second is not a directory. */
+        int skip = 1;
+        for (size_t k = 0; k < i; k++) {
+            char ch = work[k];
+            if (ch != '/' && ch != '\\' && ch != ':') { skip = 0; break; }
+        }
+        if (!skip && work[i - 1] == ':') skip = 1;
+#ifdef _WIN32
+        if (!skip && !CreateDirectoryA(work, NULL)) {
+            DWORD e = GetLastError();
+            if (e != ERROR_ALREADY_EXISTS) {
+                free(work);
+                lua_pushnil(L);
+                lua_pushfstring(L, "cannot create: %s", work);
+                return 2;
+            }
+        }
+#else
+        if (!skip && mkdir(work, 0777) != 0 && errno != EEXIST) {
+            int e = errno;
+            free(work);
+            lua_pushnil(L);
+            lua_pushfstring(L, "cannot create %s: %s", path, strerror(e));
+            return 2;
+        }
+#endif
+        if (!last) work[i] = c;
+    }
+
+    free(work);
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* xutils.list_dir(path) -> { { name=..., dir=bool }, ... } | nil, err
+**
+** ONE level. scan_dir recurses with no depth limit, which makes it unusable on
+** anything that might contain a git object store; this is the "what is directly
+** in here" call that a scratch sweep or a repository listing actually wants.
+** '.' and '..' are omitted.
+*/
+static int l_util_list_dir(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+    int count = 0;
+    lua_newtable(L);
+
+#ifdef _WIN32
+    char *pattern = path_join_dup(path, "*");
+    if (!pattern) { lua_pop(L, 1); lua_pushnil(L); lua_pushstring(L, "out of memory"); return 2; }
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    free(pattern);
+    if (h == INVALID_HANDLE_VALUE) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot list: %s", path);
+        return 2;
+    }
+    do {
+        const char *name = fd.cFileName;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        lua_newtable(L);
+        lua_pushstring(L, name);
+        lua_setfield(L, -2, "name");
+        lua_pushboolean(L, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        lua_setfield(L, -2, "dir");
+        lua_rawseti(L, -2, ++count);
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR *dp = opendir(path);
+    if (!dp) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushfstring(L, "cannot list %s: %s", path, strerror(errno));
+        return 2;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(dp)) != NULL) {
+        const char *name = ent->d_name;
+        if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+
+        int is_dir = 0;
+#ifdef DT_DIR
+        if (ent->d_type == DT_DIR)      is_dir = 1;
+        else if (ent->d_type != DT_UNKNOWN) is_dir = 0;
+        else
+#endif
+        {
+            char *full = path_join_dup(path, name);
+            struct stat st;
+            if (full && lstat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+            free(full);
+        }
+
+        lua_newtable(L);
+        lua_pushstring(L, name);
+        lua_setfield(L, -2, "name");
+        lua_pushboolean(L, is_dir);
+        lua_setfield(L, -2, "dir");
+        lua_rawseti(L, -2, ++count);
+    }
+    closedir(dp);
+#endif
+    return 1;
+}
+
 /* ==========================================================================
 ** Hashing / HMAC / base64 / hex
 **
@@ -1008,6 +1384,76 @@ static int l_util_hmac_sha256_hex(lua_State *L) {
     xu_push_hex(L, out, 32);
     return 1;
 }
+
+/* xutils.pbkdf2_sha256(password, salt, iterations [, dklen]) -> raw | nil, err
+**
+** PBKDF2-HMAC-SHA256, RFC 8018. dklen defaults to 32 (one SHA-256 block).
+**
+** Built on hmac_sha256_raw above rather than on mbedtls_pkcs5_pbkdf2_hmac
+** DELIBERATELY: pkcs5.c and md.c are only compiled into an HTTPS build, while
+** the four hash files this module already uses are linked on every
+** configuration. A password hash that exists or not depending on WITH_HTTPS is
+** not something a caller can reason about.
+**
+** In Lua this is a loop of C HMAC calls with the XOR done in interpreted code,
+** which is where the cost lives: measured at 10000 iterations it was ~55 ms per
+** verification, enough that it needed a thread of its own to keep the event
+** loop alive. The XOR belongs on this side of the boundary.
+*/
+static int l_util_pbkdf2_sha256(lua_State *L) {
+    size_t pl = 0, sl = 0;
+    const unsigned char *pw = (const unsigned char *)luaL_checklstring(L, 1, &pl);
+    const unsigned char *salt = (const unsigned char *)luaL_checklstring(L, 2, &sl);
+    lua_Integer iter = luaL_checkinteger(L, 3);
+    lua_Integer dklen = luaL_optinteger(L, 4, 32);
+
+    /* Bounded so a bad config cannot wedge the calling thread, and so the
+    ** allocation below cannot be driven from a caller's arithmetic. */
+    if (iter < 1 || iter > 10000000) {
+        lua_pushnil(L);
+        lua_pushstring(L, "pbkdf2: iterations out of range");
+        return 2;
+    }
+    if (dklen < 1 || dklen > 1024) {
+        lua_pushnil(L);
+        lua_pushstring(L, "pbkdf2: dklen out of range");
+        return 2;
+    }
+
+    unsigned char *dk = (unsigned char *)malloc((size_t)dklen);
+    if (!dk) { lua_pushnil(L); lua_pushstring(L, "out of memory"); return 2; }
+
+    /* salt || INT_BE32(block), the message for U1 of each block. */
+    unsigned char *msg = (unsigned char *)malloc(sl + 4);
+    if (!msg) { free(dk); lua_pushnil(L); lua_pushstring(L, "out of memory"); return 2; }
+    if (sl) memcpy(msg, salt, sl);
+
+    size_t done = 0;
+    for (uint32_t block = 1; done < (size_t)dklen; block++) {
+        msg[sl + 0] = (unsigned char)(block >> 24);
+        msg[sl + 1] = (unsigned char)(block >> 16);
+        msg[sl + 2] = (unsigned char)(block >> 8);
+        msg[sl + 3] = (unsigned char)(block);
+
+        unsigned char u[32], acc[32];
+        hmac_sha256_raw(pw, pl, msg, sl + 4, u);
+        memcpy(acc, u, 32);
+        for (lua_Integer i = 2; i <= iter; i++) {
+            hmac_sha256_raw(pw, pl, u, 32, u);
+            for (int b = 0; b < 32; b++) acc[b] ^= u[b];
+        }
+
+        size_t take = (size_t)dklen - done;
+        if (take > 32) take = 32;
+        memcpy(dk + done, acc, take);
+        done += take;
+    }
+
+    free(msg);
+    lua_pushlstring(L, (const char *)dk, (size_t)dklen);
+    free(dk);
+    return 1;
+}
 static int l_util_hmac_sha1(lua_State *L) {
     size_t kl = 0, ml = 0;
     const unsigned char *k = (const unsigned char *)luaL_checklstring(L, 1, &kl);
@@ -1109,6 +1555,10 @@ static const luaL_Reg xutils_funcs[] = {
     { "get_double",   l_util_get_double },
     { "get_string",   l_util_get_string },
     { "scan_dir",     l_util_scan_dir },
+    { "list_dir",     l_util_list_dir },
+    { "mkdir_p",      l_util_mkdir_p },
+    { "rmtree",       l_util_rmtree },
+    { "cwd",          l_util_cwd },
 
     /* hashes: raw digest + lowercase-hex variant */
     { "sha1",          l_util_sha1 },
@@ -1123,6 +1573,7 @@ static const luaL_Reg xutils_funcs[] = {
     /* HMAC */
     { "hmac_sha256",     l_util_hmac_sha256 },
     { "hmac_sha256_hex", l_util_hmac_sha256_hex },
+    { "pbkdf2_sha256",   l_util_pbkdf2_sha256 },
     { "hmac_sha1",       l_util_hmac_sha1 },
     { "hmac_sha1_hex",   l_util_hmac_sha1_hex },
 

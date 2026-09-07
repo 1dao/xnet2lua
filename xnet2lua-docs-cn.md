@@ -1024,6 +1024,47 @@ if files then
 end
 ```
 
+### 5.9 不用 shell 的目录操作
+
+```lua
+local entries, err = xutils.list_dir("tmp/")   -- 只列一层：{ {name=, dir=}, ... }
+local ok, err      = xutils.mkdir_p("a/b/c")   -- 自动建父目录；已存在算成功
+local ok, err      = xutils.rmtree("a")        -- 递归删除；路径不存在算成功
+```
+
+`list_dir` 是 `scan_dir` 的非递归版本——后者不限深度地往下走，因此不能对着任何
+可能含有大目录树的路径使用。`rmtree` 遇到符号链接是删掉它而不是跟进去，并且在
+Windows 上会先清掉只读属性：git 的松散对象是只读的，`DeleteFile` 拒绝这类文件。
+
+这三个替换掉的是 `mkdir -p`、`rm -rf` / `rmdir /s /q` 和 `find -delete` / `del /q`：
+一次系统调用起一个进程、每个平台一种拼法、还要把调用方给的路径塞进引号层。
+
+### 5.10 口令哈希
+
+```lua
+local dk = xutils.pbkdf2_sha256(password, salt, iterations)      -- 32 字节裸数据
+local dk = xutils.pbkdf2_sha256(password, salt, iterations, 64)  -- 或指定 dkLen
+```
+
+PBKDF2-HMAC-SHA256（RFC 8018）。**故意**建立在本模块其它哈希函数用的同一份
+SHA-256 之上——那几个文件在**每种**构建配置里都链接；而不是用
+`mbedtls_pkcs5_pbkdf2_hmac`，因为它依赖的 `pkcs5.c` 和 `md.c` 只有开启 HTTPS 时
+才编译。一个"存不存在取决于 `WITH_HTTPS`"的口令哈希，调用方没法推理。
+
+同样的循环写在 Lua 里，10000 轮约 44 ms，这里是 6 ms——差别在于每轮那次异或夹在
+两个 C 调用之间，是解释执行的。
+
+### 5.11 进程工作目录
+
+```lua
+local dir, err = xutils.cwd()   -- 进程工作目录的绝对路径
+```
+
+Lua 没有 `getcwd`，通常的绕法是跑 `pwd`（Windows 上是 `cd`）再读管道——这既要
+起一个进程，在 Windows 上又只在"进程恰好继承到的控制台代码页"正确时才对：
+`xlua/xnet.rc` 里的 UTF-8 manifest 管的是**本进程**的 ANSI 调用，管不到子进程
+的输出编码。`xutils.cwd()` 直接问系统，两个问题都没有。失败时返回 `nil, err`。
+
 ---
 
 ## 6. 帧协议（分包策略）
