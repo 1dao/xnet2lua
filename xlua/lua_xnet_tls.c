@@ -64,6 +64,23 @@ typedef struct LuaTlsConn {
     size_t outcap;
     size_t max_send;
 
+    /* Flow control and deferred close, mirroring xchannel's model so a TLS
+    ** connection answers the same Lua API the plaintext one does. Without
+    ** these a caller that works over http breaks over https on the first
+    ** `Connection: close` response or the first paused read. */
+    bool read_paused;
+    bool close_after_flush;
+    char close_reason[64];
+
+    /* An in-flight send_file_response. The body is pumped into outbuf one
+    ** chunk at a time as the socket drains -- see tls_fill_from_file for why
+    ** it cannot be pushed in one go. */
+    FILE* file_fp;
+    long long file_remaining;
+
+    uint64_t bytes_sent;
+    uint64_t bytes_recv;
+
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_x509_crt cert;        /* server: own cert; client: CA bundle */
@@ -110,6 +127,22 @@ static void tls_write_event(SOCKET_T fd, int mask,
 static void tls_error_event(SOCKET_T fd, int mask,
                             void* clientData, xPollRequest* submit_arg);
 static void tls_finish_connect(LuaTlsConn* c);
+static void tls_flush_output(LuaTlsConn* c);
+static void tls_read_plain(LuaTlsConn* c);
+static void tls_process_input(LuaTlsConn* c);
+static bool tls_fill_from_file(LuaTlsConn* c);
+static void tls_finish_deferred_close(LuaTlsConn* c);
+
+static bool tls_has_pending_file(const LuaTlsConn* c) {
+    return c && c->file_fp != NULL;
+}
+
+static void tls_close_pending_file(LuaTlsConn* c) {
+    if (!c || !c->file_fp) return;
+    fclose(c->file_fp);
+    c->file_fp = NULL;
+    c->file_remaining = 0;
+}
 
 static LuaTlsConn* check_tls_conn(lua_State* L, int idx) {
     return (LuaTlsConn*)luaL_checkudata(L, idx, LUA_XNET_TLS_META);
@@ -212,6 +245,7 @@ static void tls_close_internal(LuaTlsConn* c, const char* reason, bool notify) {
     }
 
     c->closed = true;
+    tls_close_pending_file(c);   /* a response abandoned mid-file still owns a FILE* */
 
     if (notify && c->L && c->handler_ref != LUA_NOREF && c->handler_ref != LUA_REFNIL) {
         lua_State* L = c->L;
@@ -297,11 +331,6 @@ static void tls_handle_packet_returns(LuaTlsConn* c, int first, int last) {
 
 static void tls_process_input(LuaTlsConn* c) {
     while (c && !c->closed && c->inlen > 0) {
-        if (c->inlen > c->max_packet) {
-            tls_close_internal(c, "packet_too_large", true);
-            return;
-        }
-
         lua_State* L = c->L;
         int base = lua_gettop(L);
         push_tls_self(L, c);
@@ -328,7 +357,25 @@ static void tls_process_input(LuaTlsConn* c) {
         lua_settop(L, base);
 
         if (c->closed) return;
-        if (consumed == 0) return;
+        if (consumed == 0) {
+            /* The handler cannot use what it holds yet -- normally a frame
+            ** that is still short. max_packet bounds THAT: it is a ceiling on
+            ** bytes nobody has consumed, not on how much a fast peer may
+            ** deliver in one read burst.
+            **
+            ** Checking it before the dispatch, as this used to, made every
+            ** large upload look like an oversized packet: tls_read_plain
+            ** drains the socket into inbuf before handing anything over, so a
+            ** peer that keeps the socket readable -- git streaming a packfile
+            ** -- pushed inlen past the cap while the handler, which would have
+            ** consumed every byte, had not been called once. The connection
+            ** was then closed with no reply, which the client reports as an
+            ** empty one. */
+            if (c->inlen > c->max_packet) {
+                tls_close_internal(c, "packet_too_large", true);
+            }
+            return;
+        }
         if (consumed > c->inlen) {
             tls_close_internal(c, "consume_error", true);
             return;
@@ -393,6 +440,56 @@ static void tls_drive_handshake(LuaTlsConn* c) {
     }
 }
 
+/* Read the next chunk of a pending file response into the send queue.
+**
+** One chunk at a time, and only ever with an empty queue behind it, so outbuf
+** never holds more than this much of the body however large the file is. That
+** is the whole point: the queue cap (max_send) is a backpressure signal, and a
+** response bigger than it must be paced against the socket rather than
+** refused.
+**
+** Returns false only when the connection was closed (read error or OOM). */
+static bool tls_fill_from_file(LuaTlsConn* c) {
+    if (!c || c->closed || !c->file_fp) return true;
+
+    char buf[64 * 1024];
+    size_t want = c->file_remaining > (long long)sizeof(buf)
+        ? sizeof(buf)
+        : (size_t)c->file_remaining;
+    if (want == 0) {
+        tls_close_pending_file(c);
+        return true;
+    }
+
+    size_t got = fread(buf, 1, want, c->file_fp);
+    if (got == 0) {
+        bool failed = ferror(c->file_fp) != 0;
+        tls_close_pending_file(c);
+        if (failed) {
+            tls_close_internal(c, "tls_file_read_error", true);
+            return false;
+        }
+        return true;   /* the file ended early; send what was queued */
+    }
+
+    if (!tls_append(&c->outbuf, &c->outlen, &c->outcap, buf, got)) {
+        tls_close_pending_file(c);
+        tls_close_internal(c, "out_of_memory", true);
+        return false;
+    }
+
+    c->file_remaining -= (long long)got;
+    if (c->file_remaining <= 0) tls_close_pending_file(c);
+    return true;
+}
+
+/* Close a connection whose close was deferred until its output drained. */
+static void tls_finish_deferred_close(LuaTlsConn* c) {
+    if (!c || c->closed || !c->close_after_flush) return;
+    if (c->outlen > 0 || tls_has_pending_file(c)) return;
+    tls_close_internal(c, c->close_reason[0] ? c->close_reason : "close_after_flush", true);
+}
+
 static void tls_flush_output(LuaTlsConn* c) {
     if (!c || c->closed) return;
     if (!c->handshake_done) {
@@ -400,38 +497,53 @@ static void tls_flush_output(LuaTlsConn* c) {
         return;
     }
 
-    while (!c->closed && c->outlen > 0) {
-        int rc = mbedtls_ssl_write(&c->ssl, (const unsigned char*)c->outbuf, c->outlen);
-        if (rc > 0) {
-            tls_consume(c->outbuf, &c->outlen, (size_t)rc);
-            continue;
-        }
-        if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
-            tls_disarm_write(c);
-            return;
-        }
-        if (rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
-            if (tls_arm_write(c) != 0) {
-                tls_close_internal(c, "poll_error", true);
+    /* Queue first, then the body of a pending file response, refilling the
+    ** queue as fast as the socket empties it and no faster. */
+    for (;;) {
+        while (!c->closed && c->outlen > 0) {
+            int rc = mbedtls_ssl_write(&c->ssl, (const unsigned char*)c->outbuf, c->outlen);
+            if (rc > 0) {
+                tls_consume(c->outbuf, &c->outlen, (size_t)rc);
+                c->bytes_sent += (uint64_t)rc;
+                continue;
             }
+            if (rc == MBEDTLS_ERR_SSL_WANT_READ) {
+                tls_disarm_write(c);
+                return;
+            }
+            if (rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+                if (tls_arm_write(c) != 0) {
+                    tls_close_internal(c, "poll_error", true);
+                }
+                return;
+            }
+
+            char errbuf[160];
+            tls_errmsg(rc, errbuf, sizeof(errbuf));
+            xloge("xnet: tls write failed: %s (%d)", errbuf, rc);
+            tls_close_internal(c, "tls_write_error", true);
             return;
         }
 
-        char errbuf[160];
-        tls_errmsg(rc, errbuf, sizeof(errbuf));
-        xloge("xnet: tls write failed: %s (%d)", errbuf, rc);
-        tls_close_internal(c, "tls_write_error", true);
-        return;
+        if (c->closed) return;
+        if (!tls_has_pending_file(c)) break;
+        if (!tls_fill_from_file(c)) return;
+        if (c->outlen == 0) break;              /* nothing left to send */
     }
 
-    if (!c->closed && c->outlen == 0) {
+    if (!c->closed && c->outlen == 0 && !tls_has_pending_file(c)) {
         tls_disarm_write(c);
+        tls_finish_deferred_close(c);
     }
 }
 
 static int tls_send_raw_c(LuaTlsConn* c, const char* data, size_t len) {
     if (!c || c->closed || (!data && len > 0)) return -1;
     if (len == 0) return 0;
+    /* A file response owns the tail of the stream until it finishes; queueing
+    ** anything behind it would be sent BEFORE the rest of the body. xchannel
+    ** refuses the same way. */
+    if (tls_has_pending_file(c)) return -1;
     if (c->max_send > 0) {
         if (c->outlen >= c->max_send) return -2;
         if (len > c->max_send - c->outlen) return -2;
@@ -451,7 +563,7 @@ static int tls_send_raw_c(LuaTlsConn* c, const char* data, size_t len) {
 }
 
 static void tls_read_plain(LuaTlsConn* c) {
-    if (!c || c->closed) return;
+    if (!c || c->closed || c->read_paused) return;
     if (!c->handshake_done) {
         tls_drive_handshake(c);
         return;
@@ -464,6 +576,16 @@ static void tls_read_plain(LuaTlsConn* c) {
             if (!tls_append(&c->inbuf, &c->inlen, &c->incap, (const char*)buf, (size_t)rc)) {
                 tls_close_internal(c, "out_of_memory", true);
                 return;
+            }
+            c->bytes_recv += (uint64_t)rc;
+            /* Hand over what has piled up rather than reading the whole
+            ** upload into memory first. The loop only ends when the socket
+            ** runs dry, and a peer on a fast link can keep it readable for as
+            ** long as it likes -- so without this, inbuf grows to the size of
+            ** the request no matter what max_packet says. */
+            if (c->inlen >= c->max_packet) {
+                tls_process_input(c);
+                if (c->closed || c->read_paused) return;
             }
             continue;
         }
@@ -1138,6 +1260,123 @@ static int l_tls_send_raw(lua_State* L) {
     return push_tls_send_result(L, c, tls_send_raw_c(c, data, len));
 }
 
+/* conn:close_after_flush([reason])
+**
+** Shut down once everything queued -- including the rest of a file response --
+** has reached the socket. close() drops it instead, which on a
+** `Connection: close` fetch throws away the tail of the body. */
+static int l_tls_close_after_flush(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    const char* reason = luaL_optstring(L, 2, "close_after_flush");
+    if (!c || c->closed || c->fd == INVALID_SOCKET_VAL) {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    c->close_after_flush = true;
+    snprintf(c->close_reason, sizeof(c->close_reason), "%s", reason);
+
+    tls_flush_output(c);
+    if (!c->closed && (c->outlen > 0 || tls_has_pending_file(c))) {
+        if (tls_arm_write(c) != 0) {
+            tls_close_internal(c, "poll_error", true);
+            lua_pushboolean(L, 0);
+            return 1;
+        }
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* conn:pause_read() / conn:resume_read() / conn:is_read_paused()
+**
+** The backpressure a handler needs when it is copying this connection into
+** something slower. Reads stop at the poll level, so the peer's own send
+** blocks once the socket buffer fills. */
+static int l_tls_pause_read(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    if (c && !c->closed && !c->read_paused) {
+        c->read_paused = true;
+        if (c->fd != INVALID_SOCKET_VAL) xpoll_del_event(c->fd, XPOLL_READABLE);
+    }
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int l_tls_resume_read(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    if (c && !c->closed && c->read_paused) {
+        c->read_paused = false;
+        /* Drain what is already decrypted before re-arming. mbedtls can be
+        ** holding whole records of its own, and a level-triggered poll will
+        ** not report a socket that has nothing left on it -- so a handler that
+        ** waited for the poll would wait forever. The handler may pause us
+        ** again from in there; honour that. */
+        tls_process_input(c);
+        if (!c->closed && !c->read_paused) {
+            if (tls_arm_read(c) != 0) {
+                tls_close_internal(c, "poll_error", true);
+            } else {
+                tls_read_plain(c);
+            }
+        }
+    }
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+static int l_tls_is_read_paused(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    lua_pushboolean(L, (c && !c->closed && c->read_paused) ? 1 : 0);
+    return 1;
+}
+
+/* conn:stats() -> send_buffered, recv_buffered, bytes_sent, bytes_recv
+**
+** send_buffered counts the unsent tail of a file response too: it is meant to
+** answer "how far behind is the socket", and a caller pacing itself against it
+** would otherwise see zero while megabytes were still to go. */
+static int l_tls_stats(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    size_t send_buf = 0, recv_buf = 0;
+    uint64_t sent = 0, recv = 0;
+    if (c && !c->closed) {
+        send_buf = c->outlen;
+        if (c->file_remaining > 0) send_buf += (size_t)c->file_remaining;
+        recv_buf = c->inlen;
+        sent = c->bytes_sent;
+        recv = c->bytes_recv;
+    }
+    lua_pushinteger(L, (lua_Integer)send_buf);
+    lua_pushinteger(L, (lua_Integer)recv_buf);
+    lua_pushinteger(L, (lua_Integer)sent);
+    lua_pushinteger(L, (lua_Integer)recv);
+    return 4;
+}
+
+/* conn:set_max_send(bytes) -- raise or lower this connection's queue cap. */
+static int l_tls_set_max_send(lua_State* L) {
+    LuaTlsConn* c = check_tls_conn(L, 1);
+    lua_Integer max = luaL_checkinteger(L, 2);
+    luaL_argcheck(L, max >= 0, 2, "max must not be negative");
+    if (c && !c->closed) c->max_send = (size_t)max;
+    lua_pushvalue(L, 1);
+    return 1;
+}
+
+/* conn:send_file_response(header, path [, offset [, length]])
+**
+** Queues the header and then streams the file as the socket drains, one chunk
+** at a time through the record layer. It returns once the response has been
+** ACCEPTED, not once it has been sent: the file stays open in C until the last
+** byte is out, so a caller that staged the body in a scratch directory must
+** not delete it on return. Same contract as the plaintext channel's.
+**
+** It used to push the whole file into the send queue in one synchronous loop.
+** Everything past max_send was refused, the loop gave up, and the connection
+** was left open holding a truncated body -- so a response larger than the
+** queue cap did not fail, it hung, and the client waited for bytes that were
+** never coming. */
 static int l_tls_send_file_response(lua_State* L) {
     LuaTlsConn* c = check_tls_conn(L, 1);
     size_t header_len = 0;
@@ -1148,6 +1387,11 @@ static int l_tls_send_file_response(lua_State* L) {
     long long offset = (long long)offset_arg;
     long long length = (long long)length_arg;
     if (offset < 0) offset = 0;
+
+    if (!c || c->closed || c->fd == INVALID_SOCKET_VAL ||
+        tls_has_pending_file(c) || c->close_after_flush) {
+        return push_tls_send_result(L, c, -1);
+    }
 
     FILE* fp = fopen(path, "rb");
     if (!fp) {
@@ -1193,34 +1437,28 @@ static int l_tls_send_file_response(lua_State* L) {
         return 2;
     }
 
-    int send_rc = tls_send_raw_c(c, header, header_len);
-    int ok = send_rc == 0;
-    char buf[64 * 1024];
-    while (ok && length > 0 && !c->closed) {
-        size_t want = length > (long long)sizeof(buf)
-            ? sizeof(buf)
-            : (size_t)length;
-        size_t got = fread(buf, 1, want, fp);
-        if (got == 0) {
-            ok = feof(fp) && length == 0;
-            if (!ok) tls_close_internal(c, "tls_file_read_error", true);
-            break;
-        }
-        send_rc = tls_send_raw_c(c, buf, got);
-        if (send_rc != 0) {
-            ok = 0;
-            break;
-        }
-        length -= (long long)got;
+    if (header_len > 0 &&
+        !tls_append(&c->outbuf, &c->outlen, &c->outcap, header, header_len)) {
+        fclose(fp);
+        tls_close_internal(c, "out_of_memory", true);
+        return push_tls_send_result(L, c, -1);
     }
 
-    fclose(fp);
-    if (ok && !c->closed) {
-        lua_pushboolean(L, 1);
-        return 1;
+    if (length > 0) {
+        c->file_fp = fp;
+        c->file_remaining = length;
+    } else {
+        fclose(fp);                 /* header-only response, e.g. an empty body */
     }
-    if (send_rc == 0) send_rc = -1;
-    return push_tls_send_result(L, c, send_rc);
+
+    tls_flush_output(c);
+    if (!c->closed && (c->outlen > 0 || tls_has_pending_file(c))) {
+        if (tls_arm_write(c) != 0) {
+            tls_close_internal(c, "poll_error", true);
+            return push_tls_send_result(L, c, -1);
+        }
+    }
+    return push_tls_send_result(L, c, c->closed ? -1 : 0);
 }
 
 static int l_tls_send(lua_State* L) {
@@ -1274,12 +1512,18 @@ static const luaL_Reg tls_methods[] = {
     { "peer_cert_subject", l_tls_peer_cert_subject },
     { "is_closed",   l_tls_is_closed },
     { "close",       l_tls_close },
+    { "close_after_flush", l_tls_close_after_flush },
     { "send",        l_tls_send },
     { "send_raw",    l_tls_send_raw },
     { "send_packet", l_tls_send_raw },
     { "send_file_response", l_tls_send_file_response },
     { "set_handler", l_tls_set_handler },
     { "set_framing", l_tls_set_framing },
+    { "pause_read",     l_tls_pause_read },
+    { "resume_read",    l_tls_resume_read },
+    { "is_read_paused", l_tls_is_read_paused },
+    { "stats",          l_tls_stats },
+    { "set_max_send",   l_tls_set_max_send },
     { NULL, NULL }
 };
 

@@ -401,7 +401,11 @@ function tls_connection:send_raw(data) end
 ---@return string? err Failure reason. / 失败原因。
 function tls_connection:send_packet(data) end
 
----Send a header then a file body over TLS. / 通过 TLS 发送头部再发送文件内容。
+---Send a header then a file body over TLS. Returns once the response is
+---ACCEPTED, not once it has been sent: the file stays open until it drains, so
+---the caller must not delete it on return.
+---通过 TLS 发送头部再发送文件内容。返回表示"已受理"而非"已发完"：文件在发送
+---完成前一直保持打开，调用方不得在返回后删除它。
 ---@param header string Bytes written before the file. / 文件之前写入的字节。
 ---@param path string File path to stream. / 要流式发送的文件路径。
 ---@param offset? integer Start offset, defaults to 0. / 起始偏移，默认 0。
@@ -409,6 +413,39 @@ function tls_connection:send_packet(data) end
 ---@return boolean ok True on success; false + reason otherwise. / 成功返回 true；否则返回 false + 原因。
 ---@return string? err Failure reason. / 失败原因。
 function tls_connection:send_file_response(header, path, offset, length) end
+
+---Close once everything queued -- including the rest of a file response -- has
+---reached the socket. close() drops it instead.
+---在已排队的数据（含文件响应的剩余部分）全部送达 socket 后关闭；close() 则会直接丢弃。
+---@param reason? string Reason passed to on_close. / 传给 on_close 的原因。
+---@return boolean ok True when the deferred close was armed. / 成功登记延迟关闭时返回 true。
+function tls_connection:close_after_flush(reason) end
+
+---Stop reading from this connection, so the peer's own send blocks once the
+---socket buffer fills. / 暂停读取，使对端在 socket 缓冲写满后自行阻塞。
+---@return xnet.tls_connection self The connection, for chaining. / 连接本身，便于链式调用。
+function tls_connection:pause_read() end
+
+---Resume reading, flushing anything already decrypted first.
+---恢复读取，并先把已解密的数据交给 handler。
+---@return xnet.tls_connection self The connection, for chaining. / 连接本身，便于链式调用。
+function tls_connection:resume_read() end
+
+---@return boolean paused True while reads are paused. / 读取处于暂停状态时为 true。
+function tls_connection:is_read_paused() end
+
+---Buffer occupancy and byte counters. send_buffered includes the unsent tail of
+---a file response. / 缓冲占用与字节计数；send_buffered 含文件响应尚未发出的部分。
+---@return integer send_buffered Bytes queued for the socket. / 待发送字节数。
+---@return integer recv_buffered Bytes received but not consumed. / 已收到但未消费的字节数。
+---@return integer bytes_sent Total bytes sent. / 累计发送字节数。
+---@return integer bytes_recv Total bytes received. / 累计接收字节数。
+function tls_connection:stats() end
+
+---Raise or lower this connection's send-queue cap. / 调整本连接的发送队列上限。
+---@param max integer Cap in bytes; 0 disables it. / 上限字节数，0 表示不限制。
+---@return xnet.tls_connection self The connection, for chaining. / 连接本身，便于链式调用。
+function tls_connection:set_max_send(max) end
 
 ---Replace the handler callback table. / 替换 handler 回调表。
 ---@param handler xnet.handler New callback table. / 新的回调表。
