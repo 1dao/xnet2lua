@@ -47,7 +47,7 @@ local skills    = require('xagent.skills')
 local open_url  = require('xagent.ui.open_url')
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
-local FONT_SIZE = 22
+local FONT_SIZE = 16
 
 -- Starting per-turn output cap. A bigger cap is free — you only pay for tokens
 -- actually produced — but a TOO-SMALL cap silently breaks big outputs: an
@@ -1370,7 +1370,8 @@ local function __init()
 
     raygui.init(960, 700, 'xagent')
     -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
-    if not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
+    if not raygui.load_system_font(FONT_SIZE, preseed_charset()) and
+       not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
         raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE)
     end
 
