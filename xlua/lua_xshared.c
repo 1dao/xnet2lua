@@ -195,9 +195,10 @@ static int l_stats(lua_State *L) {
     return 1;
 }
 
-/* xshared.create(name [, size_bytes=1MB [, nshards=8]]) -> dict
-** Idempotent at boot: a second create of the same name returns the existing
-** dict (so re-running a main script does not error). */
+/* xshared.create(name [, size_bytes=1MB [, nshards=8]]) -> dict, created
+** Idempotent and thread-safe: callable from any thread at any time, and a second
+** create of the same name returns the existing dict. `created` is true only for
+** the caller that actually built it. Names are module_function, lowercase. */
 static int l_create(lua_State *L) {
     const char *name = luaL_checkstring(L, 1);
     lua_Integer size    = luaL_optinteger(L, 2, 1024 * 1024);
@@ -205,23 +206,29 @@ static int l_create(lua_State *L) {
     if (size <= 0)    return luaL_error(L, "xshared.create: size must be > 0");
     if (nshards <= 0) nshards = 8;
 
-    xshared_dict_t *d = xshared_create(name, (size_t)size, (uint32_t)nshards);
-    if (!d) {
-        d = xshared_get_dict(name);                 /* already existed */
-        if (!d) return luaL_error(L, "xshared.create('%s') failed", name);
-    }
+    /* Get-or-create: any thread, any time, and concurrent callers of the same
+    ** name all get the one dict. `created` tells this caller whether it was the
+    ** one that built it -- the only way to notice that size/nshards were ignored
+    ** because someone else got there first. */
+    int created = 0;
+    xshared_dict_t *d = xshared_get_or_create(name, (size_t)size,
+                                              (uint32_t)nshards, &created);
+    if (!d)
+        return luaL_error(L, "xshared.create('%s') failed: name must be "
+            "module_function in lowercase (e.g. 'proc_scratch'), 3-64 chars", name);
     push_dict(L, d);
-    return 1;
+    lua_pushboolean(L, created);
+    return 2;
 }
 
-/* xshared.dict(name) -> dict  (errors if not created at boot) */
+/* xshared.dict(name) -> dict  (errors if the name was never created) */
 static int l_dict(lua_State *L) {
     const char *name = luaL_checkstring(L, 1);
     xshared_dict_t *d = xshared_get_dict(name);
     if (!d)
         return luaL_error(L,
-            "xshared dict '%s' not created (call xshared.create in the main "
-            "thread before workers spawn)", name);
+            "xshared dict '%s' does not exist (use xshared.create to make it; "
+            "it may be called from any thread)", name);
     push_dict(L, d);
     return 1;
 }

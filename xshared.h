@@ -41,10 +41,24 @@ extern "C" {
  * materialize into Lua OUTSIDE every lock, and NO call ever returns a pointer
  * into live shared memory (string reads hand back an owned copy).
  *
- * LIFECYCLE: create every dict from the MAIN thread, before workers spawn, via
- * xshared_create(). Workers resolve it by name with xshared_get_dict(). The
- * name->dict registry is thus written once at boot and never mutated
- * concurrently, so it needs no lock of its own.
+ * LIFECYCLE: the host calls xshared_init() once, on the MAIN thread, before any
+ * worker spawns; xshared_shutdown() once at exit, after every worker is joined.
+ * Between those two points a dict may be created from ANY thread, at any time,
+ * with xshared_get_or_create() -- so a module can own its shared state instead
+ * of requiring a line of boot wiring in the host's main(). Concurrent callers of
+ * the same name are safe: find and create sit in one critical section, so
+ * exactly one of them builds the dict and both get that one.
+ *
+ * NOBODY FREES A DICT. There is no per-dict destroy; xshared_shutdown() reclaims
+ * all of them at the end. The registry is therefore append-only for the whole
+ * life of the process, which is what makes its lock cheap: a dict pointer, once
+ * obtained, stays valid forever, so the lock guards only the name->dict list and
+ * never appears on a per-key path (get/set/incr take just their shard's lock).
+ *
+ * NAMES are module_function, lowercase: ^[a-z][a-z0-9]*_[a-z0-9_]+$, enforced.
+ * One flat namespace is shared by every module in the process, and with lazy
+ * creation a typo would otherwise produce a silent SECOND dict rather than an
+ * error -- leaving each thread with its own slice of what should be shared.
  *
  * SCOPE BOUNDARY: this is shared memory within ONE process. It replaces the
  * "each thread keeps its own count + hand-rolled inter-thread sync" layer, NOT
@@ -93,21 +107,40 @@ typedef enum {
 
 typedef struct xshared_dict xshared_dict_t;
 
-/* ---- registry / lifecycle (MAIN thread, at boot) ----------------------- */
+/* ---- registry / lifecycle ---------------------------------------------- */
 
-/* Frees every registered dict; call once at process exit. The registry needs no
-** explicit init -- it is a zero-initialised static, populated by xshared_create. */
+/* Initialise the registry lock. MAIN thread, before any worker spawns.
+** Idempotent. Required: xMutex has no portable static initialiser, so without
+** this the registry is only safe to touch single-threaded. */
+void xshared_init(void);
+
+/* Frees every registered dict; call once at process exit, after every worker has
+** been joined. No other teardown path exists -- see NOBODY FREES A DICT above. */
 void xshared_shutdown(void);
 
-/* Create a named dict. budget_bytes is the TOTAL memory ceiling (split across
-** shards); nshards is rounded up to a power of two and should be >= ~2x the
-** worker-thread count (e.g. 16/32). Returns NULL on OOM or duplicate name. */
+/* Get the named dict, creating it if this is the first caller. Any thread, any
+** time. budget_bytes is the TOTAL memory ceiling (split across shards); nshards
+** is rounded up to a power of two and should be >= ~2x the worker-thread count
+** (e.g. 16/32).
+**
+** `created` (optional) reports whether THIS call built it. Worth checking when
+** the size matters: the losing caller's budget_bytes/nshards are ignored, since
+** the dict already exists with whoever-got-there-first's configuration.
+**
+** NULL on OOM, on budget_bytes == 0, or on a name that is not module_function. */
+xshared_dict_t *xshared_get_or_create(const char *name,
+                                      size_t      budget_bytes,
+                                      uint32_t    nshards,
+                                      int        *created);
+
+/* Strict create: NULL if the name already exists (as well as on OOM / bad name).
+** Prefer xshared_get_or_create() unless "I must be the one who creates this" is
+** genuinely the contract you want to assert. */
 xshared_dict_t *xshared_create(const char *name,
                                size_t      budget_bytes,
                                uint32_t    nshards);
 
-/* Resolve a dict created at boot. NULL if the name was never created. Safe to
-** call from any thread (registry is read-only after boot). */
+/* Resolve an existing dict. NULL if the name was never created. Any thread. */
 xshared_dict_t *xshared_get_dict(const char *name);
 
 /* ---- core operations (any thread) -------------------------------------- */

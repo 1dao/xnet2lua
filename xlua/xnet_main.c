@@ -96,9 +96,12 @@ LUA_API int luaopen_xrecord(lua_State *L);
 LUA_API int luaopen_xproc(lua_State *L);
 #endif
 
-/* xshared registry lifecycle (xshared.c) -- dicts are created from Lua at boot
-** and live in a process-global registry; free them once at shutdown.
+/* xshared registry lifecycle (xshared.c) -- dicts live in a process-global
+** registry and may be created from any thread, so the registry lock must exist
+** before the first one spawns: xshared_init() up front, xshared_shutdown() once
+** at the end to free them all.
 ** xshared_tick() is the main-thread expiry sweep (self-throttled). */
+void xshared_init(void);
 void xshared_shutdown(void);
 void xshared_tick(void);
 
@@ -565,6 +568,11 @@ int main(int argc, char** argv) {
             xlog_set_max_file_bytes((unsigned long long)log_mb * 1024ull * 1024ull);
         }
     }
+
+    /* Before xthread_init: from here on a worker may exist, and a worker may
+    ** create a shared dict, so the registry lock has to be up first. Paired with
+    ** xshared_shutdown() next to xthread_uninit() below. */
+    xshared_init();
 
     if (!xthread_init()) {
         xloge("[xnet] xthread_init failed");

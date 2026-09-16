@@ -9,10 +9,12 @@
 ** entry is ONE allocation: header + key bytes + (string) value bytes, so keys
 ** are binary-safe and there is no per-entry strdup/value double-alloc.
 **
-** Concurrency contract (see header): every dict is created from the MAIN thread
-** at boot, before workers spawn. The name->dict registry is therefore written
-** once and read lock-free afterwards (thread creation establishes the
-** happens-before). Per-key operations take only the owning shard's lock.
+** Concurrency contract (see header): a dict may be created from any thread at
+** any time, so the name->dict registry is guarded by one process-global lock
+** taken only on create and resolve. Nothing is ever removed from it before
+** xshared_shutdown(), which is what keeps that lock off every hot path: a dict
+** pointer stays valid for the life of the process, and per-key operations take
+** only the owning shard's lock.
 */
 
 #include "xshared.h"     /* pulls xmacro.h -> malloc/free/strdup via rpmalloc */
@@ -24,6 +26,7 @@
 /* ---- tunables ---------------------------------------------------------- */
 #define XSHARED_INIT_BUCKETS  16u      /* per-shard, grows on load factor > 1 */
 #define XSHARED_MAX_SHARDS    1024u
+#define XSHARED_MAX_NAME      64u      /* dict name, see name_valid() */
 #define XSHARED_FNV64_BASIS   1469598103934665603ULL
 #define XSHARED_FNV64_PRIME   1099511628211ULL
 #define XSHARED_SWEEP_INTERVAL_MS 10000  /* main-thread sweep cadence (tune 5k-30k) */
@@ -76,13 +79,42 @@ struct xshared_dict {
     size_t   sweep_bucket;
 };
 
-/* ---- registry (boot-time only; read lock-free afterwards) -------------- */
+/* ---- registry ----------------------------------------------------------
+** Name -> dict, guarded by one process-global lock.
+**
+** APPEND-ONLY: nodes are linked on create and freed only by xshared_shutdown(),
+** after every worker has been joined. That single invariant is what keeps this
+** lock cheap. A dict pointer obtained under g_reg_lock stays valid for the life
+** of the process, so the lock protects the LIST STRUCTURE and nothing else --
+** per-key operations (get/set/incr) go through the dict pointer and their own
+** shard locks, and never touch it. The lock is taken a handful of times per
+** process (once per create, once per resolve), never on a hot path.
+**
+** It also means a published node's ->dict and ->next are immutable, which is why
+** xshared_tick() below can read the head under the lock and then walk the rest
+** without holding it. */
 typedef struct reg_node {
     xshared_dict_t  *dict;
     struct reg_node *next;
 } reg_node;
 
-static reg_node *g_registry = NULL;
+static reg_node *g_registry  = NULL;
+static xMutex    g_reg_lock;
+static int       g_reg_ready = 0;
+
+/* xMutex has no portable static initialiser (CRITICAL_SECTION on Windows, a
+** RECURSIVE pthread_mutex_t elsewhere), so the lock needs a real init call --
+** see xshared_init(), which the host runs before any worker spawns. The guard
+** keeps a host that never calls it usable single-threaded instead of locking an
+** uninitialised CRITICAL_SECTION. */
+static inline void reg_lock(void)   { if (g_reg_ready) xnet_mutex_lock(&g_reg_lock); }
+static inline void reg_unlock(void) { if (g_reg_ready) xnet_mutex_unlock(&g_reg_lock); }
+
+void xshared_init(void) {
+    if (g_reg_ready) return;          /* idempotent; MAIN-only, before workers */
+    xnet_mutex_init(&g_reg_lock);
+    g_reg_ready = 1;
+}
 
 /* ---- helpers ----------------------------------------------------------- */
 
@@ -470,16 +502,31 @@ static size_t sweep_expired(xshared_dict_t *d, size_t budget) {
 ** self-throttled to XSHARED_SWEEP_INTERVAL_MS and then sweeps expired keys from
 ** every registered dict. This is the single coarse "reaper" that replaces a
 ** per-key timer: lazy expiry already keeps expired values unobservable, so all
-** this does is reclaim the memory of keys nobody touches again. g_registry is
-** only ever mutated at boot (on this same main thread), so reading it here needs
-** no lock; flush_expired takes each shard's lock for the actual scan. */
+** this does is reclaim the memory of keys nobody touches again.
+**
+** REGISTRY ACCESS: g_registry can now be mutated by any thread (a worker calling
+** xshared_get_or_create), so the head is read under g_reg_lock. The rest of the
+** walk needs no lock: a node is fully written before it is published as the new
+** head, and nothing is ever unlinked or freed before xshared_shutdown, so every
+** ->next reachable from the head we just read is immutable. Nodes prepended
+** after that read simply wait for the next tick.
+**
+** The lock is released BEFORE sweeping. A sweep is bounded but not free
+** (XSHARED_SWEEP_BUDGET entries per dict), and holding the registry lock across
+** it would park any worker trying to create a dict for the whole pass.
+** flush_expired takes each shard's lock for the actual scan. */
 void xshared_tick(void) {
     static int64_t last_sweep_ms = 0;
     int64_t now = now_ms();
     if (last_sweep_ms == 0) { last_sweep_ms = now; return; }   /* defer first sweep */
     if (now - last_sweep_ms < XSHARED_SWEEP_INTERVAL_MS) return;
     last_sweep_ms = now;
-    for (reg_node *n = g_registry; n; n = n->next) {
+
+    reg_lock();
+    reg_node *n = g_registry;
+    reg_unlock();
+
+    for (; n; n = n->next) {
         sweep_expired(n->dict, XSHARED_SWEEP_BUDGET);  /* bounded, cursor-resumed */
     }
 }
@@ -500,21 +547,56 @@ void xshared_stats(xshared_dict_t *d, xshared_stats_t *out) {
     }
 }
 
-/* ---- registry / lifecycle (MAIN thread, at boot) ----------------------- */
+/* ---- registry / lifecycle (any thread) --------------------------------- */
 
-xshared_dict_t *xshared_get_dict(const char *name) {
-    if (!name) return NULL;
+/* module_function, lowercase. Enforced, not merely documented: one flat
+** process-global namespace is shared by every module, and now that a dict can be
+** created lazily from any thread, a typo no longer fails loudly -- it silently
+** creates a SECOND dict, and each thread then sees only its own slice of what
+** was supposed to be shared state. That is precisely the bug this module exists
+** to prevent, so the convention is a startup error instead of a comment.
+** Grammar: ^[a-z][a-z0-9]*_[a-z0-9_]+$ */
+static int name_valid(const char *name) {
+    if (!name) return 0;
+    size_t n = strlen(name);
+    if (n < 3 || n > XSHARED_MAX_NAME) return 0;
+    if (name[0] < 'a' || name[0] > 'z') return 0;      /* also rules out a leading _ */
+    if (name[n - 1] == '_') return 0;
+    int has_sep = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = name[i];
+        if (c == '_') { has_sep = 1; continue; }
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) continue;
+        return 0;
+    }
+    return has_sep;
+}
+
+/* Caller holds g_reg_lock. */
+static xshared_dict_t *find_locked(const char *name) {
     for (reg_node *n = g_registry; n; n = n->next) {
         if (strcmp(n->dict->name, name) == 0) return n->dict;
     }
     return NULL;
 }
 
-xshared_dict_t *xshared_create(const char *name, size_t budget_bytes,
-                               uint32_t nshards) {
-    if (!name || budget_bytes == 0) return NULL;
-    if (xshared_get_dict(name)) return NULL;   /* duplicate */
+xshared_dict_t *xshared_get_dict(const char *name) {
+    if (!name) return NULL;
+    reg_lock();
+    xshared_dict_t *d = find_locked(name);
+    reg_unlock();
+    return d;
+}
 
+/* Build and link one dict. Caller holds g_reg_lock, and holds it across the
+** WHOLE construction on purpose. Building outside the lock and re-checking on
+** the way in would mean handling "someone else won the race, destroy what I just
+** built" -- a dict that is created and immediately freed, a lifecycle branch
+** that otherwise does not exist here. Construction is a few dozen small callocs
+** and happens a handful of times per process, so paying for it under the lock
+** buys that entire error path away. */
+static xshared_dict_t *create_locked(const char *name, size_t budget_bytes,
+                                     uint32_t nshards) {
     if (nshards == 0) nshards = 8;
     nshards = next_pow2_u32(nshards);
     if (nshards > XSHARED_MAX_SHARDS) nshards = XSHARED_MAX_SHARDS;
@@ -562,6 +644,37 @@ xshared_dict_t *xshared_create(const char *name, size_t budget_bytes,
     return d;
 }
 
+/* Get-or-create, atomically. The find and the create sit in ONE critical
+** section: that is the whole point. A lock that covered only the lookup, or only
+** the link, would leave the original race untouched -- two threads would both
+** look, both miss, both build, and each would walk away holding a DIFFERENT dict
+** for the same name (with one of them unreachable and leaked).
+**
+** created (optional) distinguishes "I made it" from "it was already there",
+** which is the only way a caller can notice that its budget_bytes/nshards were
+** ignored because someone else created the dict first. */
+xshared_dict_t *xshared_get_or_create(const char *name, size_t budget_bytes,
+                                      uint32_t nshards, int *created) {
+    if (created) *created = 0;
+    if (!name || budget_bytes == 0 || !name_valid(name)) return NULL;
+
+    reg_lock();
+    xshared_dict_t *d = find_locked(name);
+    if (!d) {
+        d = create_locked(name, budget_bytes, nshards);
+        if (d && created) *created = 1;
+    }
+    reg_unlock();
+    return d;
+}
+
+xshared_dict_t *xshared_create(const char *name, size_t budget_bytes,
+                               uint32_t nshards) {
+    int created = 0;
+    xshared_dict_t *d = xshared_get_or_create(name, budget_bytes, nshards, &created);
+    return created ? d : NULL;          /* unchanged contract: NULL on duplicate */
+}
+
 static void dict_free(xshared_dict_t *d) {
     if (!d) return;
     for (uint32_t si = 0; si < d->nshards; si++) {
@@ -578,13 +691,25 @@ static void dict_free(xshared_dict_t *d) {
     free(d);
 }
 
+/* MAIN thread, once, after every worker has been joined -- which is the whole
+** ownership rule for shared dicts: no thread ever frees one, they are all
+** reclaimed here. That is what lets a dict pointer handed out under g_reg_lock
+** stay valid forever, and therefore what lets the lock guard the list alone. */
 void xshared_shutdown(void) {
+    reg_lock();
     reg_node *n = g_registry;
     g_registry = NULL;
+    reg_unlock();
+
     while (n) {
         reg_node *nx = n->next;
         dict_free(n->dict);
         free(n);
         n = nx;
+    }
+
+    if (g_reg_ready) {              /* workers are joined; nobody can be waiting */
+        g_reg_ready = 0;
+        xnet_mutex_uninit(&g_reg_lock);
     }
 }

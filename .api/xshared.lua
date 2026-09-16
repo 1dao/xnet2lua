@@ -18,10 +18,20 @@ do return end
 -- nonce、熔断开关、封禁名单、会话令牌、单飞锁。仅限进程内，不是 Redis。值刻意限定
 -- 为标量（数字/布尔/字符串），原生存储、热路径零解码；表不在范围内。
 --
--- Lifecycle: create dicts from the MAIN thread at boot, then resolve them from
--- any thread. TTL reclamation is the runtime's job (no flush_* is exposed).
--- 生命周期：在 MAIN 线程启动时创建字典，随后任意线程都可解析使用。TTL 回收由运行时
--- 负责（不暴露 flush_* 接口）。
+-- Lifecycle: create a dict from ANY thread, at any time -- concurrent creates of
+-- one name are safe and all get the same dict, so a module can own its shared
+-- state without boot wiring. No thread ever frees a dict; the runtime reclaims
+-- them all at process exit. TTL reclamation is also the runtime's job (no
+-- flush_* is exposed).
+-- 生命周期：可在任意线程、任意时刻创建字典——同名并发创建是安全的，所有调用方拿到的
+-- 是同一个字典，因此模块可以自己持有共享状态而无需在启动脚本里接线。任何线程都不释放
+-- 字典，运行时在进程退出时统一回收。TTL 回收同样由运行时负责（不暴露 flush_* 接口）。
+--
+-- Names: module_function, lowercase (^[a-z][a-z0-9]*_[a-z0-9_]+$, 3-64 chars),
+-- enforced -- one flat namespace is shared by every module, and a typo would
+-- otherwise silently create a SECOND dict instead of failing.
+-- 命名：module_function 小写（^[a-z][a-z0-9]*_[a-z0-9_]+$，3-64 字符），强制校验——
+-- 所有模块共享同一个扁平命名空间，拼写错误否则会静默创建出第二个字典而不是报错。
 
 ---@class xshared
 local xshared = {}
@@ -102,23 +112,29 @@ function dict:stats() end
 
 -- Module functions / 模块函数
 
----Create (or fetch, if already created) a shared dict. Call at boot from MAIN.
----创建（若已创建则获取）一个共享字典。应在 MAIN 线程启动时调用。
----Idempotent: a second create of the same name returns the existing dict, so
----re-running a main script does not error. The dict enforces a hard byte budget
----with LRU eviction per shard.
----幂等：对同名再次创建会返回既有字典，因此重跑主脚本不会报错。字典按分片以 LRU
----淘汰强制执行字节上限。
----@param name string Unique dict name. / 唯一的字典名称。
+---Get the named shared dict, creating it if this is the first caller.
+---获取指定名称的共享字典；若是第一个调用者则创建它。
+---Any thread, any time. Concurrent callers of one name are safe: exactly one of
+---them builds the dict and all of them get it. The dict enforces a hard byte
+---budget with LRU eviction per shard.
+---任意线程、任意时刻均可调用。同名并发调用是安全的：恰好一个调用者创建字典，所有
+---调用者拿到的都是它。字典按分片以 LRU 淘汰强制执行字节上限。
+---If `created` is false, size_bytes/nshards were ignored -- the dict already
+---existed with the first creator's configuration.
+---若 created 为 false，则 size_bytes/nshards 被忽略——字典已按第一个创建者的配置存在。
+---@param name string module_function, lowercase, e.g. "proc_scratch"; errors otherwise. / module_function 小写，如 "proc_scratch"；否则报错。
 ---@param size_bytes? integer Total byte budget, defaults to 1 MiB. / 总字节预算，默认 1 MiB。
 ---@param nshards? integer Shard count (more shards = less contention), defaults to 8. / 分片数（越多争用越少），默认 8。
 ---@return xshared.dict dict The shared dict handle. / 共享字典句柄。
+---@return boolean created True only for the caller that built the dict. / 仅对实际创建字典的调用者为 true。
 function xshared.create(name, size_bytes, nshards) end
 
 ---Resolve an existing shared dict by name.
 ---按名称解析一个已创建的共享字典。
----Errors if the dict was not created (create it in MAIN before workers spawn).
----若字典尚未创建则报错（请在工作线程启动前于 MAIN 中创建）。
+---Errors if the dict does not exist. Prefer xshared.create, which is safe from
+---any thread and never errors on an existing name.
+---若字典不存在则报错。优先使用 xshared.create——它在任意线程都安全，且对已存在的
+---名称不会报错。
 ---@param name string Dict name passed to xshared.create. / 传给 xshared.create 的字典名称。
 ---@return xshared.dict dict The shared dict handle. / 共享字典句柄。
 function xshared.dict(name) end
