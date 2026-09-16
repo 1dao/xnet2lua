@@ -6,6 +6,7 @@
 package.path = 'scripts/?.lua;' .. package.path
 
 local router        = dofile('scripts/core/share/xrouter.lua')
+local xutils        = require('xutils')
 local config        = require('xagent.config')
 local registry      = require('xagent.tools.registry')
 local system_prompt = require('xagent.context.system_prompt')
@@ -16,7 +17,6 @@ local session       = require('xagent.session.session')
 registry.register(require('xagent.tools.read'))
 registry.register(require('xagent.tools.bash'))
 
-local IS_WIN = (package.config:sub(1, 1) == '\\')
 local function out(s) io.write(s); io.flush() end
 
 local function printer(ev)
@@ -35,8 +35,7 @@ local function __init()
     assert(subprocess.setup())
 
     local co = coroutine.create(function()
-        local r = subprocess.run({ cmd = IS_WIN and 'cd' or 'pwd' })
-        local cwd = (r.stdout or '.'):gsub('%s+$', '')
+        local cwd = xutils.cwd() or '.'
         local pmd, pmd_path = project_md.load(cwd)
         local sys = system_prompt.build({ cwd = cwd, project_md = pmd })
 
@@ -79,5 +78,9 @@ return {
     __tick_ms = 10,
     __thread_handle = router.handle,
     __init = __init,
-    __uninit = function() if xnet and xnet.uninit then xnet.uninit() end end,
+    __uninit = function()
+        -- Join the process workers while this state is still alive (see xproc.shutdown).
+        subprocess.shutdown()
+        if xnet and xnet.uninit then xnet.uninit() end
+    end,
 }

@@ -2,10 +2,24 @@
 --
 -- NOT the module you get from require('xproc'). That name belongs to the C
 -- binding (xproc.c / xlua/lua_xproc.c), which has real pollable pipes but is
--- compiled in only with WITH_XPROC=1 and so is absent from a stock bin/xnet.
--- This file is the pure-Lua fallback that works on any build: the same job done
--- by blocking os.execute on a worker thread instead of by pipes on the event
--- loop. Load it by path with dofile, never with require.
+-- compiled in only with WITH_XPROC=1 (off by default, so a stock bin/xnet lacks
+-- it) and is POSIX-only even then: xproc.supported() returns false on Windows
+-- and spawn() always fails there.
+-- This file is the portable path that works on any build and any platform: the
+-- same job done by blocking os.execute on a worker thread instead of by pipes on
+-- the event loop. Load it by path with dofile, never with require.
+--
+-- REBUILDING bin/xnet WITH THE C BINDING. WITH_XPROC defaults to 0 and build.bat
+-- (MSVC) has no switch for it, so it must come from the Makefile:
+--     mingw32-make -j16 WITH_XPROC=1 xnet     # Windows  -> bin/xnet.exe
+--     make -j16 WITH_XPROC=1 xnet             # Linux    -> bin/xnet
+-- Keep HTTPS on: anything that talks to a TLS endpoint (xagent's LLM calls,
+-- among others) breaks on a nohttps / WITH_HTTPS=0 build.
+--
+-- Because dofile does not cache, each dofile() call yields an INDEPENDENT pool
+-- with its own state. That is deliberate: a caller that needs a lane nothing
+-- else can occupy (xagent's UI lane in xagent/proc/subprocess.lua, for one) just
+-- sets up a second instance on its own thread ids.
 --
 -- Pairs with xproc_worker.lua. setup() spawns N worker threads once at boot;
 -- exec() dispatches one command to the least-busy worker over a coroutine RPC,
@@ -25,8 +39,9 @@
 -- WHY A POOL AND NOT ONE WORKER
 -- One worker runs one os.execute at a time and blocks for its whole duration. A
 -- single worker would serialise every concurrent request behind the slowest
--- child (a big clone, say). Workers are picked by least-outstanding-calls, so a
--- long-running command parks on one thread and short ones flow around it.
+-- child (a large clone, a test suite, a dialog waiting on a person). Workers are
+-- picked by least-outstanding-calls, so a long-running command parks on one
+-- thread and short ones flow around it.
 
 local M = {}
 
@@ -86,6 +101,25 @@ end
 function M.running() return started end
 function M.size()    return #pool end
 
+-- Join every worker in this pool. MAIN state, from the entry script's __uninit.
+--
+-- WHY IT EXISTS: at exit the runner closes the main Lua state -- which owns each
+-- worker's ThreadData -- BEFORE xthread_uninit() joins whatever threads remain.
+-- A worker still alive in that gap can run one more update tick against freed
+-- memory: an intermittent segfault on exit, likelier the more workers a pool
+-- holds. Calling this from __uninit performs the very join the runtime would do
+-- anyway, only while the state is still valid. It adds no blocking of its own: a
+-- worker still inside os.execute is waited for either way.
+--
+-- No RPC, so not coroutine-only. Idempotent; the pool can be set up again after.
+function M.shutdown()
+    for _, w in ipairs(pool) do
+        xthread.shutdown_thread(w.tid)
+    end
+    pool = {}
+    started = false
+end
+
 -- ---------------------------------------------------------------------------
 -- exec
 -- ---------------------------------------------------------------------------
@@ -100,7 +134,8 @@ end
 
 -- Run one command. Coroutine-only. See xproc_worker.lua for the full spec
 -- shape. Returns a result table, never raises:
---   { ok, exit_code, stdout, stderr, stdout_file, stderr_file, timed_out, err }
+--   { ok, exit_code, stdout, stderr, stdout_bytes, stderr_bytes,
+--     stdout_file, stderr_file, timed_out, timeout_s, err }
 -- ok is true when the child exited 0. A non-zero exit is a normal result with
 -- ok=false and err set; only a transport failure sets exit_code = -1.
 function M.exec(spec)

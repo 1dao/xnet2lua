@@ -1,16 +1,19 @@
 -- xagent/tools/grep.lua — the Grep tool. Content search via ripgrep (rg),
--- run through the thread-offloaded subprocess runner. rg gives real regex,
+-- run through the thread-offloaded subprocess pool. rg gives real regex,
 -- speed, and .gitignore awareness. MUST run inside the agent coroutine.
+--
+-- Arguments go out as ARGV, never as a hand-quoted command string. This used to
+-- wrap each one in double quotes, which does not protect a POSIX shell's $,
+-- backtick or backslash: searching for `$(id)` or a literal `$HOME` made the
+-- shell substitute or expand it, so the pattern the model asked for was not the
+-- pattern rg received. subprocess.run{ argv = ... } quotes per-platform with the
+-- real rules (see xproc_worker.lua).
 
 local subprocess = require('xagent.proc.subprocess')
 local text = dofile('scripts/core/share/xtext.lua')
 
 local MAX_OUTPUT = 20000
-
--- Double-quote an argument for the shell, escaping embedded quotes.
-local function q(s)
-    return '"' .. tostring(s):gsub('"', '\\"') .. '"'
-end
+local IS_WIN = (package.config:sub(1, 1) == '\\')
 
 return {
     name = 'Grep',
@@ -35,16 +38,30 @@ return {
         if type(input.pattern) ~= 'string' or input.pattern == '' then
             return { content = 'Error: pattern is required', is_error = true }
         end
-
-        local parts = { 'rg', '-n', '--no-heading', '--color', 'never', '--max-columns', '300' }
-        if input.ignore_case then parts[#parts + 1] = '-i' end
-        if input.glob and input.glob ~= '' then
-            parts[#parts + 1] = '-g'; parts[#parts + 1] = q(input.glob)
+        -- The one thing per-platform quoting cannot cover: cmd.exe expands
+        -- %VAR% even inside double quotes, and `cmd /c` has no escape for it.
+        -- Refusing beats silently searching for something else.
+        if IS_WIN then
+            for _, v in ipairs({ input.pattern, input.path, input.glob }) do
+                if type(v) == 'string' and v:match('%%[A-Za-z_][A-Za-z0-9_]*%%') then
+                    return { content = 'Error: %VAR% cannot be passed through cmd.exe ' ..
+                        'safely on Windows; escape or rephrase the pattern.', is_error = true }
+                end
+            end
         end
-        parts[#parts + 1] = '-e'; parts[#parts + 1] = q(input.pattern)
-        parts[#parts + 1] = q((input.path and input.path ~= '') and input.path or '.')
 
-        local r = subprocess.run({ cmd = table.concat(parts, ' '), cwd = ctx and ctx.cwd, timeout_ms = 30000 })
+        local argv = { 'rg', '-n', '--no-heading', '--color', 'never', '--max-columns', '300' }
+        if input.ignore_case then argv[#argv + 1] = '-i' end
+        if input.glob and input.glob ~= '' then
+            argv[#argv + 1] = '-g'; argv[#argv + 1] = input.glob
+        end
+        -- -e guards a pattern that starts with '-' from being read as a flag;
+        -- '--' then does the same for the path.
+        argv[#argv + 1] = '-e'; argv[#argv + 1] = input.pattern
+        argv[#argv + 1] = '--'
+        argv[#argv + 1] = (input.path and input.path ~= '') and input.path or '.'
+
+        local r = subprocess.run({ argv = argv, cwd = ctx and ctx.cwd, timeout_ms = 30000 })
         if not r.ok then
             return { content = 'Error: ' .. tostring(r.err), is_error = true }
         end

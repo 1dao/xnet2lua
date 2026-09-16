@@ -8,18 +8,19 @@
 --
 -- WHY os.execute AND NOT io.popen
 -- -------------------------------
--- io.popen gives a pipe, and on Windows that pipe hands back console-codepage
--- (GBK) bytes: fine for text, fatal for a git packfile. os.execute + shell
--- redirection writes the child's stdout straight to a file the OS never
--- transcodes, and we read that file back in binary mode. It also gives us
--- stdin-from-a-file for free, which io.popen cannot do at all from Lua — that
--- is the whole reason git smart-HTTP is reachable from here without a new C
--- binding.
+-- io.popen gives a pipe, and Lua opens it in TEXT mode on Windows: CRLF is
+-- rewritten and a literal 0x1A byte ends the stream early, so binary output is
+-- silently corrupted. It also cannot feed stdin at all from Lua. os.execute plus
+-- shell redirection writes the child's stdout straight to a file the OS never
+-- touches, and we read that file back in binary mode; stdin redirection comes
+-- free with it.
 --
 -- The cost is that the child's stdout must land on disk before we can look at
--- it: no streaming, and a temp file per call. A real xproc C binding with
--- pollable pipes is still the endgame; this module's API is shaped so that
--- swapping the implementation underneath it changes nothing for callers.
+-- it: no streaming, and a temp file per call. The real xproc C binding
+-- (require('xproc'), pollable pipes) is the endgame for streaming, but it is
+-- POSIX-only — xproc.supported() is false on Windows — so this module stays the
+-- portable path. Its API is shaped so swapping the implementation underneath
+-- changes nothing for callers.
 --
 -- SPEC (table, msgpack'd across the thread boundary):
 --   argv           {string,...}  argv[1] is the program; quoted per-platform
@@ -29,14 +30,20 @@
 --   stdin_file     string?       redirect stdin from this file
 --   stdout_file    string?       redirect stdout here (kept; caller owns it)
 --   stderr_file    string?       redirect stderr here (kept; caller owns it)
+--   merge_stderr   bool?         send stderr down the stdout stream (2>&1);
+--                                overrides stderr_file / capture_stderr
 --   capture_stdout bool?         read stdout back into the reply
---   capture_stderr bool?         read stderr back into the reply (default true)
+--   capture_stderr bool?         read stderr back into the reply (default true,
+--                                forced off by merge_stderr)
 --   max_capture    number?       cap on each captured stream (default 8 MiB)
 --   timeout_ms     number?       opt-in watchdog; 0/absent = no limit
 --   tmp_dir        string?       where scratch files go (default: cwd)
 --
 -- REPLY (table):
---   { exit_code, stdout, stderr, stdout_file, stderr_file, timed_out, err }
+--   { exit_code, stdout, stderr, stdout_bytes, stderr_bytes,
+--     stdout_file, stderr_file, timed_out, timeout_s, err }
+-- stdout_bytes is the stream's FULL size on disk even when max_capture cut the
+-- returned string short, so a caller can report an honest "truncated, N total".
 --
 -- The handler never raises for a non-zero exit — a failed child is a normal
 -- result. It raises only when the spec itself is unusable.
@@ -77,8 +84,9 @@ end
 --
 -- WHAT THIS DOES NOT COVER: %VAR% expansion. cmd.exe expands it even inside
 -- double quotes and `cmd /c` offers no escape, so an argument holding a literal
--- % is not safely representable here. Callers that build arguments out of user
--- input (repository names, ref names) must reject % upstream.
+-- % is not safely representable here. Callers that build arguments out of
+-- untrusted input (repository or ref names, a model's search pattern) must
+-- reject % before it gets here.
 local function quote_win(s)
     s = tostring(s)
     if s ~= '' and s:match(SAFE_WIN) then return s end
@@ -105,13 +113,17 @@ local quote = IS_WIN and quote_win or quote_posix
 -- Small file helpers (binary, so a packfile survives the round trip)
 -- ---------------------------------------------------------------------------
 
+-- Returns (data, total_bytes). total_bytes is the file's real size, which is
+-- what makes a truncation notice truthful when max_bytes cut `data` short.
 local function read_binary(path, max_bytes)
-    if not path then return nil end
+    if not path then return nil, 0 end
     local f = io.open(path, 'rb')
-    if not f then return nil end
+    if not f then return nil, 0 end
+    local total = f:seek('end') or 0
+    f:seek('set', 0)
     local data = f:read(max_bytes or DEFAULT_MAX_CAPTURE) or ''
     f:close()
-    return data
+    return data, total
 end
 
 local function remove_quietly(path)
@@ -127,22 +139,16 @@ end
 -- directory instead, and the caller would get an empty file with no error worth
 -- reading. We rewrite relative redirect paths against the process cwd so that
 -- never happens.
---
--- Lua has no getcwd, so we ask the shell once and cache it. The probe runs with
--- no `cd` of its own, so it reports exactly the directory we want; it lands in
--- the OS temp directory because the process cwd is not guaranteed writable.
 -- ---------------------------------------------------------------------------
 local proc_cwd = nil
 local function process_cwd()
     if proc_cwd then return proc_cwd end
-    -- xutils.cwd() is a C binding; see xlua/lua_xutils.c.
-    --
-    -- This used to shell out: `pwd` (or `cd`) redirected into a probe file in
-    -- the temp directory, read back and unlinked. A process, a file, a read and
-    -- an unlink for a value the OS hands over for free — and on Windows the
-    -- answer arrived in whatever console code page the process had inherited,
-    -- so a non-ASCII install path could come back mangled and every redirect
-    -- resolved against it would then name a path that does not exist.
+    -- xutils.cwd() is a C binding; see xlua/lua_xutils.c. Shelling out for this
+    -- (`pwd`/`cd` into a probe file) costs a process, a write, a read and an
+    -- unlink for a value the OS hands over free — and on Windows the answer
+    -- arrives in the inherited console code page, so a non-ASCII install path
+    -- comes back mangled and every redirect resolved against it then names a
+    -- path that does not exist.
     local xutils = require('xutils')
     proc_cwd = xutils.cwd() or '.'
     return proc_cwd
@@ -155,17 +161,50 @@ local function is_absolute(p)
     return p:sub(1, 1) == '/'
 end
 
+-- The null device is a name the shell resolves itself, not a path. Re-rooting it
+-- would turn NUL into C:\...\NUL, which happens to still work on Windows and
+-- would quietly stop working the day that quirk does.
+local NULL_DEVICE = IS_WIN and 'NUL' or '/dev/null'
+
 local function resolve_against_process(p)
     if not p or p == '' or is_absolute(p) then return p end
+    if p == NULL_DEVICE or p:upper() == 'NUL' then return p end
     return process_cwd() .. SEP .. p
 end
 
+-- Scratch names carry the worker's thread id AND a tag drawn once at load.
+--
+-- A <time>_<seq> name — which is what this used to be — is not unique. Every
+-- worker starts seq at 0 and they stay in step, so two of them landing in the
+-- same os.time() second pick the SAME file, and one command's output surfaces in
+-- another's reply. Measured on a pool of 4 before this fix: 30 of 40 concurrent
+-- calls got someone else's stdout.
+--
+-- The tid is what actually makes it deterministic — the pool hands every worker a
+-- distinct one, so tid+seq needs no coordination at all: no lock, no shared
+-- counter, no boot ordering. The random tag covers the case tid cannot, two xnet
+-- PROCESSES sharing a tmp_dir (two instances started from one checkout).
 local seq = 0
+local my_tid = (xthread.current_id and xthread.current_id()) or 0
+
+-- xnet.random_bytes is the same CSPRNG gitloom's util_rand_hex uses, and it works
+-- on a worker thread without xnet.init(). The fallback only has to separate
+-- processes, never workers, so a weaker source there is fine.
+local function boot_tag()
+    local ok, raw = pcall(function() return xnet.random_bytes(4) end)
+    if ok and type(raw) == 'string' and #raw == 4 then
+        return (require('xutils').hex_encode(raw))
+    end
+    math.randomseed(os.time() * 1000 + my_tid + math.floor((os.clock() or 0) * 1e6))
+    return string.format('%04x%04x', math.random(0, 0xffff), math.random(0, 0xffff))
+end
+local TAG = boot_tag()
+
 local function scratch_path(tmp_dir, suffix)
     seq = seq + 1
     local dir = tmp_dir or '.'
-    return string.format('%s%sxproc_%d_%d_%s', dir, SEP,
-        math.floor(os.time()), seq, suffix)
+    return string.format('%s%sxproc_%s_t%d_%d_%s', dir, SEP,
+        TAG, my_tid, seq, suffix)
 end
 
 -- ---------------------------------------------------------------------------
@@ -180,13 +219,8 @@ local function build_command(spec)
     -- The env block MUST come after the `cd`, and this is not cosmetic. A POSIX
     -- assignment prefix applies to the single command it precedes, and `cd` is a
     -- regular builtin, so `VAR=x cd /repo && git ...` sets VAR for `cd` alone —
-    -- it does not persist, and git never sees it. That silently dropped
-    -- GIT_PROTOCOL on Linux, degrading every clone from protocol v2 to v0 with
-    -- nothing logged. Verified: `sh -c "V=hello cd /tmp && sh -c 'echo [\$V]'"`
-    -- prints [], the same line with the prefix after the && prints [hello].
-    --
-    -- Windows works either way (`set` mutates the shell), so putting cwd first
-    -- is correct on both.
+    -- it does not persist, and the command never sees it. Windows works either
+    -- way (`set` mutates the shell), so putting cwd first is correct on both.
     if spec.cwd then
         -- `cd /d` wants backslashes; a forward-slash path reaches it as a
         -- relative-looking argument and fails with "The system cannot find the
@@ -219,9 +253,15 @@ local function build_command(spec)
         for _, a in ipairs(spec.argv) do parts[#parts + 1] = quote(a) end
     end
 
-    if spec.stdin_file then parts[#parts + 1] = '< '  .. quote(spec.stdin_file) end
-    if spec._stdout    then parts[#parts + 1] = '> '  .. quote(spec._stdout)    end
-    if spec._stderr    then parts[#parts + 1] = '2> ' .. quote(spec._stderr)    end
+    if spec.stdin_file then parts[#parts + 1] = '< ' .. quote(spec.stdin_file) end
+    if spec._stdout    then parts[#parts + 1] = '> ' .. quote(spec._stdout)    end
+    -- 2>&1 must come AFTER the stdout redirect: it duplicates whatever fd 1 is
+    -- at that point. Placed before it, stderr would follow the ORIGINAL stdout.
+    if spec.merge_stderr then
+        parts[#parts + 1] = '2>&1'
+    elseif spec._stderr then
+        parts[#parts + 1] = '2> ' .. quote(spec._stderr)
+    end
 
     return table.concat(parts, ' ')
 end
@@ -245,12 +285,48 @@ local function posix_timeout_bin()
     return false
 end
 
+-- Build the Windows PowerShell watchdog, base64(UTF-16LE)-encoded for
+-- -EncodedCommand so it carries through cmd.exe with zero quoting concerns. The
+-- inner command rides inside as its own base64 literal, so the script itself
+-- stays pure ASCII and neither shell gets a second chance to reinterpret the
+-- quoting we just built.
+--
+-- Note there is no stdout plumbing here: the inner command already redirects to
+-- the caller's files, so the PowerShell host has nothing to relay. That also
+-- keeps powershell.exe's own CLIXML progress/error chatter out of the captured
+-- output — it goes to OUR stderr, never into the child's stream. (A host that
+-- relays the child's bytes down a pipe is exactly how CLIXML ends up mixed into
+-- captured output.)
+local function win_watchdog(inner, timeout_ms)
+    local xutils = require('xutils')
+    local ps = table.concat({
+        "$ErrorActionPreference='SilentlyContinue';",
+        "$ProgressPreference='SilentlyContinue';",
+        "$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('",
+            xutils.base64_encode(inner), "'));",
+        "$i=New-Object Diagnostics.ProcessStartInfo;",
+        "$i.FileName=$env:ComSpec;",
+        "$i.Arguments='/d /s /c \"'+$c+'\"';",     -- /s: keep $c verbatim
+        "$i.UseShellExecute=$false;",
+        "$i.CreateNoWindow=$true;",
+        "$p=[Diagnostics.Process]::Start($i);",
+        "$done=$p.WaitForExit(", tostring(math.floor(timeout_ms)), ");",
+        "if(-not $done){& taskkill /T /F /PID $p.Id 2>$null|Out-Null;",
+            "$p.WaitForExit(", tostring(KILL_GRACE_S * 1000), ")|Out-Null};",
+        "if($done){exit $p.ExitCode}else{exit ", tostring(TIMEOUT_EXIT), "}",
+    })
+    -- -EncodedCommand wants base64 of UTF-16LE bytes. The script is pure ASCII,
+    -- so UTF-16LE is just each byte followed by a NUL.
+    local utf16 = ps:gsub('(.)', '%1\0')
+    return 'powershell -NoProfile -NonInteractive -EncodedCommand ' ..
+        xutils.base64_encode(utf16)
+end
+
 -- Opt-in watchdog. os.execute has no kill of its own, so a child that never
 -- exits wedges this worker (and only this worker) forever. Wrapping bounds the
 -- runtime and kills the process TREE, which is what actually frees us.
---   * Windows: a PowerShell host starts the command through cmd.exe, waits,
---     then `taskkill /T /F`. It costs a PowerShell start-up (~200ms) per call,
---     which is why it is off unless the caller asks for it.
+--   * Windows: the PowerShell host above. It costs a PowerShell start-up
+--     (~200ms measured on this hardware) per call, which is why it is opt-in.
 --   * POSIX: GNU `timeout` (or `gtimeout` on macOS) with a SIGKILL grace. If
 --     neither is present the command runs unwrapped and a warning is logged
 --     once — the wedge risk returns on that host only.
@@ -258,21 +334,11 @@ end
 local function wrap_timeout(inner, timeout_ms)
     local ms = tonumber(timeout_ms) or 0
     if ms <= 0 then return inner, nil end
-    local secs = math.max(1, math.floor(ms / 1000))
+    -- ceil, not floor: a 1500ms budget must allow 2s of `timeout` granularity,
+    -- and a sub-second budget must not round down to "no limit at all".
+    local secs = math.max(1, math.ceil(ms / 1000))
 
-    if IS_WIN then
-        local xutils = require('xutils')
-        -- The command travels as base64 so neither cmd.exe nor PowerShell gets
-        -- a second chance to reinterpret the quoting we just built.
-        local b64 = xutils.base64_encode(inner)
-        local ps = string.format(
-            "$c=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'));" ..
-            "$p=Start-Process cmd.exe -ArgumentList '/c',$c -PassThru -NoNewWindow;" ..
-            "if(-not $p.WaitForExit(%d)){taskkill /T /F /PID $p.Id *> $null;exit %d};" ..
-            "exit $p.ExitCode", b64, secs * 1000, TIMEOUT_EXIT)
-        return string.format('powershell -NoProfile -NonInteractive -Command "%s"',
-            (ps:gsub('"', '\\"'))), secs
-    end
+    if IS_WIN then return win_watchdog(inner, ms), secs end
 
     local bin = posix_timeout_bin()
     if not bin then
@@ -303,8 +369,9 @@ router.register('proc_exec', function(spec)
 
     local max_capture = tonumber(spec.max_capture) or DEFAULT_MAX_CAPTURE
     -- stderr is captured by default: it is small, and it is the only place a
-    -- failing child explains itself once its stdout has gone to a file.
-    local capture_stderr = spec.capture_stderr ~= false
+    -- failing child explains itself once its stdout has gone to a file. With
+    -- merge_stderr there is no separate stream left to capture.
+    local capture_stderr = (not spec.merge_stderr) and spec.capture_stderr ~= false
 
     -- Files the caller named are the caller's to keep and delete. Files we
     -- invent are ours, and we delete them before replying.
@@ -314,10 +381,12 @@ router.register('proc_exec', function(spec)
         own_stdout = scratch_path(spec.tmp_dir, 'out.bin')
         spec._stdout = own_stdout
     end
-    spec._stderr = spec.stderr_file
-    if not spec._stderr and capture_stderr then
-        own_stderr = scratch_path(spec.tmp_dir, 'err.txt')
-        spec._stderr = own_stderr
+    if not spec.merge_stderr then
+        spec._stderr = spec.stderr_file
+        if not spec._stderr and capture_stderr then
+            own_stderr = scratch_path(spec.tmp_dir, 'err.txt')
+            spec._stderr = own_stderr
+        end
     end
 
     -- Redirects are process-relative by contract; the `cd` we are about to
@@ -344,12 +413,15 @@ router.register('proc_exec', function(spec)
         stdout_file = spec.stdout_file,
         stderr_file = spec.stderr_file,
         timed_out   = timed_out or nil,
+        timeout_s   = timed_out and secs or nil,
     }
     if spec.capture_stdout then
-        res.stdout = read_binary(spec._stdout, max_capture) or ''
+        local data, total = read_binary(spec._stdout, max_capture)
+        res.stdout, res.stdout_bytes = data or '', total
     end
     if capture_stderr then
-        res.stderr = read_binary(spec._stderr, max_capture) or ''
+        local data, total = read_binary(spec._stderr, max_capture)
+        res.stderr, res.stderr_bytes = data or '', total
     end
     if timed_out then
         res.err = 'timeout'

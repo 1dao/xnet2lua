@@ -130,9 +130,44 @@ local function run_tests()
                               'echo still-alive' }, capture_stdout = true })
     check('pool survives a timeout', trim(r.stdout) == 'still-alive', trim(r.stdout))
 
-    out(string.format('\n[xproc] %s (%d failure(s))\n',
-        fails == 0 and 'ALL PASS' or 'FAILED', fails))
-    xthread.stop(fails == 0 and 0 or 1)
+    -- 7) concurrency: every caller gets ITS OWN output back.
+    --
+    -- Every case above runs one command at a time, and that is how a real bug
+    -- shipped: the worker named its scratch files <time>_<seq>, every worker
+    -- starts seq at 0, so two workers busy in the same second wrote the SAME
+    -- file and one request read another's stdout. Measured before the fix: 30 of
+    -- 40 concurrent calls came back with someone else's output. Nothing
+    -- sequential can see it, so this fires a burst and checks each reply
+    -- against the token its own command echoed.
+    --
+    -- Continuation-style on purpose: the last reply to land runs the report.
+    -- A headless __init-only script does not pump xtimer, so a sleep-and-poll
+    -- loop here would hang instead of fail.
+    local N = 30
+    local done, wrong, first_bad = 0, 0, nil
+    for i = 1, N do
+        local token = string.format('XPROC_TOKEN_%03d', i)
+        local co = coroutine.create(function()
+            local cr = xproc.exec({ cmd = 'echo ' .. token, capture_stdout = true })
+            local got = trim(cr.stdout)
+            if got ~= token then
+                wrong = wrong + 1
+                first_bad = first_bad or string.format('%s got %q', token, got)
+            end
+            done = done + 1
+            if done < N then return end
+
+            check('concurrent callers each get their own stdout', wrong == 0,
+                string.format('%d/%d replies wrong, e.g. %s', wrong, N, tostring(first_bad)))
+            out(string.format('\n[xproc] %s (%d failure(s))\n',
+                fails == 0 and 'ALL PASS' or 'FAILED', fails))
+            xthread.stop(fails == 0 and 0 or 1)
+        end)
+        local cok, cerr = coroutine.resume(co)
+        if not cok then
+            check('concurrent dispatch ' .. i, false, cerr)
+        end
+    end
 end
 
 return {
@@ -152,4 +187,8 @@ return {
             xthread.stop(1)
         end
     end,
+    -- Join the workers while this state is still alive: the runtime closes it
+    -- before joining leftover threads, and a worker alive in that gap can crash
+    -- the process on exit (see xproc.shutdown).
+    __uninit = function() xproc.shutdown() end,
 }

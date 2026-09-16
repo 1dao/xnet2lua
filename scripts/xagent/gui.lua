@@ -661,11 +661,11 @@ function pick_directory_ps()
     T().status = '选择目录中…'
 
     local preset = (T().cwd or ''):gsub("'", "''")   -- PS single-quote escaping
-    -- The picked path is wrapped in sentinels: powershell.exe serializes its
-    -- progress/error streams as CLIXML (`<Objs Version=...`) onto stderr when
-    -- redirected, and the worker merges stderr into stdout — so the raw output
-    -- can contain arbitrary XML noise around the path. Parse ONLY the
-    -- sentinel-delimited span. ProgressPreference cuts the noise at the source.
+    -- The picked path stays wrapped in sentinels. The worker now stages stdout
+    -- through a file rather than relaying it down a pipe, so powershell.exe's
+    -- CLIXML progress/error chatter no longer lands in the captured output — but
+    -- parsing only the sentinel-delimited span costs nothing and keeps this
+    -- robust against whatever else a PS host decides to print.
     local ps = "$ProgressPreference='SilentlyContinue'\n" ..
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n" ..
         "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n" ..
@@ -678,7 +678,10 @@ function pick_directory_ps()
         xutils.base64_encode(utf8_to_utf16le(ps))
 
     local co = coroutine.create(function()
-        local r = subprocess.run({ cmd = cmd, timeout_ms = 300000 })  -- 5 min to pick
+        -- run_ui, not run: this RPC is held open for as long as the human leaves
+        -- the dialog up (5 min cap). On the shared pool that would occupy a
+        -- worker every agent tab needs; the UI lane is reserved for exactly this.
+        local r = subprocess.run_ui({ cmd = cmd, timeout_ms = 300000 })
         S.picking_dir = false
         local raw = tostring(r and r.stdout or '')
         local out = raw:match('<<PICK>>(.-)<<END>>')
@@ -1366,7 +1369,9 @@ end
 local function __init()
     S.profiles = config.load_profiles()
     assert(xnet.init())
-    assert(subprocess.setup())
+    -- ui_lane reserves one worker outside the shared pool for the folder dialog,
+    -- which holds its RPC open for as long as the human takes to answer.
+    assert(subprocess.setup({ ui_lane = true }))
 
     raygui.init(960, 700, 'xagent')
     -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
@@ -1430,6 +1435,12 @@ local function __init()
     -- (new/resumed sessions pick them up automatically at creation).
     S.mcp_status = 'connecting'
     local boot_co = coroutine.create(function()
+        -- Prove the process workers answer before any tool call rides on one.
+        -- A dead worker would otherwise show up as the first Bash mysteriously
+        -- timing out, minutes later. Coroutine-only, hence in here.
+        local sok, serr = subprocess.selftest()
+        if not sok then add(T(), 'error', '进程池自检失败: ' .. tostring(serr)) end
+
         -- bootstrap is best-effort (no throws): bad config / failed servers are
         -- collected into summary.errors, never raised. It awaits the network, so
         -- it isn't wrapped in pcall (yielding across pcall isn't safe on every
@@ -1871,6 +1882,8 @@ local function __update()
 end
 
 local function __uninit()
+    -- Join the process workers while this state is still alive (see xproc.shutdown).
+    subprocess.shutdown()
     if S.started then raygui.close() end
     if xnet and xnet.uninit then xnet.uninit() end
 end

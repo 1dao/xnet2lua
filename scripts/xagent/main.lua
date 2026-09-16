@@ -35,7 +35,6 @@ registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
 local skills = require('xagent.skills')
 
-local IS_WIN = (package.config:sub(1, 1) == '\\')
 local function out(s) io.write(s); io.flush() end
 
 -- argv KEY=VALUE overrides.
@@ -132,9 +131,18 @@ local function __init()
     local max_tokens = tonumber(argv.MAX_TOKENS) or 4096
 
     local co = coroutine.create(function()
+        -- The worker threads were created above; prove they actually answer
+        -- before the first tool call rides on one. Coroutine-only, hence here.
+        local sok, serr = subprocess.selftest()
+        if not sok then
+            io.stderr:write('subprocess selftest failed: ' .. tostring(serr) .. '\n')
+            xthread.stop(2); return
+        end
+
         -- Resolve the absolute cwd once (used by tools + the system prompt).
-        local r = subprocess.run({ cmd = IS_WIN and 'cd' or 'pwd' })
-        local cwd = (r.stdout or '.'):gsub('%s+$', '')
+        -- xutils.cwd() is a C call: no child process, and no trip through the
+        -- console code page, which used to mangle a non-ASCII path on Windows.
+        local cwd = xutils.cwd() or '.'
 
         skills.bootstrap(cwd)
 
@@ -185,5 +193,9 @@ return {
     __tick_ms = 10,
     __thread_handle = router.handle,
     __init = __init,
-    __uninit = function() if xnet and xnet.uninit then xnet.uninit() end end,
+    __uninit = function()
+        -- Join the process workers while this state is still alive (see xproc.shutdown).
+        subprocess.shutdown()
+        if xnet and xnet.uninit then xnet.uninit() end
+    end,
 }
