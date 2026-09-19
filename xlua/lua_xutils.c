@@ -12,6 +12,7 @@
 **   xutils.get_string(key[, default]) -> string | nil    (default: string)
 **   xutils.scan_dir(path)     -> { { path=..., rel=... }, ... } | nil,err
 **   xutils.list_dir(path)     -> { { name=..., dir=... }, ... } | nil,err  (one level)
+**   xutils.stat(path)         -> { exists, type, size, mtime } | nil,err (no symlink following)
 **   xutils.mkdir_p(path)      -> true | nil,err
 **   xutils.rmtree(path)       -> true | nil,err
 **   xutils.cwd()              -> string | nil,err
@@ -1138,8 +1139,9 @@ static int l_util_rmtree(lua_State *L) {
 ** Create a directory and any missing parents. An existing directory is success.
 */
 static int l_util_mkdir_p(lua_State *L) {
-    const char *path = luaL_checkstring(L, 1);
-    size_t n = strlen(path);
+    size_t n;
+    const char *path = luaL_checklstring(L, 1, &n);
+    luaL_argcheck(L, !memchr(path, 0, n), 1, "path contains NUL");
     if (n == 0) {
         lua_pushnil(L);
         lua_pushstring(L, "mkdir_p: empty path");
@@ -1155,7 +1157,11 @@ static int l_util_mkdir_p(lua_State *L) {
     for (size_t i = 1; i <= n; i++) {
         char c = work[i];
         int last = (i == n);
-        if (!last && c != '/' && c != '\\') continue;
+        if (!last && c != '/'
+#ifdef _WIN32
+            && c != '\\'
+#endif
+        ) continue;
         if (!last) work[i] = '\0';
 
         /* Nothing to create for a bare root ("/", "//") or a drive ("C:"):
@@ -1169,20 +1175,24 @@ static int l_util_mkdir_p(lua_State *L) {
 #ifdef _WIN32
         if (!skip && !CreateDirectoryA(work, NULL)) {
             DWORD e = GetLastError();
-            if (e != ERROR_ALREADY_EXISTS) {
-                free(work);
+            DWORD attrs = GetFileAttributesA(work);
+            if (e != ERROR_ALREADY_EXISTS || attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
                 lua_pushnil(L);
                 lua_pushfstring(L, "cannot create: %s", work);
+                free(work);
                 return 2;
             }
         }
 #else
-        if (!skip && mkdir(work, 0777) != 0 && errno != EEXIST) {
+        if (!skip && mkdir(work, 0777) != 0) {
             int e = errno;
-            free(work);
-            lua_pushnil(L);
-            lua_pushfstring(L, "cannot create %s: %s", path, strerror(e));
-            return 2;
+            struct stat st;
+            if (e != EEXIST || stat(work, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                free(work);
+                lua_pushnil(L);
+                lua_pushfstring(L, "cannot create %s: %s", path, strerror(e));
+                return 2;
+            }
         }
 #endif
         if (!last) work[i] = c;
@@ -1201,7 +1211,12 @@ static int l_util_mkdir_p(lua_State *L) {
 ** '.' and '..' are omitted.
 */
 static int l_util_list_dir(lua_State *L) {
-    const char *path = luaL_checkstring(L, 1);
+    size_t path_len;
+    const char *path = luaL_checklstring(L, 1, &path_len);
+    luaL_argcheck(L, path_len > 0 && !memchr(path, 0, path_len), 1, "invalid path");
+    lua_Integer limit = luaL_optinteger(L, 2, INT_MAX);
+    luaL_argcheck(L, limit > 0 && limit <= INT_MAX, 2, "invalid entry limit");
+    int truncated = 0;
     int count = 0;
     lua_newtable(L);
 
@@ -1220,6 +1235,7 @@ static int l_util_list_dir(lua_State *L) {
     do {
         const char *name = fd.cFileName;
         if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        if (count >= limit) { truncated = 1; break; }
         lua_newtable(L);
         lua_pushstring(L, name);
         lua_setfield(L, -2, "name");
@@ -1240,6 +1256,7 @@ static int l_util_list_dir(lua_State *L) {
     while ((ent = readdir(dp)) != NULL) {
         const char *name = ent->d_name;
         if (name[0] == '.' && (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'))) continue;
+        if (count >= limit) { truncated = 1; break; }
 
         int is_dir = 0;
 #ifdef DT_DIR
@@ -1263,6 +1280,50 @@ static int l_util_list_dir(lua_State *L) {
     }
     closedir(dp);
 #endif
+    lua_pushboolean(L, truncated);
+    return 2;
+}
+
+/* Missing paths are data, other OS errors are failures. Do not follow links:
+** callers must be able to distinguish a link from its target before traversal. */
+static int l_util_stat(lua_State *L) {
+    size_t n;
+    const char *path = luaL_checklstring(L, 1, &n);
+    luaL_argcheck(L, n > 0 && !memchr(path, 0, n), 1, "invalid path");
+    const char *kind = "other";
+    lua_Integer size = 0, mtime = 0;
+    int exists = 1;
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &data)) {
+        DWORD e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) exists = 0;
+        else { lua_pushnil(L); lua_pushfstring(L, "cannot stat %s (error %d)", path, (int)e); return 2; }
+    } else {
+        kind = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? "link" :
+               (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "directory" : "file";
+        size = (lua_Integer)(((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow);
+        uint64_t ticks = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
+        mtime = (lua_Integer)(ticks / 10000000ULL) - 11644473600LL;
+    }
+#else
+    struct stat st;
+    if (lstat(path, &st) != 0) {
+        int e = errno;
+        if (e == ENOENT || e == ENOTDIR) exists = 0;
+        else { lua_pushnil(L); lua_pushfstring(L, "cannot stat %s: %s", path, strerror(e)); return 2; }
+    } else {
+        kind = S_ISLNK(st.st_mode) ? "link" : S_ISDIR(st.st_mode) ? "directory" : S_ISREG(st.st_mode) ? "file" : "other";
+        size = (lua_Integer)st.st_size; mtime = (lua_Integer)st.st_mtime;
+    }
+#endif
+    lua_newtable(L);
+    lua_pushboolean(L, exists); lua_setfield(L, -2, "exists");
+    if (exists) {
+        lua_pushstring(L, kind); lua_setfield(L, -2, "type");
+        lua_pushinteger(L, size); lua_setfield(L, -2, "size");
+        lua_pushinteger(L, mtime); lua_setfield(L, -2, "mtime");
+    }
     return 1;
 }
 
@@ -1556,6 +1617,7 @@ static const luaL_Reg xutils_funcs[] = {
     { "get_string",   l_util_get_string },
     { "scan_dir",     l_util_scan_dir },
     { "list_dir",     l_util_list_dir },
+    { "stat",         l_util_stat },
     { "mkdir_p",      l_util_mkdir_p },
     { "rmtree",       l_util_rmtree },
     { "cwd",          l_util_cwd },
