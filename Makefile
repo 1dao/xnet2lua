@@ -128,9 +128,10 @@ else
 endif
 
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS) -DXNET_WITH_XPROC=$(WITH_XPROC)
-# mbedTLS hash primitives (sha1/sha256/sha512/md5 + platform_util) are
-# self-contained -- no SSL/x509/PSA deps -- so xutils exports them on EVERY
-# build (see xlua/lua_xutils.c). The include path is therefore always needed.
+# mbedTLS hash primitives (sha1/sha256/sha512/md5 + platform_util) and the AES
+# block cipher are self-contained -- no SSL/x509/PSA deps -- so xutils exports
+# them on EVERY build (see xlua/lua_xutils.c). The include path is therefore
+# always needed.
 XNET_CFLAGS := -I3rd/libdeflate -I3rd/mbedtls3/include
 XNET_HTTPS_SRC :=
 XNET_CRYPTO_SRC :=
@@ -211,14 +212,18 @@ endif
 endif
 
 # WITH_HTTPS=1 compiles the whole mbedTLS library (which already contains the
-# hash files). WITH_HTTPS=0 still needs the hash subset for xutils, so add just
-# those files -- guarded so we never compile them twice (duplicate symbols).
+# hash and AES files). WITH_HTTPS=0 still needs that subset for xutils, so add
+# just those files -- guarded so we never compile them twice (duplicate
+# symbols). aes.c reaches for the hardware paths when the config enables them
+# (MBEDTLS_AESNI_C / AESCE_C / PADLOCK_C), so those three come with it.
 ifeq ($(WITH_HTTPS),1)
 	XNET_HTTPS_SRC := $(wildcard 3rd/mbedtls3/library/*.c)
 else
 	XNET_CRYPTO_SRC := 3rd/mbedtls3/library/sha1.c 3rd/mbedtls3/library/sha256.c \
 		3rd/mbedtls3/library/sha512.c 3rd/mbedtls3/library/md5.c \
-		3rd/mbedtls3/library/platform_util.c
+		3rd/mbedtls3/library/platform_util.c \
+		3rd/mbedtls3/library/aes.c 3rd/mbedtls3/library/aesni.c \
+		3rd/mbedtls3/library/aesce.c 3rd/mbedtls3/library/padlock.c
 endif
 
 XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c

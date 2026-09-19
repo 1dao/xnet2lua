@@ -17,6 +17,8 @@
 **   xutils.rmtree(path)       -> true | nil,err
 **   xutils.cwd()              -> string | nil,err
 **   xutils.pbkdf2_sha256(pw, salt, iter [, dklen]) -> raw string | nil,err
+**   xutils.aes_cbc_encrypt(key, iv, data) -> raw string | nil,err  (no padding)
+**   xutils.aes_cbc_decrypt(key, iv, data) -> raw string | nil,err  (no padding)
 */
 
 #include <math.h>
@@ -67,6 +69,7 @@
 #include "mbedtls/sha256.h"
 #include "mbedtls/sha512.h"
 #include "mbedtls/md5.h"
+#include "mbedtls/aes.h"
 
 #include "../xmacro.h"   /* malloc/free → rpmalloc; must be last include */
 
@@ -1532,6 +1535,70 @@ static int l_util_hmac_sha1_hex(lua_State *L) {
     return 1;
 }
 
+/* --- AES-CBC ------------------------------------------------------------
+**
+** xutils.aes_cbc_encrypt(key, iv, data) -> raw | nil, err
+** xutils.aes_cbc_decrypt(key, iv, data) -> raw | nil, err
+**
+** The raw cipher, NO PADDING: `data` is a whole number of 16-byte blocks and
+** comes back the same length. Padding is the protocol's business (PKCS#7 for
+** WeCom's callback, something else elsewhere), and a primitive that stripped
+** it could not tell a caller whether the plaintext had been padded at all.
+**
+** Key length picks the variant: 16, 24 or 32 bytes for AES-128/192/256.
+**
+** Like the hashes above, these are linked on EVERY build -- aes.c and its
+** hardware paths are in the crypto subset the Makefile compiles when
+** WITH_HTTPS=0, for the reason spelled out on pbkdf2_sha256.
+*/
+static int xu_aes_cbc(lua_State *L, int encrypt) {
+    size_t kl = 0, il = 0, dl = 0;
+    const unsigned char *key  = (const unsigned char *)luaL_checklstring(L, 1, &kl);
+    const unsigned char *iv   = (const unsigned char *)luaL_checklstring(L, 2, &il);
+    const unsigned char *data = (const unsigned char *)luaL_checklstring(L, 3, &dl);
+
+    if (kl != 16 && kl != 24 && kl != 32) {
+        lua_pushnil(L); lua_pushstring(L, "aes: key must be 16, 24 or 32 bytes"); return 2;
+    }
+    if (il != 16) {
+        lua_pushnil(L); lua_pushstring(L, "aes: iv must be 16 bytes"); return 2;
+    }
+    if (dl == 0 || (dl % 16) != 0) {
+        lua_pushnil(L); lua_pushstring(L, "aes: data must be whole 16-byte blocks"); return 2;
+    }
+
+    /* mbedtls_aes_crypt_cbc advances the IV in place, so it gets a copy: the
+    ** caller's Lua string is immutable and may be reused for another call. */
+    unsigned char ivbuf[16];
+    memcpy(ivbuf, iv, 16);
+
+    luaL_Buffer b;
+    unsigned char *out = (unsigned char *)luaL_buffinitsize(L, &b, dl);
+
+    mbedtls_aes_context ctx;
+    mbedtls_aes_init(&ctx);
+    int rc = encrypt ? mbedtls_aes_setkey_enc(&ctx, key, (unsigned int)(kl * 8))
+                     : mbedtls_aes_setkey_dec(&ctx, key, (unsigned int)(kl * 8));
+    if (rc == 0) {
+        rc = mbedtls_aes_crypt_cbc(&ctx, encrypt ? MBEDTLS_AES_ENCRYPT : MBEDTLS_AES_DECRYPT,
+                                   dl, ivbuf, data, out);
+    }
+    mbedtls_aes_free(&ctx);
+
+    if (rc != 0) {
+        luaL_pushresultsize(&b, 0);
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushfstring(L, "aes: mbedtls error %d", rc);
+        return 2;
+    }
+    luaL_pushresultsize(&b, dl);
+    return 1;
+}
+static int l_util_aes_cbc_encrypt(lua_State *L) { return xu_aes_cbc(L, 1); }
+static int l_util_aes_cbc_decrypt(lua_State *L) { return xu_aes_cbc(L, 0); }
+
+
 /* --- base64 (standard + url-safe) and hex ------------------------------ */
 static const char XU_B64STD[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1638,6 +1705,10 @@ static const luaL_Reg xutils_funcs[] = {
     { "pbkdf2_sha256",   l_util_pbkdf2_sha256 },
     { "hmac_sha1",       l_util_hmac_sha1 },
     { "hmac_sha1_hex",   l_util_hmac_sha1_hex },
+
+    /* AES-CBC, raw blocks: the caller pads */
+    { "aes_cbc_encrypt", l_util_aes_cbc_encrypt },
+    { "aes_cbc_decrypt", l_util_aes_cbc_decrypt },
 
     /* encodings */
     { "base64_encode",     l_util_base64_encode },
