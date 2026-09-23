@@ -260,16 +260,21 @@ function M.request(opts, cb)
         if scheme == 'https' and not xnet.connect_tls_fd then
             return fail('https not supported: xnet built without HTTPS')
         end
-        return xproxy.open_tunnel(proxy, host, port, {
+        -- The tunnel is the caller's handle for the whole request: once the
+        -- origin connection exists it is adopted, so close() still reaches the
+        -- live stream after the TLS upgrade (cancel / timeout on Android).
+        local tun
+        tun = xproxy.open_tunnel(proxy, host, port, {
             on_ready = function(tconn, extra)
                 local c, aerr = xproxy.attach(tconn, extra, handler, {
                     tls = scheme == 'https', host = host, port = port,
                     verify = opts.verify, ca_file = opts.ca_file,
                 })
-                if not c then fail(aerr) end
+                if c then tun:adopt(c) else fail(aerr) end
             end,
             on_error = fail,
         })
+        return tun
     end
 
     local conn, err

@@ -149,6 +149,9 @@ M.HANDSHAKE_TIMEOUT_MS = 15000
 -- M.HANDSHAKE_TIMEOUT_MS; 0 disables).
 -- tunnel.conn is the in-flight proxy connection (nil once handed off);
 -- tunnel:close(reason) aborts silently (no callback).
+-- tunnel:adopt(conn) hands the tunnel the connection attach() returned, so a
+-- caller holding the tunnel as its request handle can still close() the live
+-- stream (and ask is_closed()) after the TCP -> TLS upgrade.
 function M.open_tunnel(proxy, host, port, cb, opts)
     local tun = { done = false }
     local buf, phase = '', (proxy.type == 'http') and 'connect' or 'greet'
@@ -169,12 +172,26 @@ function M.open_tunnel(proxy, host, port, cb, opts)
     end
 
     function tun:close(reason)
+        local live = self.live
+        if live then
+            if not live:is_closed() then live:close(reason or 'cancelled') end
+            return
+        end
         if self.done then return end
         self.done = true
         stop_timer()
         local c = self.conn
         self.conn = nil
         if c and not c:is_closed() then c:close(reason or 'cancelled') end
+    end
+
+    function tun:is_closed()
+        if self.live then return self.live:is_closed() end
+        return self.done
+    end
+
+    function tun:adopt(conn)
+        self.live = conn
     end
 
     -- Defer the hand-off out of the channel callback (see header note).

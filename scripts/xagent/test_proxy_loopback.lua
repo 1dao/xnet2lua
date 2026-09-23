@@ -15,6 +15,7 @@ package.path = 'scripts/?.lua;' .. package.path
 local anthropic = require('xagent.llm.anthropic')
 local httpc = dofile('scripts/core/share/xhttp_client.lua')
 local xproxy = dofile('scripts/core/share/xproxy.lua')
+local stream = dofile('scripts/core/share/xhttp_stream.lua')
 local xutils = require('xutils')
 
 local HOST = '127.0.0.1'
@@ -51,6 +52,8 @@ local function finish(ok, msg)
 end
 
 -- ── origin: one request per connection, answered with chunked SSE ──────────
+local holding = {}      -- origin connections serving an open-ended /hold stream
+
 local function origin_handler()
     local bufs = setmetatable({}, { __mode = 'k' })
     local h = {}
@@ -64,6 +67,15 @@ local function origin_handler()
         bufs[conn] = nil
         seen.origin_line = buf:match('^([^\r]*)')
         seen.origin_proxy_auth = buf:match('\r\n[Pp]roxy%-[Aa]uthorization:%s*([^\r]*)')
+        if seen.origin_line:find(' /hold ', 1, true) then
+            -- A stream that never ends on its own: only the client can close it.
+            holding[conn] = true
+            conn:send_raw('HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n' ..
+                'Transfer-Encoding: chunked\r\n\r\n')
+            local part = 'event: ping\ndata: {}\n\n'
+            conn:send_raw(string.format('%x\r\n%s\r\n', #part, part))
+            return #data
+        end
         conn:send_raw('HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n' ..
             'Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n')
         local i = 1
@@ -76,7 +88,13 @@ local function origin_handler()
         conn:close('done')
         return #data
     end
-    function h.on_close(conn) bufs[conn] = nil end
+    function h.on_close(conn)
+        bufs[conn] = nil
+        if holding[conn] then
+            holding[conn] = nil
+            if seen.on_hold_closed then seen.on_hold_closed() end
+        end
+    end
     return h
 end
 
@@ -293,6 +311,33 @@ local function handshake_timeout_case(next_case)
     }, { timeout_ms = 200 })
 end
 
+-- The handle xhttp_stream returns for a proxied request must still close the
+-- stream after the tunnel handed off (Android cancels and times out requests
+-- through it). The origin only closes /hold when the client does.
+local function close_after_tunnel_case(next_case)
+    seen = {}
+    local name = 'stream close after tunnel'
+    local handle, closed = nil, false
+    seen.on_hold_closed = function()
+        if not handle:is_closed() then return finish(false, name .. ': handle not closed') end
+        out('[proxy] ' .. name .. ' ok\n')
+        next_case()
+    end
+    handle = stream.request({
+        url = ORIGIN .. '/hold', method = 'POST', body = '{}',
+        headers = { ['content-type'] = 'application/json' },
+        proxy = 'socks5://' .. HOST .. ':' .. SOCKS_PORT,
+    }, {
+        on_body = function()
+            if closed then return end
+            closed = true
+            handle:close('cancelled')
+        end,
+        on_error = function(e) if not closed then finish(false, name .. ': ' .. tostring(e)) end end,
+    })
+    if not handle then finish(false, name .. ': no handle') end
+end
+
 local function expect_error_case(name, proxy, want)
     return function(next_case)
         anthropic.stream_message(
@@ -334,6 +379,7 @@ local CASES = {
     end),
     connect_tunnel_case,
     handshake_timeout_case,
+    close_after_tunnel_case,
 }
 
 local function run_case(i)
