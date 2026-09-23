@@ -29,6 +29,51 @@ spec.describe('tokens.estimation', function()
     end)
 end)
 
+spec.describe('tokens.cache usage', function()
+    spec.it('counts cache hits and writes as input and reports the hit ratio', function()
+        local u = { input_tokens = 100, cache_read_input_tokens = 800, cache_creation_input_tokens = 100 }
+        spec.equal(tokens.total_input_tokens(u), 1000)
+        spec.equal(tokens.cache_hit_ratio(u), 0.8)
+        spec.nil_value(tokens.cache_hit_ratio({ output_tokens = 5 }))
+    end)
+
+    spec.it('sums usage including the cache counters', function()
+        local acc = { input_tokens = 0, output_tokens = 0 }
+        tokens.add_usage(acc, { input_tokens = 10, output_tokens = 2, cache_read_input_tokens = 90 })
+        tokens.add_usage(acc, { input_tokens = 5, output_tokens = 1, cache_creation_input_tokens = 7 })
+        spec.equal(acc.input_tokens, 15)
+        spec.equal(acc.output_tokens, 3)
+        spec.equal(acc.cache_read_input_tokens, 90)
+        spec.equal(acc.cache_creation_input_tokens, 7)
+    end)
+
+    spec.it('loop.run reports the turn total across tool round-trips', function()
+        local provider = require('xagent.llm.provider')
+        local loop = require('xagent.core.loop')
+        local saved, n = provider.stream_message, 0
+        provider.stream_message = function(_, _, cb)
+            n = n + 1
+            local content = (n == 1)
+                and { { type = 'tool_use', id = 'u1', name = 'NoSuchTool', input = {} } }
+                or { { type = 'text', text = 'done' } }
+            cb.on_done({ message = { role = 'assistant', content = content },
+                stop_reason = (n == 1) and 'tool_use' or 'end_turn',
+                usage = { input_tokens = 10, output_tokens = 1, cache_read_input_tokens = 100 } })
+        end
+        local res
+        local co = coroutine.create(function()
+            res = loop.run({ cfg = { model = 'm' }, messages = { { role = 'user', content = 'go' } },
+                             system = 'SYS', tools = {}, ctx = {} })
+        end)
+        local ok, err = coroutine.resume(co)
+        provider.stream_message = saved
+        assert(ok, err)
+        spec.equal(res.usage.input_tokens, 20)
+        spec.equal(res.usage.cache_read_input_tokens, 200)
+        spec.equal(res.usage.output_tokens, 2)
+    end)
+end)
+
 spec.describe('tokens.budget', function()
     spec.it('uses the model window (DeepSeek = 128K)', function()
         local s = tokens.build_budget_snapshot({ { role = 'user', content = BIG } }, { model = 'deepseek-v4-pro' })

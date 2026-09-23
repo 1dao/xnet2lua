@@ -46,6 +46,24 @@ registry.register(require('xagent.tools.skill'))
 
 local skills    = require('xagent.skills')
 local open_url  = require('xagent.ui.open_url')
+local tokens    = require('xagent.context.tokens')
+
+local function ktok(v)
+    v = tonumber(v) or 0
+    if v >= 1000 then return string.format('%.1fk', v / 1000) end
+    return tostring(v)
+end
+
+-- "输入 120.3k（缓存 92%） · 输出 3.1k". Input counts cache hits and writes too
+-- (the codecs report input_tokens without them), so the percentage says how
+-- much of what the request read was billed at cache price.
+local function usage_label(u)
+    if not u then return '' end
+    local s = '输入 ' .. ktok(tokens.total_input_tokens(u))
+    local r = tokens.cache_hit_ratio(u)
+    if r then s = s .. string.format('（缓存 %d%%）', math.floor(r * 100 + 0.5)) end
+    return s .. ' · 输出 ' .. ktok(u.output_tokens)
+end
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local FONT_SIZE = 16
@@ -394,6 +412,10 @@ local function on_event(tab, ev)
             tostring(ev.from or '?'), tostring(ev.to or '?'))
     elseif ev.type == 'done' then
         flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = 'ready'
+        -- This turn's totals over every request it made (tool round-trips too).
+        if ev.usage and tokens.total_input_tokens(ev.usage) > 0 then
+            tab.status = 'ready  ·  本轮 ' .. usage_label(ev.usage)
+        end
     elseif ev.type == 'error' then
         flush_tail(tab); clear_thinking(tab); add(tab, 'error', 'ERROR: ' .. tostring(ev.error)); tab.busy = false; tab.status = 'error'
     end
@@ -792,11 +814,15 @@ local function build_log_detail(rec)
         L('tool', '返回状态：HTTP ' .. tostring(rec.status or '-') .. '  失败', { no_copy = true })
         L('error', '错误：' .. tostring(rec.error))
     else
-        L('tool', string.format('返回状态：HTTP %s  ·  stop=%s  ·  输入 %s / 输出 %s tok  ·  %dms',
+        L('tool', string.format('返回状态：HTTP %s  ·  stop=%s  ·  %dms',
             tostring(rec.status or '-'), tostring(rec.stop_reason or '?'),
-            tostring(rec.usage and rec.usage.input_tokens or '?'),
-            tostring(rec.usage and rec.usage.output_tokens or '?'),
             rec.elapsed_ms or 0), { no_copy = true })
+        if rec.usage then
+            local u = rec.usage
+            L('tool', string.format('用量：%s  （未缓存 %d · 缓存命中 %d · 写入缓存 %d）',
+                usage_label(u), u.input_tokens or 0, u.cache_read_input_tokens or 0,
+                u.cache_creation_input_tokens or 0), { no_copy = true })
+        end
     end
     -- The RAW response body, shown UNPARSED — the exact SSE stream the server
     -- sent. It already carries every block (text deltas AND tool_use blocks with
@@ -1768,9 +1794,11 @@ local function __update()
                         local icon = (not rec.done) and '○' or (rec.error and '×' or '✓')
                         local lbl
                         if rec.done and not rec.error then
-                            lbl = string.format('%s #%d %s  %s→%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
-                                shorttok(rec.usage and rec.usage.input_tokens),
-                                shorttok(rec.usage and rec.usage.output_tokens))
+                            local r = tokens.cache_hit_ratio(rec.usage)
+                            lbl = string.format('%s #%d %s  %s→%s%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
+                                rec.usage and shorttok(tokens.total_input_tokens(rec.usage)) or '?',
+                                shorttok(rec.usage and rec.usage.output_tokens),
+                                r and string.format('  缓存%d%%', math.floor(r * 100 + 0.5)) or '')
                         elseif rec.error then
                             lbl = string.format('%s #%d %s  失败', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
                         else

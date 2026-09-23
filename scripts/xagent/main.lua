@@ -179,8 +179,10 @@ local function __init()
             on_event = make_printer(),
         })
 
-        out(string.format('\27[90m[usage] in=%d out=%d turns=%d\27[0m\n',
-            res.usage.input_tokens, res.usage.output_tokens, res.turns))
+        -- in = uncached input; cache_read/cache_write are billed separately.
+        out(string.format('\27[90m[usage] in=%d cache_read=%d cache_write=%d out=%d turns=%d\27[0m\n',
+            res.usage.input_tokens or 0, res.usage.cache_read_input_tokens or 0,
+            res.usage.cache_creation_input_tokens or 0, res.usage.output_tokens or 0, res.turns))
         xthread.stop(res.stop_reason == 'error' and 1 or 0)
     end)
 

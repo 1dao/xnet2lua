@@ -6,6 +6,7 @@
 -- ~/.xagent/sessions/<id>.json and reloads for resume.
 
 local loop = require('xagent.core.loop')
+local tokens = require('xagent.context.tokens')
 local fs = dofile('scripts/core/share/xfs.lua')
 local xutils = require('xutils')
 
@@ -143,8 +144,7 @@ function Session:run(on_event)
         usage_anchor_index = self.usage_anchor_index,
         should_stop = function() return self.cancelled end,
     })
-    self.usage.input_tokens = self.usage.input_tokens + (res.usage.input_tokens or 0)
-    self.usage.output_tokens = self.usage.output_tokens + (res.usage.output_tokens or 0)
+    tokens.add_usage(self.usage, res.usage)
     self.last_usage = res.last_usage
     self.usage_anchor_index = res.usage_anchor_index
     return res

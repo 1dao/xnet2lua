@@ -77,7 +77,8 @@ function M.run(opts)
     local messages = opts.messages
     local function emit(ev) if opts.on_event then opts.on_event(ev) end end
 
-    local total_in, total_out = 0, 0
+    -- Summed over every request this turn (input/output and the cache counters).
+    local total = { input_tokens = 0, output_tokens = 0 }
     -- Anchor the token estimate on the model's real usage: after each turn the
     -- newest response gives an exact count up to the assistant message; the only
     -- tokens we estimate are tool_result turns appended afterward.
@@ -90,7 +91,7 @@ function M.run(opts)
         if opts.should_stop and opts.should_stop() then
             emit({ type = 'done', stop_reason = 'cancelled' })
             return { stop_reason = 'cancelled',
-                     usage = { input_tokens = total_in, output_tokens = total_out },
+                     usage = total,
                      last_usage = last_usage, usage_anchor_index = anchor, turns = turn }
         end
 
@@ -129,13 +130,12 @@ function M.run(opts)
 
         if err then
             emit({ type = 'error', error = err })
-            return { stop_reason = 'error', usage = { input_tokens = total_in, output_tokens = total_out }, turns = turn }
+            return { stop_reason = 'error', usage = total, turns = turn }
         end
 
         local assistant = result.message
         messages[#messages + 1] = assistant
-        total_in = total_in + (result.usage.input_tokens or 0)
-        total_out = total_out + (result.usage.output_tokens or 0)
+        tokens.add_usage(total, result.usage)
         emit({ type = 'assistant', message = assistant, usage = result.usage })
 
         -- The response's usage covers system + every message up to (and
@@ -150,10 +150,10 @@ function M.run(opts)
 
         if result.stop_reason ~= 'tool_use' then
             emit({ type = 'done', stop_reason = result.stop_reason,
-                   usage = { input_tokens = total_in, output_tokens = total_out },
+                   usage = total,
                    last_usage = last_usage, usage_anchor_index = anchor })
             return { stop_reason = result.stop_reason,
-                     usage = { input_tokens = total_in, output_tokens = total_out },
+                     usage = total,
                      last_usage = last_usage, usage_anchor_index = anchor, turns = turn }
         end
 
@@ -164,7 +164,7 @@ function M.run(opts)
 
     emit({ type = 'done', stop_reason = 'max_turns' })
     return { stop_reason = 'max_turns',
-             usage = { input_tokens = total_in, output_tokens = total_out }, turns = opts.max_turns or M.MAX_TURNS }
+             usage = total, turns = opts.max_turns or M.MAX_TURNS }
 end
 
 return M

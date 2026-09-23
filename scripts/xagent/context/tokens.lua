@@ -108,6 +108,33 @@ function M.estimate_system_prompt_tokens(system)
     return rough(system) + MESSAGE_OVERHEAD_TOKENS
 end
 
+-- Everything the request read as input: uncached + cache hits + cache writes
+-- (both codecs report input_tokens WITHOUT the cached part).
+function M.total_input_tokens(usage)
+    if not usage then return 0 end
+    return (usage.input_tokens or 0)
+         + (usage.cache_read_input_tokens or 0)
+         + (usage.cache_creation_input_tokens or 0)
+end
+
+-- Share of the input served from the prompt cache (0..1), or nil when the
+-- usage carries no input at all.
+function M.cache_hit_ratio(usage)
+    local total = M.total_input_tokens(usage)
+    if total <= 0 then return nil end
+    return (usage.cache_read_input_tokens or 0) / total
+end
+
+-- Sum `usage` into `acc` (input/output and both cache counters). Returns acc.
+function M.add_usage(acc, usage)
+    if not usage then return acc end
+    for _, k in ipairs({ 'input_tokens', 'output_tokens',
+                         'cache_read_input_tokens', 'cache_creation_input_tokens' }) do
+        if usage[k] then acc[k] = (acc[k] or 0) + usage[k] end
+    end
+    return acc
+end
+
 function M.get_token_count_from_usage(usage)
     if not usage then return 0 end
     return (usage.input_tokens or 0)
