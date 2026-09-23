@@ -130,7 +130,7 @@ function M.build_request(cfg, params)
     if params.tools and #params.tools > 0 then payload.tools = params.tools end
     if params.tool_choice then payload.tool_choice = params.tool_choice end
 
-    local body = xutils.json_pack(payload)
+    local body = common.json_encode(payload)   -- sorted keys: a stable, cacheable prefix
     if not body or body == '' then
         -- yyjson returns nil on invalid UTF-8 (or other non-encodable data).
         -- Surfacing this beats sending an empty body and getting a cryptic 400.

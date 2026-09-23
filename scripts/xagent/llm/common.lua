@@ -15,6 +15,65 @@ local api_log = require('xagent.llm.api_log')
 
 local M = {}
 
+-- ── canonical request JSON ─────────────────────────────────────────────────
+-- json_pack emits object keys in Lua hash order, and LuaJIT seeds its string
+-- hash per process: the same tools schema or history block serializes with a
+-- different key order after every restart, so the provider's prompt cache
+-- (keyed on the exact prefix) misses the whole conversation on the first
+-- request. Encode request bodies with object keys sorted instead. Leaves still
+-- go through json_pack, so numbers/strings are byte-identical to before and
+-- invalid UTF-8 still fails the encode (nil) exactly as json_pack does. Table
+-- shape follows json_pack: consecutive integer keys 1..n (n > 0) are an
+-- array, anything else (including {}) an object; json_null is null.
+local json_null = xutils.json_null
+
+local function encode(v, out)
+    if v == json_null then out[#out + 1] = 'null'; return true end
+    if type(v) ~= 'table' then
+        local s = xutils.json_pack(v)
+        if not s then return false end
+        out[#out + 1] = s
+        return true
+    end
+    local n, count, array = #v, 0, true
+    for k in pairs(v) do
+        count = count + 1
+        if type(k) ~= 'number' or k < 1 or k > n or k % 1 ~= 0 then array = false end
+    end
+    if array and n > 0 and count == n then
+        out[#out + 1] = '['
+        for i = 1, n do
+            if i > 1 then out[#out + 1] = ',' end
+            if not encode(v[i], out) then return false end
+        end
+        out[#out + 1] = ']'
+        return true
+    end
+    local keys = {}
+    for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+    table.sort(keys)
+    local lookup = {}
+    for k, val in pairs(v) do lookup[tostring(k)] = val end
+    out[#out + 1] = '{'
+    for i, k in ipairs(keys) do
+        if i > 1 then out[#out + 1] = ',' end
+        local ks = xutils.json_pack(k)
+        if not ks then return false end
+        out[#out + 1] = ks
+        out[#out + 1] = ':'
+        if not encode(lookup[k], out) then return false end
+    end
+    out[#out + 1] = '}'
+    return true
+end
+
+-- json_encode(value) -> string | nil. Deterministic json_pack (sorted keys).
+function M.json_encode(value)
+    local out = {}
+    if not encode(value, out) then return nil end
+    return table.concat(out)
+end
+
 -- Parse a tool call's accumulated JSON arguments. On failure, DON'T swallow the
 -- reason: json_unpack returns (nil, "json unpack error at <pos>: <msg>"); a
 -- raised error comes back as parsed. Keep both _raw and _error so tools_run can

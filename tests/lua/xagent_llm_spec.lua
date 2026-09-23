@@ -197,6 +197,34 @@ spec.describe('api_log redaction', function()
     end)
 end)
 
+spec.describe('common.json_encode', function()
+    local common = require('xagent.llm.common')
+
+    spec.it('sorts object keys whatever the insertion order', function()
+        local a, b = {}, {}
+        for _, k in ipairs({ 'type', 'input', 'id', 'name' }) do a[k] = k end
+        for _, k in ipairs({ 'name', 'id', 'input', 'type' }) do b[k] = k end
+        spec.equal(common.json_encode(a), '{"id":"id","input":"input","name":"name","type":"type"}')
+        spec.equal(common.json_encode(b), common.json_encode(a))
+    end)
+
+    spec.it('follows json_pack for shapes and leaves', function()
+        spec.equal(common.json_encode({ 1, 'x', true, 1.5 }), '[1,"x",true,1.5]')
+        spec.equal(common.json_encode({}), '{}')
+        spec.equal(common.json_encode(xutils.json_null), 'null')
+        spec.equal(common.json_encode({ [1] = 'a', [3] = 'c' }), '{"1":"a","3":"c"}')
+        spec.equal(common.json_encode({ s = 'a"b\n中' }), '{"s":' .. xutils.json_pack('a"b\n中') .. '}')
+        local nested = { tools = { { name = 'Read', input_schema = { type = 'object', required = { 'p' } } } } }
+        spec.equal(common.json_encode(nested),
+            '{"tools":[{"input_schema":{"required":["p"],"type":"object"},"name":"Read"}]}')
+    end)
+
+    spec.it('fails like json_pack on invalid UTF-8 and non-encodable values', function()
+        spec.nil_value(common.json_encode({ text = '\255' }))
+        spec.nil_value(common.json_encode({ f = function() end }))
+    end)
+end)
+
 spec.describe('anthropic.build_request', function()
     spec.it('builds url, auth header and a streaming json body', function()
         local req = anthropic.build_request(

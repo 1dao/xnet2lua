@@ -163,7 +163,7 @@ local function convert_assistant(out, msg, cfg)
         elseif b.type == 'tool_use' then
             local call = {
                 id = b.id, type = 'function',
-                ['function'] = { name = b.name, arguments = xutils.json_pack(b.input or {}) or '{}' },
+                ['function'] = { name = b.name, arguments = common.json_encode(b.input or {}) or '{}' },
             }
             if gemini then
                 -- Only the first call of a step must carry the signature.
@@ -276,7 +276,7 @@ function M.build_request(cfg, params)
     local tc = convert_tool_choice(params.tool_choice)
     if tc then payload.tool_choice = tc end
 
-    local body = xutils.json_pack(payload)
+    local body = common.json_encode(payload)   -- sorted keys: a stable, cacheable prefix
     if not body or body == '' then
         -- yyjson returns nil on invalid UTF-8 (or other non-encodable data).
         error('json_pack produced an empty body (invalid UTF-8 or non-encodable value in messages)')
