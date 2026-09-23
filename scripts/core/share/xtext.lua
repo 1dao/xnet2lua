@@ -89,4 +89,25 @@ function M.truncate(s, max, marker)
     return s:sub(1, max) .. (marker or '\n...[truncated]')
 end
 
+-- Keep the first `head` and last `tail` bytes of s, dropping the middle. Both
+-- cuts snap to line boundaries when one is near (within half the budget) and
+-- never split a UTF-8 sequence. Command output needs both ends: the command's
+-- first error is usually near the top, the summary/exit reason at the bottom.
+-- Returns s unchanged when it already fits in head + tail.
+function M.head_tail(s, head, tail)
+    s = tostring(s or '')
+    if #s <= head + tail then return s end
+    local h = head
+    local nl = s:sub(1, h):match('.*()\n')
+    if nl and nl > head / 2 then h = nl - 1 end
+    while h > 0 and h < #s and (s:byte(h + 1) or 0) >= 0x80 and (s:byte(h + 1) or 0) < 0xC0 do h = h - 1 end
+
+    local t = #s - tail + 1
+    local nl2 = s:find('\n', t, true)
+    if nl2 and nl2 - t < tail / 2 then t = nl2 + 1 end
+    while t <= #s and (s:byte(t) or 0) >= 0x80 and (s:byte(t) or 0) < 0xC0 do t = t + 1 end
+
+    return s:sub(1, h) .. string.format('\n...[%d bytes omitted]...\n', t - h - 1) .. s:sub(t)
+end
+
 return M

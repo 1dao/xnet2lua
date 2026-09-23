@@ -214,6 +214,79 @@ spec.describe('text.valid_utf8', function()
     end)
 end)
 
+spec.describe('text.head_tail', function()
+    spec.it('returns short input unchanged', function()
+        spec.equal(text.head_tail('abc', 10, 10), 'abc')
+    end)
+
+    spec.it('keeps both ends on line boundaries and counts the gap', function()
+        local lines = {}
+        for i = 1, 200 do lines[i] = string.format('line %03d', i) end
+        local s = table.concat(lines, '\n')
+        local out = text.head_tail(s, 100, 100)
+        spec.truthy(out:sub(1, 8) == 'line 001', 'head kept')
+        spec.truthy(out:sub(-8) == 'line 200', 'tail kept')
+        spec.truthy(not out:find('line 100', 1, true), 'middle dropped')
+        spec.contains(out, 'bytes omitted')
+        for row in out:gmatch('[^\n]+') do
+            spec.truthy(row:match('^line %d%d%d$') or row:match('^%.%.%.%[%d+ bytes omitted%]%.%.%.$'),
+                'no partial line: ' .. row)
+        end
+    end)
+
+    spec.it('never splits a UTF-8 sequence', function()
+        local s = string.rep('中', 100)          -- 3 bytes each, no newlines
+        local out = text.head_tail(s, 10, 10)
+        spec.equal(text.valid_utf8(out), out)
+    end)
+end)
+
+spec.describe('Read tool', function()
+    local read = require('xagent.tools.read')
+    local tmp = (os.getenv('TEMP') or os.getenv('TMPDIR') or '.') .. '/xagent_read_spec.txt'
+    local function write_lines(n, width)
+        local rows = {}
+        for i = 1, n do
+            local r = 'row' .. i
+            rows[i] = r .. string.rep(' ', (width or 0) - #r)
+        end
+        local f = assert(io.open(tmp, 'wb')); f:write(table.concat(rows, '\n')); f:close()
+    end
+
+    spec.it('reads a small file whole with no continuation footer', function()
+        write_lines(5)
+        local r = read.call({ file_path = tmp })
+        spec.contains(r.content, '(5 lines)')
+        spec.contains(r.content, 'row5')
+        spec.truthy(not r.content:find('Call Read with offset', 1, true))
+    end)
+
+    spec.it('defaults to 2000 lines and names the next offset', function()
+        write_lines(2500)
+        local r = read.call({ file_path = tmp })
+        spec.contains(r.content, 'row2000')
+        spec.truthy(not r.content:find('row2001', 1, true), 'stops at the default limit')
+        spec.contains(r.content, 'Call Read with offset=2001')
+    end)
+
+    spec.it('caps the window at ~50KB on a whole line, even with an explicit limit', function()
+        write_lines(2000, 100)                    -- ~200KB
+        local r = read.call({ file_path = tmp, limit = 2000 })
+        spec.truthy(#r.content < 52000, 'got ' .. #r.content .. ' bytes')
+        local next_off = tonumber(r.content:match('offset=(%d+) to continue'))
+        spec.truthy(next_off and next_off > 1, 'footer gives the next offset')
+        spec.contains(r.content, 'cut at ~50KB')
+        spec.contains(r.content, 'row' .. (next_off - 1))
+    end)
+
+    spec.it('honors an explicit offset and reports past-the-end reads', function()
+        write_lines(10)
+        spec.contains(read.call({ file_path = tmp, offset = 8 }).content, 'row10')
+        spec.contains(read.call({ file_path = tmp, offset = 50 }).content, 'past the end')
+        os.remove(tmp)
+    end)
+end)
+
 return {
     __init = function()
         local failed = spec.finish()

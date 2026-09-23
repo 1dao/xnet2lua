@@ -7,7 +7,9 @@ local async = dofile('scripts/core/share/xasync.lua')
 local text = dofile('scripts/core/share/xtext.lua')
 local httpc = dofile('scripts/core/share/xhttp_client.lua')
 
-local MAX_OUTPUT = 30000
+-- The page text is resent on every later turn; 16KB keeps the main content of
+-- most docs pages without carrying a whole site's worth of navigation.
+local MAX_OUTPUT = 16000
 local UA = 'Mozilla/5.0 (compatible; xagent/0.1)'
 
 -- Best-effort HTML → text: drop script/style blocks, strip tags, decode common

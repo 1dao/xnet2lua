@@ -57,6 +57,21 @@ local function run_tests()
     check('Bash keeps quoted spacing',
         tostring(b4.content):find('a b c', 1, true) ~= nil, tostring(b4.content))
 
+    -- Long output keeps both ends (first error near the top, summary at the
+    -- bottom) and drops the middle instead of the whole tail.
+    local big = FIXTURE_DIR .. '/bash_big_output.txt'
+    local bf = assert(io.open(big, 'wb'))
+    for i = 1, 5000 do bf:write(string.format('out line %05d\n', i)) end
+    bf:close()
+    local b5 = bash.call({ command = IS_WIN and ('type ' .. (big:gsub('/', '\\'))) or ('cat ' .. big) }, ctx)
+    local c5 = tostring(b5.content)
+    os.remove(big)
+    check('Bash long output keeps head and tail',
+        c5:find('out line 00001', 1, true) and c5:find('out line 05000', 1, true)
+            and not c5:find('out line 02500', 1, true) and c5:find('bytes omitted', 1, true)
+            and #c5 < 17000,
+        #c5 .. ' bytes: ' .. c5:sub(1, 200))
+
     -- ---------------------------------------------------------------- Grep ---
     -- rg is an external dependency, not part of this repo. Report the Grep cases
     -- as skipped where it is missing rather than as seven identical failures.

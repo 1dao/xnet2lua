@@ -8,7 +8,11 @@ local subprocess = require('xagent.proc.subprocess')
 local text = dofile('scripts/core/share/xtext.lua')
 
 local DEFAULT_TIMEOUT_MS = 120000
-local MAX_OUTPUT = 30000
+-- Output is resent on every later turn, so keep a bounded slice: the head
+-- (the command echo and usually the first error) and the tail (the summary and
+-- the exit reason), dropping the middle.
+local HEAD_BYTES = 4000
+local TAIL_BYTES = 12000
 
 return {
     name = 'Bash',
@@ -39,7 +43,10 @@ return {
         end
 
         local out = r.stdout or ''
-        out = text.truncate(out, MAX_OUTPUT, string.format('\n...[truncated, %d bytes total]', #out))
+        if #out > HEAD_BYTES + TAIL_BYTES then
+            out = text.head_tail(out, HEAD_BYTES, TAIL_BYTES)
+                .. string.format('\n[output truncated: %d bytes total]', #r.stdout)
+        end
         if out == '' then out = '(no output)' end
         if r.exit_code ~= 0 then
             out = out .. '\n[exit code: ' .. tostring(r.exit_code) .. ']'
