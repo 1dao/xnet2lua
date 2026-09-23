@@ -74,6 +74,60 @@ spec.describe('tokens.cache usage', function()
     end)
 end)
 
+spec.describe('loop.run usage accounting', function()
+    local provider = require('xagent.llm.provider')
+    local loop = require('xagent.core.loop')
+    local U = { input_tokens = 100, output_tokens = 5, cache_read_input_tokens = 50 }
+
+    -- Run loop.run against canned replies (stop_reason per call); returns the
+    -- result and every emitted 'done' event.
+    local function run_with(stops, opts)
+        local saved, n = provider.stream_message, 0
+        provider.stream_message = function(_, _, cb)
+            n = n + 1
+            local stop = stops[math.min(n, #stops)]
+            local content = (stop == 'tool_use')
+                and { { type = 'tool_use', id = 'u' .. n, name = 'NoSuchTool', input = {} } }
+                or { { type = 'text', text = 'x' } }
+            cb.on_done({ message = { role = 'assistant', content = content }, stop_reason = stop, usage = U })
+        end
+        local res, dones = nil, {}
+        local o = { cfg = { model = 'm' }, messages = { { role = 'user', content = 'go' } },
+                    system = 'SYS', tools = {}, ctx = {},
+                    on_event = function(ev) if ev.type == 'done' then dones[#dones + 1] = ev end end }
+        for k, v in pairs(opts or {}) do o[k] = v end
+        local co = coroutine.create(function() res = loop.run(o) end)
+        local ok, err = coroutine.resume(co)
+        provider.stream_message = saved
+        assert(ok, err)
+        return res, dones, n
+    end
+
+    spec.it('counts the discarded attempt of a max_tokens retry', function()
+        local res, dones, calls = run_with({ 'max_tokens', 'end_turn' }, { max_tokens = 1000 })
+        spec.equal(calls, 2)
+        spec.equal(res.usage.input_tokens, 200)
+        spec.equal(res.usage.output_tokens, 10)
+        spec.equal(res.usage.cache_read_input_tokens, 100)
+        spec.equal(dones[1].usage.input_tokens, 200)
+    end)
+
+    spec.it('reports usage on a cancelled turn', function()
+        local stopped = false
+        local res, dones = run_with({ 'tool_use' }, {
+            should_stop = function() local s = stopped; stopped = true; return s end })
+        spec.equal(res.stop_reason, 'cancelled')
+        spec.equal(dones[1].usage.input_tokens, 100)
+    end)
+
+    spec.it('reports usage and keeps the anchor at the turn limit', function()
+        local res, dones = run_with({ 'tool_use' }, { max_turns = 2 })
+        spec.equal(res.stop_reason, 'max_turns')
+        spec.equal(dones[1].usage.input_tokens, 200)
+        spec.truthy(res.last_usage ~= nil and res.usage_anchor_index ~= nil, 'anchor kept')
+    end)
+end)
+
 spec.describe('tokens.budget', function()
     spec.it('uses the model window (DeepSeek = 128K)', function()
         local s = tokens.build_budget_snapshot({ { role = 'user', content = BIG } }, { model = 'deepseek-v4-pro' })

@@ -89,7 +89,7 @@ function M.run(opts)
         -- in a clean state (any tool_use already has its paired tool_result), so
         -- a cancelled session can be saved and resumed without a dangling pair.
         if opts.should_stop and opts.should_stop() then
-            emit({ type = 'done', stop_reason = 'cancelled' })
+            emit({ type = 'done', stop_reason = 'cancelled', usage = total })
             return { stop_reason = 'cancelled',
                      usage = total,
                      last_usage = last_usage, usage_anchor_index = anchor, turns = turn }
@@ -123,6 +123,8 @@ function M.run(opts)
                 function(id, name) emit({ type = 'tool_use_start', id = id, name = name }) end
             )
             if err or result.stop_reason ~= 'max_tokens' or eff_max >= ceiling then break end
+            -- The discarded attempt was still billed.
+            tokens.add_usage(total, result.usage)
             local new_max = math.min(eff_max * 2, ceiling)
             emit({ type = 'truncated_retry', from = eff_max, to = new_max, turn = turn })
             eff_max = new_max
@@ -162,9 +164,10 @@ function M.run(opts)
         messages[#messages + 1] = { role = 'user', content = tool_results }
     end
 
-    emit({ type = 'done', stop_reason = 'max_turns' })
+    emit({ type = 'done', stop_reason = 'max_turns', usage = total })
     return { stop_reason = 'max_turns',
-             usage = total, turns = opts.max_turns or M.MAX_TURNS }
+             usage = total,
+             last_usage = last_usage, usage_anchor_index = anchor, turns = opts.max_turns or M.MAX_TURNS }
 end
 
 return M
