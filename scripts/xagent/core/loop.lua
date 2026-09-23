@@ -6,7 +6,7 @@
 -- streaming client and, via tools, the subprocess RPC).
 
 local async = dofile('scripts/core/share/xasync.lua')
-local anthropic = require('xagent.llm.anthropic')
+local provider = require('xagent.llm.provider')
 local tools_run = require('xagent.core.tools_run')
 local compaction = require('xagent.context.compaction')
 local tokens = require('xagent.context.tokens')
@@ -26,7 +26,7 @@ M.MAX_TOKENS_CEILING = 32000
 -- One streaming turn. Streams text out via on_text; returns (result, err).
 local function stream_turn(cfg, params, on_text, on_tool_use_start)
     return async.await(function(resolve)
-        anthropic.stream_message(cfg, params, {
+        provider.stream_message(cfg, params, {
             on_text = on_text,
             on_tool_use_start = on_tool_use_start,
             on_done = function(result) resolve(result, nil) end,
@@ -139,8 +139,13 @@ function M.run(opts)
         emit({ type = 'assistant', message = assistant, usage = result.usage })
 
         -- The response's usage covers system + every message up to (and
-        -- including) this assistant turn; anchor future estimates on it.
-        last_usage, anchor = result.usage, #messages
+        -- including) this assistant turn; anchor future estimates on it. When
+        -- the server sent no usage (usage_missing), its zeros would anchor the
+        -- budget at 0 and stall auto-compaction, so keep the previous anchor
+        -- and let everything after it be estimated.
+        if not result.usage_missing then
+            last_usage, anchor = result.usage, #messages
+        end
         emit_budget(opts, messages, emit, last_usage, anchor)
 
         if result.stop_reason ~= 'tool_use' then

@@ -1,14 +1,16 @@
 -- xagent/test_loopback.lua — end-to-end SSE streaming over REAL xnet sockets,
--- no network and no API key. A loopback HTTP server emits a canned Anthropic
--- chunked text/event-stream response (split across several send_raw calls to
--- exercise incremental delivery); the client drives anthropic.stream_message
--- against it and asserts the reassembled message. Exits 0 on success, 1 on the
--- first mismatch.
+-- no network and no API key. A loopback HTTP server emits a canned chunked
+-- text/event-stream response (split across several send_raw calls to exercise
+-- incremental delivery) — Anthropic Messages or OpenAI Chat Completions,
+-- picked by the request path. The client drives each codec's stream_message
+-- against it and asserts both reassemble to the SAME Anthropic-shaped message.
+-- Exits 0 on success, 1 on the first mismatch.
 --
 -- Run: bin/xnet scripts/xagent/test_loopback.lua
 
 package.path = 'scripts/?.lua;' .. package.path
 local anthropic = require('xagent.llm.anthropic')
+local openai = require('xagent.llm.openai')
 local xutils = require('xutils')
 
 local HOST, PORT = '127.0.0.1', 18231
@@ -33,6 +35,25 @@ local SSE = table.concat({
     ev('content_block_stop',   { type='content_block_stop', index=1 }),
     ev('message_delta',        { type='message_delta', delta={ stop_reason='tool_use' }, usage={ output_tokens=4 } }),
     ev('message_stop',         { type='message_stop' }),
+})
+
+-- ── canned OpenAI SSE: the same text + tool call, in chunk form ─────────────
+local function data(obj) return 'data: ' .. pack(obj) .. '\n\n' end
+local function chunk(delta, finish_reason)
+    return data({ id = 'chatcmpl_lb', object = 'chat.completion.chunk',
+                  choices = { { index = 0, delta = delta, finish_reason = finish_reason } } })
+end
+
+local OPENAI_SSE = table.concat({
+    chunk({ role = 'assistant', content = 'Hello' }),
+    chunk({ content = ' world' }),
+    chunk({ tool_calls = { { index = 0, id = 'tu_lb', type = 'function',
+                             ['function'] = { name = 'Read', arguments = '{"file' } } } }),
+    chunk({ tool_calls = { { index = 0, ['function'] = { arguments = '_path":"x.lua"}' } } } }),
+    chunk({}, 'tool_calls'),
+    -- include_usage: a trailing chunk with empty choices, then the terminator.
+    data({ id = 'chatcmpl_lb', choices = {}, usage = { prompt_tokens = 7, completion_tokens = 4 } }),
+    'data: [DONE]\n\n',
 })
 
 -- chunk-encode `s` into pieces of `n` bytes each (HTTP Transfer-Encoding: chunked)
@@ -68,12 +89,13 @@ local function make_server()
         local buf = (bufs[conn] or '') .. data
         if not buf:find('\r\n\r\n', 1, true) then bufs[conn] = buf; return #data end
         bufs[conn] = nil
+        local body = buf:find('^POST [^ ]*/chat/completions') and OPENAI_SSE or SSE
         -- headers complete → emit a chunked SSE response in several writes
         conn:send_raw('HTTP/1.1 200 OK\r\n' ..
             'Content-Type: text/event-stream\r\n' ..
             'Transfer-Encoding: chunked\r\n' ..
             'Connection: close\r\n\r\n')
-        for _, piece in ipairs(chunk_pieces(SSE, 40)) do
+        for _, piece in ipairs(chunk_pieces(body, 40)) do
             conn:send_raw(piece)
         end
         conn:close('done')
@@ -83,39 +105,50 @@ local function make_server()
     return h
 end
 
--- ── client: drive the real streaming stack ─────────────────────────────────
-local streamed = {}
-local tool_started
-local result
+-- ── client: drive the real streaming stack, once per codec ─────────────────
+local CASES = {
+    { name = 'anthropic', codec = anthropic },
+    { name = 'openai', codec = openai },
+}
 
-local function run_client()
-    anthropic.stream_message(
-        { api_key = 'unused', base_url = BASE, model = 'test' },
+local function verify(name, text, tool_started, result)
+    local function bad(msg) return name .. ': ' .. msg end
+    if text ~= 'Hello world' then return bad('text=' .. text) end
+    if tool_started ~= 'Read:tu_lb' then return bad('tool_started=' .. tostring(tool_started)) end
+    if not result then return bad('no result') end
+    if result.stop_reason ~= 'tool_use' then return bad('stop_reason=' .. tostring(result.stop_reason)) end
+    local c = result.message.content
+    if #c ~= 2 then return bad('blocks=' .. #c) end
+    if c[1].type ~= 'text' or c[1].text ~= 'Hello world' then return bad('block1 bad') end
+    if c[2].type ~= 'tool_use' or c[2].name ~= 'Read' or c[2].input.file_path ~= 'x.lua' then
+        return bad('tool block bad: ' .. pack(c[2]))
+    end
+    if result.usage.input_tokens ~= 7 or result.usage.output_tokens ~= 4 then
+        return bad('usage bad')
+    end
+    return nil
+end
+
+local function run_case(i)
+    local case = CASES[i]
+    if not case then
+        return finish(true, 'anthropic + openai streams reassembled over real sockets')
+    end
+    local streamed, tool_started = {}, nil
+    case.codec.stream_message(
+        { api_key = 'unused', base_url = BASE, model = 'test', max_retries = 0 },
         { messages = { { role = 'user', content = 'hi' } } },
         {
             on_text = function(t) streamed[#streamed + 1] = t end,
             on_tool_use_start = function(id, name) tool_started = name .. ':' .. id end,
-            on_error = function(e) finish(false, 'on_error: ' .. tostring(e)) end,
-            on_done = function(r) result = r; verify() end,
+            on_error = function(e) finish(false, case.name .. ' on_error: ' .. tostring(e)) end,
+            on_done = function(r)
+                local problem = verify(case.name, table.concat(streamed), tool_started, r)
+                if problem then return finish(false, problem) end
+                out('[loopback] ' .. case.name .. ' ok\n')
+                run_case(i + 1)
+            end,
         })
-end
-
-function verify()
-    local text = table.concat(streamed)
-    if text ~= 'Hello world' then return finish(false, 'text=' .. text) end
-    if tool_started ~= 'Read:tu_lb' then return finish(false, 'tool_started=' .. tostring(tool_started)) end
-    if not result then return finish(false, 'no result') end
-    if result.stop_reason ~= 'tool_use' then return finish(false, 'stop_reason=' .. tostring(result.stop_reason)) end
-    local c = result.message.content
-    if #c ~= 2 then return finish(false, 'blocks=' .. #c) end
-    if c[1].type ~= 'text' or c[1].text ~= 'Hello world' then return finish(false, 'block1 bad') end
-    if c[2].type ~= 'tool_use' or c[2].name ~= 'Read' or c[2].input.file_path ~= 'x.lua' then
-        return finish(false, 'tool block bad: ' .. pack(c[2]))
-    end
-    if result.usage.input_tokens ~= 7 or result.usage.output_tokens ~= 4 then
-        return finish(false, 'usage bad')
-    end
-    finish(true, 'streamed text + tool_use reassembled over real sockets')
 end
 
 local function __init()
@@ -123,7 +156,7 @@ local function __init()
     local s, e = xnet.listen(HOST, PORT, make_server())
     if not s then return finish(false, 'listen: ' .. tostring(e)) end
     server = s
-    run_client()
+    run_case(1)
 end
 
 local function __uninit()

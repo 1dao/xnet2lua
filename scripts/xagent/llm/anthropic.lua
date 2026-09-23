@@ -2,15 +2,14 @@
 --
 -- Turns the raw SSE event stream (message_start / content_block_* /
 -- message_delta / message_stop) into assembled assistant content blocks, while
--- surfacing incremental text/tool events as they arrive. Transport is delegated
--- to llm/stream.lua.
+-- surfacing incremental text/tool events as they arrive. Transport and retry
+-- live in llm/common.lua.
 --
 -- Config (cfg): { api_key, base_url?, model?, verify?, ca_file?, auth_style? }
 --   auth_style: 'x-api-key' (default) or 'bearer' (some compatible endpoints).
 
-local stream = dofile('scripts/core/share/xhttp_stream.lua')
 local xutils = require('xutils')
-local api_log = require('xagent.llm.api_log')
+local common = require('xagent.llm.common')
 
 local M = {}
 
@@ -137,46 +136,7 @@ function M.new_decoder(cb)
             local i = ev.index
             local b = self.blocks[i]
             if b and b.type == 'tool_use' then
-                local acc = self.tool_json[i] or ''
-                if acc ~= '' then
-                    local ok2, parsed, perr = pcall(xutils.json_unpack, acc)
-                    if ok2 and type(parsed) == 'table' then
-                        b.input = parsed
-                    else
-                        -- Parse failed. DON'T swallow the reason: json_unpack
-                        -- returns (nil, "json unpack error at <pos>: <msg>"); a
-                        -- raised error comes back as parsed. Keep both _raw and
-                        -- _error so tools_run can surface the real cause to the
-                        -- model instead of a misleading "X is required" (which
-                        -- the model just blindly retries → infinite loop).
-                        local reason = (not ok2) and tostring(parsed)
-                            or tostring(perr or 'invalid json')
-                        b.input = { _raw = acc, _error = reason }
-                        -- Diagnostic dump (latest failure) for root-causing: the
-                        -- offending byte region around err.pos reveals invalid
-                        -- UTF-8 vs. an unescaped control char vs. truncation.
-                        pcall(function()
-                            local f = io.open('tool_json_fail.txt', 'wb')
-                            if not f then return end
-                            f:write('tool: ', tostring(b.name), '\n')
-                            f:write('error: ', reason, '\n')
-                            f:write('acc_len: ', tostring(#acc), '\n')
-                            local pos = tonumber(reason:match('at (%d+)'))
-                            if pos and pos >= 1 then
-                                local a = math.max(1, pos - 80)
-                                local z = math.min(#acc, pos + 80)
-                                f:write('context[', a, '..', z, ']:\n', acc:sub(a, z), '\n')
-                                f:write('hex around pos ', pos, ':\n')
-                                for k = math.max(1, pos - 16), math.min(#acc, pos + 16) do
-                                    f:write(string.format('%02X ', acc:byte(k)))
-                                end
-                                f:write('\n')
-                            end
-                            f:write('--- full acc ---\n', acc, '\n')
-                            f:close()
-                        end)
-                    end
-                end
+                b.input = common.parse_tool_input(self.tool_json[i], b.name)
             end
 
         elseif t == 'message_delta' then
@@ -188,6 +148,7 @@ function M.new_decoder(cb)
             end
 
         elseif t == 'message_stop' then
+            self.got_stop = true
             self:finish()
 
         elseif t == 'error' then
@@ -209,6 +170,18 @@ function M.new_decoder(cb)
             end
             return
         end
+        -- Closed mid-response: no message_stop and no stop_reason (message_delta)
+        -- — some gateways skip message_stop, so either one counts as complete.
+        -- Without this, truncated text would end the turn as if normal, and a
+        -- tool_use whose input may be cut off would be executed.
+        if not self.got_stop and self.stop_reason == '' then
+            self.errored = true
+            if cb.on_error then
+                cb.on_error('stream ended before the response completed (no stop_reason); ' ..
+                    'the connection was probably dropped')
+            end
+            return
+        end
         local content = {}
         for i = 0, self.max_index do
             if self.blocks[i] then content[#content + 1] = self.blocks[i] end
@@ -226,83 +199,9 @@ function M.new_decoder(cb)
     return self
 end
 
-local function format_http_error(status, body)
-    local msg = body or ''
-    local ok, parsed = pcall(xutils.json_unpack, body or '')
-    if ok and type(parsed) == 'table' and parsed.error and parsed.error.message then
-        msg = parsed.error.message
-    end
-    if #tostring(msg) > 500 then msg = tostring(msg):sub(1, 500) .. '...' end
-    return string.format('HTTP %s: %s', tostring(status), msg)
-end
-
--- ── one streaming request, with retry on transient failures ────────────────
--- stream_message(cfg, params, cb) — cb same shape as new_decoder's cb.
---   params = { messages, system?, tools?, model?, max_tokens?, tool_choice? }
--- Retries (up to cfg.max_retries, default 2) when the connection drops before
--- ANY content is surfaced — a connection reset, a 5xx, or a 429. This is safe
--- because nothing was shown yet, so a re-run can't duplicate visible output.
--- A 4xx (other than 429) is a real client error and is surfaced immediately.
+-- stream_message(cfg, params, cb) — see common.stream_message for cb/params.
 function M.stream_message(cfg, params, cb)
-    cb = cb or {}
-    local max_retries = tonumber(cfg.max_retries) or 2
-
-    local attempt
-    attempt = function(n)
-        local ok, req = pcall(M.build_request, cfg, params)
-        if not ok then
-            if cb.on_error then cb.on_error(tostring(req)) end
-            return
-        end
-
-        -- Record this HTTP attempt (in-memory, for the GUI's "API 记录" panel).
-        -- Each attempt is its own entry, so retried/dropped requests show up too.
-        local rec = api_log.begin({
-            model = params.model or cfg.model, url = req.url, method = 'POST',
-            body = req.body, headers = req.headers,
-        })
-
-        local got_content = false
-        local function retry_or_fail(msg, transient)
-            api_log.fail(rec, { error = msg })
-            if transient and not got_content and n < max_retries then
-                attempt(n + 1)            -- immediate re-attempt (fresh connection)
-            elseif cb.on_error then
-                cb.on_error(msg)
-            end
-        end
-
-        local decoder = M.new_decoder({
-            on_text = function(t) got_content = true; if cb.on_text then cb.on_text(t) end end,
-            on_tool_use_start = function(id, name)
-                got_content = true
-                if cb.on_tool_use_start then cb.on_tool_use_start(id, name) end
-            end,
-            on_tool_input = cb.on_tool_input,
-            on_done = function(r) api_log.finish(rec, r); if cb.on_done then cb.on_done(r) end end,
-            -- decoder errors include the "connection closed before any data"
-            -- case (got_any=false) and SSE `error` events — both transient.
-            on_error = function(m) retry_or_fail(m, true) end,
-        })
-
-        stream.request({
-            url = req.url, method = 'POST', headers = req.headers, body = req.body,
-            verify = cfg.verify, ca_file = cfg.ca_file,
-        }, {
-            on_headers = function(status) api_log.set_status(rec, status) end,
-            on_body = function(chunk) api_log.append_raw(rec, chunk) end,
-            on_sse = function(event, data) decoder:on_sse(event, data) end,
-            on_done = function() decoder:finish() end,   -- close before message_stop
-            on_error = function(err) retry_or_fail('connection error: ' .. tostring(err), true) end,
-            on_http_error = function(status, body)
-                local transient = (status == 429 or status >= 500)
-                api_log.set_status(rec, status)
-                retry_or_fail(format_http_error(status, body), transient)
-            end,
-        })
-    end
-
-    attempt(0)
+    return common.stream_message(M, cfg, params, cb)
 end
 
 return M

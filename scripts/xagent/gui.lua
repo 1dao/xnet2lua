@@ -1307,26 +1307,28 @@ end
 
 local function open_add_model()
     S.dd_open = nil
-    S.add_model = { name = '', url = 'https://', model = '', token = '',
+    S.add_model = { name = '', url = 'https://', model = '', token = '', api_format = nil,
                     name_e = false, url_e = false, model_e = false, token_e = false, err = nil }
 end
 
 -- A centered modal to add a model (persisted to ~/.xagent/models.json). Only
--- URL + 模型ID are required; auth_style is auto (x-api-key). Esc / 取消 closes.
+-- URL + 模型ID are required. The protocol follows the URL until the user picks
+-- one; auth_style is derived from the protocol (x-api-key / Bearer). Esc / 取消
+-- closes.
 local function draw_add_model_modal(W, H)
     local f = S.add_model
     if not f then return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
         S.add_model = nil; return
     end
-    local mw, mh = 520, 300
+    local mw, mh = 520, 336
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
     raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
-    raygui.label(mx + 16, my + 12, mw - 32, 24, '新增模型（鉴权方式自动 = x-api-key）')
+    raygui.label(mx + 16, my + 12, mw - 32, 24, '新增模型（鉴权方式按协议自动选择）')
 
     local pad, lblw = 16, 84
     local fx = mx + pad + lblw + 8
@@ -1342,6 +1344,16 @@ local function draw_add_model_modal(W, H)
     fld('模型ID', 'model')
     fld('Token', 'token')
 
+    -- Protocol toggle. Until clicked it tracks the URL (…/chat/completions,
+    -- api.openai.com → OpenAI); a click pins the choice.
+    local fmt = f.api_format or config.infer_api_format(f.url)
+    raygui.label(mx + pad, row + 4, lblw, 22, '协议')
+    local fmt_label = (fmt == 'openai') and 'OpenAI (Chat Completions)' or 'Anthropic (Messages)'
+    if raygui.button(fx, row, fw, rh - 4, fmt_label) then
+        f.api_format = (fmt == 'openai') and 'anthropic' or 'openai'
+    end
+    row = row + rh + 6
+
     if f.err then
         local ec = { 220, 90, 90, 255 }
         raygui.draw_rectangle(mx + pad, row, 6, 6, ec[1], ec[2], ec[3], 255)
@@ -1355,7 +1367,7 @@ local function draw_add_model_modal(W, H)
             f.err = '请至少填写 API地址 和 模型ID'
         else
             config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
-                base_url = url, model = model,
+                base_url = url, model = model, api_format = f.api_format,
                 api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '') })
             reload_profiles()
             S.model_sel = #S.profiles      -- select the model just added
@@ -1718,6 +1730,7 @@ local function __update()
                 local function det(s) raygui.label(pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
                 det('地址: ' .. sanitize_label(selp.base_url or '?'))
                 det('模型: ' .. sanitize_label(selp.model or '?'))
+                det('协议: ' .. tostring(selp.api_format or 'anthropic'))
                 det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
                 det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
                 det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))

@@ -45,13 +45,22 @@ local function utf8_prefix(s, max)
 end
 
 -- Copy headers, masking the secret auth header so a clipboard copy of the
--- request never leaks the API key.
+-- request never leaks the API key. Match by shape, not a fixed list: each
+-- provider picks its own header (x-api-key, Azure's api-key, …), and a new one
+-- must not slip through unmasked.
+local function is_secret_header(lk)
+    return lk == 'authorization' or lk == 'proxy-authorization'
+        or lk:find('api%-?key') ~= nil or lk:find('token') ~= nil
+end
+
+function M._is_secret_header(name) return is_secret_header(tostring(name):lower()) end
+
 local function redact_headers(h)
     if type(h) ~= 'table' then return nil end
     local out = {}
     for k, v in pairs(h) do
         local lk = tostring(k):lower()
-        if lk == 'x-api-key' or lk == 'authorization' then
+        if is_secret_header(lk) then
             out[k] = '***redacted***'
         else
             out[k] = v

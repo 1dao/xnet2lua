@@ -1,5 +1,5 @@
 -- xagent/test_stream.lua — live end-to-end streaming check against a real
--- Anthropic-compatible endpoint. Unlike tests/lua/xagent_llm_spec.lua (offline,
+-- Anthropic- or OpenAI-compatible endpoint. Unlike tests/lua/xagent_llm_spec.lua (offline,
 -- deterministic), this one actually opens a TLS connection and streams tokens.
 --
 -- Run (PowerShell):
@@ -9,12 +9,14 @@
 --   ANTHROPIC_MODEL / MODEL=...        (default below)
 --   PROMPT="..."        the user message
 --   AUTH_STYLE=bearer   for OpenAI-style "Authorization: Bearer" endpoints
+--   API_FORMAT=openai   speak Chat Completions instead of Messages
+--   BASE_URL=...        endpoint override (e.g. https://api.deepseek.com)
 --
 -- NOTE: Lua print() is routed to the log file by the runtime; this script uses
 -- io.write + io.flush so the streamed text shows on the real stdout.
 
 package.path = 'scripts/?.lua;' .. package.path
-local anthropic = require('xagent.llm.anthropic')
+local provider = require('xagent.llm.provider')
 local config = require('xagent.config')
 
 -- KEY=VALUE argv overrides (the runner exposes them in the global `arg`).
@@ -29,6 +31,11 @@ end
 -- Base config from xnet.cfg + xagent.local.cfg + env; argv can override.
 local cfg = config.load()
 if argv.MODEL then cfg.model = argv.MODEL end
+if argv.BASE_URL then cfg.base_url = argv.BASE_URL end
+if argv.API_FORMAT then
+    cfg.api_format = argv.API_FORMAT
+    cfg.auth_style = config.infer_auth_style(cfg.base_url, cfg.api_format)
+end
 if argv.AUTH_STYLE then cfg.auth_style = argv.AUTH_STYLE end
 local base_url = cfg.base_url
 local model    = cfg.model
@@ -45,9 +52,10 @@ local function __init()
     end
 
     assert(xnet.init())
-    out(string.format('--- streaming from %s  (model=%s) ---\n', base_url, model))
+    out(string.format('--- streaming from %s  (model=%s, %s) ---\n',
+        base_url, model, tostring(cfg.api_format)))
 
-    anthropic.stream_message(cfg, {
+    provider.stream_message(cfg, {
         messages = { { role = 'user', content = prompt } },
         max_tokens = tonumber(argv.MAX_TOKENS) or 256,
     }, {

@@ -167,6 +167,34 @@ spec.describe('anthropic reassembler', function()
         dec:on_sse('error', pack({ type = 'error', error = { message = 'overloaded' } }))
         spec.equal(got, 'overloaded')
     end)
+
+    spec.it('fails a stream that closes before any stop_reason', function()
+        local got, done
+        local dec = anthropic.new_decoder({
+            on_error = function(m) got = m end, on_done = function() done = true end })
+        dec:on_sse('message_start', pack({ type = 'message_start', message = { id = 'm' } }))
+        dec:on_sse('content_block_start', pack({ type = 'content_block_start', index = 0,
+            content_block = { type = 'tool_use', id = 't', name = 'Bash' } }))
+        dec:on_sse('content_block_delta', pack({ type = 'content_block_delta', index = 0,
+            delta = { type = 'input_json_delta', partial_json = '{"command":"rm' } }))
+        dec:finish()   -- transport closed: no message_delta / message_stop
+        spec.nil_value(done)
+        spec.contains(got, 'before the response completed')
+    end)
+end)
+
+spec.describe('api_log redaction', function()
+    spec.it('masks every provider auth header', function()
+        local api_log = require('xagent.llm.api_log')
+        for _, h in ipairs({ 'Authorization', 'x-api-key', 'api-key', 'X-Goog-Api-Key', 'X-Auth-Token' }) do
+            spec.truthy(api_log._is_secret_header(h), h)
+        end
+        spec.truthy(not api_log._is_secret_header('content-type'))
+        local rec = api_log.begin({ url = 'u', method = 'POST', body = '{}',
+            headers = { ['api-key'] = 'sk-secret', ['content-type'] = 'application/json' } })
+        spec.equal(rec.headers['api-key'], '***redacted***')
+        spec.equal(rec.headers['content-type'], 'application/json')
+    end)
 end)
 
 spec.describe('anthropic.build_request', function()

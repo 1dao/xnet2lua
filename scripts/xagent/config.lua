@@ -6,7 +6,8 @@
 --   3. ANTHROPIC_* env     (override, for one-off runs)
 --
 -- A "profile" is one model/endpoint. The base profile uses the un-suffixed keys
--- (XAGENT_BASE_URL / XAGENT_MODEL / XAGENT_AUTH_STYLE / XAGENT_AUTH_TOKEN);
+-- (XAGENT_BASE_URL / XAGENT_MODEL / XAGENT_AUTH_STYLE / XAGENT_AUTH_TOKEN /
+-- XAGENT_API_FORMAT);
 -- additional profiles use a numeric suffix (XAGENT_BASE_URL1, XAGENT_MODEL1, …;
 -- then …2, …3). Each numbered profile's token falls back to the shared
 -- XAGENT_AUTH_TOKEN when no XAGENT_AUTH_TOKEN{N} is set. M.load_profiles()
@@ -14,7 +15,8 @@
 -- just the base profile (the headless main.lua and tests use this).
 --
 -- Profiles ALSO come from ~/.xagent/models.json — models the user adds in the
--- GUI settings page (each { name, base_url, model, auth_style, api_key }). These
+-- GUI settings page (each { name, base_url, model, api_format, auth_style,
+-- api_key }). These
 -- are tagged source='json' (cfg-defined ones are source='cfg') so the GUI can
 -- offer delete only for the user-managed ones. Tokens live in the user's home
 -- dir, never in the repo.
@@ -25,6 +27,25 @@ local fs     = dofile('scripts/core/share/xfs.lua')
 local M = {}
 
 local MAX_PROFILES = 32
+
+-- Wire protocol of an endpoint: 'anthropic' (Messages) or 'openai' (Chat
+-- Completions). Explicit config wins; otherwise guess from the URL, defaulting
+-- to anthropic so existing profiles keep working. DeepSeek/Kimi/… serve both
+-- (…/anthropic vs. the bare host), so only unambiguous URLs flip to openai.
+function M.infer_api_format(url)
+    local u = tostring(url or ''):lower()
+    if u:find('/anthropic') or u:find('api%.anthropic%.com') then return 'anthropic' end
+    if u:find('/chat/completions') or u:find('api%.openai%.com')
+        or u:find('openai%.azure%.com') or u:find('/compatible%-mode/') then
+        return 'openai'
+    end
+    return 'anthropic'
+end
+
+local function resolve_api_format(explicit, url)
+    if explicit and explicit ~= '' then return explicit:lower() end
+    return M.infer_api_format(url)
+end
 
 local function cfg(key)
     local v = xutils.get_config(key)
@@ -42,19 +63,26 @@ local function build(suffix, shared_token)
     if suffix ~= '' and not base_url and not model then return nil end
 
     local token = cfg('XAGENT_AUTH_TOKEN' .. suffix) or shared_token
-    if suffix == '' then
+    local explicit_format = cfg('XAGENT_API_FORMAT' .. suffix)
+    if explicit_format == 'openai' then
+        base_url = base_url or 'https://api.openai.com/v1'
+        model    = model or 'gpt-4.1'
+    elseif suffix == '' then
         base_url = base_url or os.getenv('ANTHROPIC_BASE_URL') or 'https://api.anthropic.com'
         model    = model or os.getenv('ANTHROPIC_MODEL') or 'claude-sonnet-4-5'
     else
         base_url = base_url or 'https://api.anthropic.com'
         model    = model or 'claude-sonnet-4-5'
     end
+    local api_format = resolve_api_format(explicit_format, base_url)
 
     return {
         api_key    = token,
         base_url   = base_url,
         model      = model,
-        auth_style = cfg('XAGENT_AUTH_STYLE' .. suffix) or 'x-api-key',
+        api_format = api_format,
+        auth_style = cfg('XAGENT_AUTH_STYLE' .. suffix) or M.infer_auth_style(base_url, api_format),
+        max_tokens_param = cfg('XAGENT_MAX_TOKENS_PARAM' .. suffix),
         name       = cfg('XAGENT_NAME' .. suffix),   -- explicit label (nil → derived below)
         verify     = true,
     }
@@ -89,9 +117,14 @@ function M.models_file()
 end
 
 -- Auto-derive the auth header style from the endpoint. Anthropic and the common
--- /anthropic-compatible gateways (DeepSeek, Volcengine ark, …) all use x-api-key,
--- so that's the default; the user can hand-edit models.json for bearer.
-function M.infer_auth_style(_url)
+-- /anthropic-compatible gateways (DeepSeek, Volcengine ark, …) all use x-api-key;
+-- OpenAI-format endpoints use a Bearer token, except Azure's `api-key` header.
+-- The user can hand-edit models.json to override.
+function M.infer_auth_style(url, api_format)
+    if (api_format or M.infer_api_format(url)) == 'openai' then
+        if tostring(url or ''):lower():find('openai%.azure%.com') then return 'api-key' end
+        return 'bearer'
+    end
     return 'x-api-key'
 end
 
@@ -106,11 +139,14 @@ function M.load_user_models()
     if type(arr) == 'table' then
         for _, m in ipairs(arr) do
             if type(m) == 'table' and (m.base_url or m.model) then
+                local api_format = resolve_api_format(m.api_format, m.base_url)
                 out[#out + 1] = {
                     name       = m.name,
                     base_url   = m.base_url,
                     model      = m.model,
-                    auth_style = m.auth_style or M.infer_auth_style(m.base_url),
+                    api_format = api_format,
+                    max_tokens_param = m.max_tokens_param,
+                    auth_style = m.auth_style or M.infer_auth_style(m.base_url, api_format),
                     api_key    = m.api_key,
                     verify     = true,
                 }
@@ -124,21 +160,25 @@ local function save_user_models(list)
     local clean = {}
     for _, m in ipairs(list) do
         clean[#clean + 1] = { name = m.name, base_url = m.base_url,
-            model = m.model, auth_style = m.auth_style, api_key = m.api_key }
+            model = m.model, api_format = m.api_format, auth_style = m.auth_style,
+            max_tokens_param = m.max_tokens_param, api_key = m.api_key }
     end
     fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
     return fs.write_file(M.models_file(), xutils.json_pack({ models = clean }))
 end
 
--- Append a user model. m = { name?, base_url, model, api_key?, auth_style? }.
+-- Append a user model. m = { name?, base_url, model, api_key?, api_format?,
+-- auth_style? }.
 function M.add_user_model(m)
     local list = M.load_user_models()
+    local api_format = resolve_api_format(m.api_format, m.base_url)
     list[#list + 1] = {
         name       = (m.name and m.name ~= '') and m.name or m.model,
         base_url   = m.base_url,
         model      = m.model,
+        api_format = api_format,
         auth_style = (m.auth_style and m.auth_style ~= '') and m.auth_style
-            or M.infer_auth_style(m.base_url),
+            or M.infer_auth_style(m.base_url, api_format),
         api_key    = (m.api_key and m.api_key ~= '') and m.api_key or nil,
     }
     return save_user_models(list)

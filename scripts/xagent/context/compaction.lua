@@ -10,10 +10,10 @@
 --
 -- auto_compact_if_needed() is the entry point the loop calls before each turn.
 -- The summarization step makes an LLM call, so it MUST run inside the agent
--- coroutine (it awaits anthropic.stream_message).
+-- coroutine (it awaits provider.stream_message).
 
 local async     = dofile('scripts/core/share/xasync.lua')
-local anthropic = require('xagent.llm.anthropic')
+local provider = require('xagent.llm.provider')
 local tokens    = require('xagent.context.tokens')
 local text      = dofile('scripts/core/share/xtext.lua')
 
@@ -218,7 +218,7 @@ function M.summarize_messages(cfg, messages, focus)
 
     local acc = {}
     local result, err = async.await(function(resolve)
-        anthropic.stream_message(cfg, {
+        provider.stream_message(cfg, {
             system = system,
             messages = { { role = 'user', content = 'Conversation to summarize:\n' .. convo } },
             max_tokens = M.SUMMARY_MAX_TOKENS,
