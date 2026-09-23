@@ -50,7 +50,7 @@ end
 -- emits a 'compact' event when anything changed.
 local function maybe_compact(opts, messages, emit, last_usage, anchor)
     local res = compaction.auto_compact_if_needed({
-        messages = messages, cfg = opts.cfg, system = opts.system,
+        messages = messages, cfg = opts.cfg, system = opts.system, tools = opts.tools,
         usage = last_usage, usage_anchor_index = anchor,
         notify = function() emit({ type = 'compact_start' }) end,
     })

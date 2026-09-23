@@ -208,29 +208,63 @@ local function render_for_summary(messages)
     return text.valid_utf8(table.concat(parts, '\n'))
 end
 
--- summarize_messages(cfg, messages, focus) -> summary, err. Runs inside coroutine.
-function M.summarize_messages(cfg, messages, focus)
-    local system = NO_TOOLS_PREAMBLE .. BASE_COMPACT_PROMPT
+local function compact_prompt(focus)
+    local p = NO_TOOLS_PREAMBLE .. BASE_COMPACT_PROMPT
     if focus and focus ~= '' then
-        system = system .. '\n\n## Compact Instructions\n' .. focus
+        p = p .. '\n\n## Compact Instructions\n' .. focus
     end
-    local convo = render_for_summary(messages)
+    return p
+end
 
+-- The history plus the compaction instruction as the only new content. The
+-- instruction must not open a second consecutive user turn (strict endpoints
+-- reject that), so when the history already ends on a user message it is
+-- appended as a trailing text block of a copy of that message — everything
+-- before it stays byte-identical to the request the loop last sent.
+function M.build_cached_summary_messages(messages, instruction)
+    local out = table.move(messages, 1, #messages, 1, {})
+    local last = out[#out]
+    if last and last.role == 'user' then
+        local c = last.content
+        local blocks
+        if type(c) == 'string' then
+            blocks = { { type = 'text', text = c } }
+        elseif type(c) == 'table' then
+            blocks = table.move(c, 1, #c, 1, {})
+        else
+            blocks = {}
+        end
+        blocks[#blocks + 1] = { type = 'text', text = instruction }
+        local nm = {}
+        for k, v in pairs(last) do nm[k] = v end
+        nm.content = blocks
+        out[#out] = nm
+    else
+        out[#out + 1] = { role = 'user', content = instruction }
+    end
+    return out
+end
+
+-- The model's <analysis> is scratch work: keeping it would carry thousands of
+-- tokens into every later request. Keep only the <summary> body when present.
+function M.format_summary(raw)
+    local s = tostring(raw or '')
+    s = s:gsub('<analysis>.-</analysis>', '')
+    local body = s:match('<summary>(.-)</summary>') or s:match('<summary>(.*)$')
+    if body then s = body end
+    return (s:gsub('^%s+', ''):gsub('%s+$', ''))
+end
+
+local function run_summary(cfg, params)
     local acc = {}
     local result, err = async.await(function(resolve)
-        provider.stream_message(cfg, {
-            system = system,
-            messages = { { role = 'user', content = 'Conversation to summarize:\n' .. convo } },
-            max_tokens = M.SUMMARY_MAX_TOKENS,
-            -- no tools on purpose
-        }, {
+        provider.stream_message(cfg, params, {
             on_text = function(t) acc[#acc + 1] = t end,
             on_done = function(r) resolve(r, nil) end,
             on_error = function(e) resolve(nil, e) end,
         })
     end)
     if err then return nil, err end
-
     -- Prefer streamed text; fall back to reassembled blocks.
     local summary = table.concat(acc)
     if summary == '' and result and result.message then
@@ -238,7 +272,45 @@ function M.summarize_messages(cfg, messages, focus)
             if b.type == 'text' then summary = summary .. b.text end
         end
     end
-    return (summary:gsub('^%s+', ''):gsub('%s+$', '')), nil
+    return M.format_summary(summary), nil
+end
+
+-- summarize_messages(cfg, messages, focus, opts) -> summary, err. Runs inside
+-- the coroutine.
+-- opts = { system?, tools?, cached_messages? }
+--
+-- First try: replay the exact request the loop has been sending (same system,
+-- same tools, same history) and append the instruction. At compaction time that
+-- prefix is ~all of the window, and on a prompt-caching endpoint it is already
+-- cached, so the summary costs cache-read price instead of a full-price re-read
+-- of the whole conversation. cached_messages is the history as last sent (NOT
+-- micro-compacted — clearing old bodies would change the prefix).
+--
+-- Fallback: a fresh request over a plain-text transcript (old tool bodies
+-- capped at 4000 chars). Used when there is no system prompt to align with,
+-- when the replay fails (e.g. the history no longer fits the window), or when
+-- the model answers with a tool call instead of text.
+function M.summarize_messages(cfg, messages, focus, opts)
+    opts = opts or {}
+    local prompt = compact_prompt(focus)
+
+    if opts.system and opts.system ~= '' then
+        local replay = opts.cached_messages or messages
+        local summary = run_summary(cfg, {
+            system = opts.system,
+            tools = opts.tools,
+            messages = M.build_cached_summary_messages(replay, prompt),
+            max_tokens = M.SUMMARY_MAX_TOKENS,
+        })
+        if summary and summary ~= '' then return summary, nil end
+    end
+
+    return run_summary(cfg, {
+        system = prompt,
+        messages = { { role = 'user', content = 'Conversation to summarize:\n' .. render_for_summary(messages) } },
+        max_tokens = M.SUMMARY_MAX_TOKENS,
+        -- no tools on purpose
+    })
 end
 
 local CONTINUE_PREFIX =
@@ -262,8 +334,10 @@ end
 
 -- ── orchestration ───────────────────────────────────────────────────────────
 
--- opts: { messages, cfg, system?, usage?, usage_anchor_index?, focus?,
+-- opts: { messages, cfg, system?, tools?, usage?, usage_anchor_index?, focus?,
 --         force?, query_source? }
+-- system/tools must be exactly what the loop sends, so the summary request can
+-- reuse its cached prefix.
 -- Returns: { messages, did_compact, did_micro, summary?, estimated, threshold }
 function M.auto_compact_if_needed(opts)
     local messages = opts.messages
@@ -314,7 +388,9 @@ function M.auto_compact_if_needed(opts)
     -- a full (slow) model round-trip with no streamed text, so the UI must say
     -- it's compacting or it looks frozen.
     if opts.notify then opts.notify() end
-    local summary, err = M.summarize_messages(cfg, working, opts.focus)
+    local summary, err = M.summarize_messages(cfg, working, opts.focus, {
+        system = opts.system, tools = opts.tools, cached_messages = messages,
+    })
     if err or not summary or summary == '' then
         consecutive_failures = consecutive_failures + 1
         return {

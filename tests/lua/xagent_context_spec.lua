@@ -125,6 +125,84 @@ spec.describe('compaction.auto_compact_if_needed', function()
     end)
 end)
 
+spec.describe('compaction.build_cached_summary_messages', function()
+    spec.it('keeps the history prefix and folds the instruction into a trailing user turn', function()
+        local h = make_history()
+        local out = comp.build_cached_summary_messages(h, 'SUMMARIZE')
+        spec.equal(#out, #h)
+        for i = 1, #h - 1 do spec.truthy(out[i] == h[i], 'prefix message ' .. i .. ' must be shared') end
+        local last = out[#out].content
+        spec.equal(last[1].type, 'tool_result')
+        spec.equal(last[#last].text, 'SUMMARIZE')
+        spec.equal(#h[#h].content, 1, 'the real history must not be mutated')
+    end)
+
+    spec.it('appends a new user turn after an assistant message', function()
+        local h = { { role = 'user', content = 'q' }, { role = 'assistant', content = 'a' } }
+        local out = comp.build_cached_summary_messages(h, 'SUMMARIZE')
+        spec.equal(#out, 3)
+        spec.equal(out[3].role, 'user')
+        spec.equal(out[3].content, 'SUMMARIZE')
+    end)
+end)
+
+spec.describe('compaction.format_summary', function()
+    spec.it('drops the analysis scratchpad and unwraps the summary', function()
+        spec.equal(comp.format_summary('<analysis>long notes</analysis>\n<summary>\nKEEP\n</summary>'), 'KEEP')
+        spec.equal(comp.format_summary('plain text'), 'plain text')
+    end)
+end)
+
+spec.describe('compaction.summarize_messages', function()
+    local provider = require('xagent.llm.provider')
+
+    -- Run fn in a coroutine with provider.stream_message answering from `reply`
+    -- (fn(params) -> text or nil for an error); returns the captured requests.
+    local function with_provider(reply, fn)
+        local saved, calls = provider.stream_message, {}
+        provider.stream_message = function(_, params, cb)
+            calls[#calls + 1] = params
+            local t = reply(params, #calls)
+            if t then
+                cb.on_text(t)
+                cb.on_done({ message = { role = 'assistant', content = { { type = 'text', text = t } } } })
+            else
+                cb.on_error('boom')
+            end
+        end
+        local co = coroutine.create(fn)
+        local ok, err = coroutine.resume(co)
+        provider.stream_message = saved
+        assert(ok, err)
+        return calls
+    end
+
+    spec.it('replays the sent request (system, tools, raw history) for a cache hit', function()
+        local h = make_history()
+        local tools = { { name = 'Read' } }
+        local got
+        local calls = with_provider(function() return '<summary>S</summary>' end, function()
+            got = comp.summarize_messages({}, {}, nil, { system = 'SYS', tools = tools, cached_messages = h })
+        end)
+        spec.equal(got, 'S')
+        spec.equal(#calls, 1)
+        spec.equal(calls[1].system, 'SYS')
+        spec.truthy(calls[1].tools == tools, 'tools must be the same as the loop sends')
+        spec.truthy(calls[1].messages[1] == h[1], 'history prefix must be replayed as-is')
+    end)
+
+    spec.it('falls back to a transcript request when the replay fails', function()
+        local got
+        local calls = with_provider(function(_, n) if n == 2 then return 'FALLBACK' end end, function()
+            got = comp.summarize_messages({}, make_history(), nil, { system = 'SYS' })
+        end)
+        spec.equal(got, 'FALLBACK')
+        spec.equal(#calls, 2)
+        spec.nil_value(calls[2].tools)
+        spec.contains(calls[2].messages[1].content, 'Conversation to summarize')
+    end)
+end)
+
 return {
     __init = function()
         local failed = spec.finish()

@@ -93,13 +93,19 @@ end
 -- assistant message (and any tool_result turns) to self.messages in place, and
 -- may compact the history when it nears the context window. The usage anchor is
 -- threaded across turns so the token estimate stays cheap and accurate.
-function Session:run(on_event)
-    self:ensure_title()
-    -- The skills listing is appended fresh each turn so conditional skills
-    -- activated by the previous turn's file touches become visible.
+-- The system prompt a turn sends. The skills listing is appended fresh each
+-- turn so conditional skills activated by the previous turn's file touches
+-- become visible.
+function Session:turn_system()
     local system = self.system
     local rem = require('xagent.skills').reminder()
     if rem ~= '' then system = system .. '\n\n' .. rem end
+    return system
+end
+
+function Session:run(on_event)
+    self:ensure_title()
+    local system = self:turn_system()
 
     local res = loop.run({
         cfg = self.cfg,
@@ -126,7 +132,8 @@ function Session:compact(focus, on_event)
     self:ensure_title()
     local compaction = require('xagent.context.compaction')
     local res = compaction.auto_compact_if_needed({
-        messages = self.messages, cfg = self.cfg, system = self.system,
+        -- Same system + tools as a turn, so the summary reuses the cached prefix.
+        messages = self.messages, cfg = self.cfg, system = self:turn_system(), tools = self.tools,
         usage = self.last_usage, usage_anchor_index = self.usage_anchor_index,
         focus = focus, force = true,
     })
