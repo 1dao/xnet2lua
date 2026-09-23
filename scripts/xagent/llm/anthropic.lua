@@ -49,6 +49,58 @@ local function wire_messages(messages)
 end
 M._wire_messages = wire_messages
 
+-- ── prompt caching ─────────────────────────────────────────────────────────
+-- Every tool round-trip resends system + tools + the whole history, so the
+-- cached-prefix price is what a long session really costs. Endpoints that cache
+-- only on request (Anthropic, Qwen on Bailian) need explicit breakpoints; ones
+-- that cache automatically (DeepSeek) ignore the field. Two breakpoints: the
+-- system prompt (covers tools too — they render before it) and the newest
+-- message, whose cached prefix the next turn reads back via lookback.
+-- cfg.prompt_cache == false turns this off for a gateway that rejects the field.
+local EPHEMERAL = { type = 'ephemeral' }
+
+local function cached_system(system)
+    if type(system) == 'string' then
+        if system == '' then return system end
+        return { { type = 'text', text = system, cache_control = EPHEMERAL } }
+    end
+    return system
+end
+
+-- Blocks that may not carry cache_control.
+local UNCACHEABLE = { thinking = true, redacted_thinking = true }
+
+-- Copy of `messages` with a breakpoint on the last cacheable block of the final
+-- message. Earlier messages are shared untouched; the history is never mutated.
+local function cache_last_message(messages)
+    local n = #messages
+    if n == 0 then return messages end
+    local last = messages[n]
+    local content = last.content
+    if type(content) == 'string' then
+        if content == '' then return messages end
+        content = { { type = 'text', text = content } }
+    elseif type(content) ~= 'table' or #content == 0 then
+        return messages
+    end
+    local k = #content
+    while k > 0 and (type(content[k]) ~= 'table' or UNCACHEABLE[content[k].type]) do k = k - 1 end
+    if k == 0 then return messages end
+
+    local nc = table.move(content, 1, #content, 1, {})
+    local nb = {}
+    for key, v in pairs(content[k]) do nb[key] = v end
+    nb.cache_control = EPHEMERAL
+    nc[k] = nb
+    local nm = {}
+    for key, v in pairs(last) do nm[key] = v end
+    nm.content = nc
+    local out = table.move(messages, 1, n - 1, 1, {})
+    out[n] = nm
+    return out
+end
+M._cache_last_message = cache_last_message
+
 -- Build { url, headers, body } for a streaming Messages request.
 function M.build_request(cfg, params)
     local base = (cfg.base_url or DEFAULT_BASE):gsub('/+$', '')
@@ -63,13 +115,18 @@ function M.build_request(cfg, params)
         headers['x-api-key'] = cfg.api_key
     end
 
+    local cache = cfg.prompt_cache ~= false
+    local messages = wire_messages(params.messages)
+    if cache then messages = cache_last_message(messages) end
     local payload = {
         model = params.model or cfg.model,
         max_tokens = params.max_tokens or cfg.max_tokens or DEFAULT_MAX_TOKENS,
-        messages = wire_messages(params.messages),
+        messages = messages,
         stream = true,
     }
-    if params.system then payload.system = params.system end
+    if params.system then
+        payload.system = cache and cached_system(params.system) or params.system
+    end
     if params.tools and #params.tools > 0 then payload.tools = params.tools end
     if params.tool_choice then payload.tool_choice = params.tool_choice end
 

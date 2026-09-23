@@ -74,6 +74,18 @@ function M.resolve_proxy(own, shared)
     return v
 end
 
+-- Prompt caching (cache_control breakpoints) is on unless a profile says
+-- otherwise: false/'off'/'0'/'no' disables it for a gateway that rejects the
+-- field. nil keeps the default.
+function M.parse_prompt_cache(v)
+    if v == false then return false end
+    if type(v) == 'string' then
+        local s = v:lower():gsub('^%s+', ''):gsub('%s+$', '')
+        if s == 'off' or s == '0' or s == 'no' or s == 'false' then return false end
+    end
+    return nil
+end
+
 -- Build one profile from keys with the given numeric suffix ('' = base).
 -- shared_token is the base XAGENT_AUTH_TOKEN (+ env), used when a numbered
 -- profile has no token of its own. Returns the cfg table, or nil when a numbered
@@ -109,6 +121,7 @@ local function build(suffix, shared_token)
         max_tokens_param = cfg('XAGENT_MAX_TOKENS_PARAM' .. suffix),
         name       = cfg('XAGENT_NAME' .. suffix),   -- explicit label (nil → derived below)
         proxy_own  = cfg('XAGENT_PROXY' .. suffix),
+        prompt_cache = M.parse_prompt_cache(cfg('XAGENT_PROMPT_CACHE' .. suffix)),
         verify     = true,
     }
 end
@@ -198,7 +211,8 @@ local function write_store(store)
     for _, m in ipairs(store.models) do
         clean[#clean + 1] = { id = m.id or new_id(), name = m.name, base_url = m.base_url,
             model = m.model, api_format = m.api_format, auth_style = m.auth_style,
-            max_tokens_param = m.max_tokens_param, api_key = m.api_key, proxy = m.proxy }
+            max_tokens_param = m.max_tokens_param, api_key = m.api_key, proxy = m.proxy,
+            prompt_cache = m.prompt_cache }
     end
     local out = { models = clean }
     if next(store.overrides) then out.overrides = store.overrides end
@@ -222,6 +236,7 @@ function M.load_user_models()
             auth_style = m.auth_style or M.infer_auth_style(m.base_url, api_format),
             api_key    = m.api_key,
             proxy_own  = m.proxy,
+            prompt_cache = M.parse_prompt_cache(m.prompt_cache),
             verify     = true,
         }
     end

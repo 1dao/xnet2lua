@@ -210,12 +210,56 @@ spec.describe('anthropic.build_request', function()
         spec.contains(req.body, '"system"')
     end)
 
+    spec.it('marks the system prompt and the newest message as cache breakpoints', function()
+        local history = {
+            { role = 'user', content = 'first' },
+            { role = 'assistant', content = { { type = 'tool_use', id = 't1', name = 'Read', input = {} } } },
+            { role = 'user', content = { { type = 'tool_result', tool_use_id = 't1', content = 'x' } } },
+        }
+        local req = anthropic.build_request({ api_key = 'k' }, { messages = history, system = 'SYS' })
+        local body = xutils.json_unpack(req.body)
+        spec.equal(body.system[1].text, 'SYS')
+        spec.equal(body.system[1].cache_control.type, 'ephemeral')
+        spec.equal(body.messages[3].content[1].cache_control.type, 'ephemeral')
+        spec.nil_value(body.messages[1].cache_control)
+        spec.nil_value(history[3].content[1].cache_control, 'the history must not be mutated')
+    end)
+
+    spec.it('skips thinking blocks and wraps string content for the breakpoint', function()
+        local out = anthropic._cache_last_message({
+            { role = 'assistant', content = { { type = 'text', text = 'a' }, { type = 'thinking', thinking = 't' } } },
+        })
+        spec.equal(out[1].content[1].cache_control.type, 'ephemeral')
+        spec.nil_value(out[1].content[2].cache_control)
+        out = anthropic._cache_last_message({ { role = 'user', content = 'hi' } })
+        spec.equal(out[1].content[1].text, 'hi')
+        spec.equal(out[1].content[1].cache_control.type, 'ephemeral')
+    end)
+
+    spec.it('sends no cache_control when prompt_cache is off', function()
+        local req = anthropic.build_request({ api_key = 'k', prompt_cache = false },
+            { messages = { { role = 'user', content = 'hi' } }, system = 'SYS' })
+        spec.truthy(not req.body:find('cache_control', 1, true))
+        spec.equal(xutils.json_unpack(req.body).system, 'SYS')
+    end)
+
     spec.it('supports bearer auth style', function()
         local req = anthropic.build_request(
             { api_key = 'tok', auth_style = 'bearer' },
             { messages = { { role = 'user', content = 'hi' } } })
         spec.equal(req.headers['authorization'], 'Bearer tok')
         spec.nil_value(req.headers['x-api-key'])
+    end)
+end)
+
+spec.describe('prompt_cache config', function()
+    local config = require('xagent.config')
+    spec.it('only an explicit off value disables caching', function()
+        spec.equal(config.parse_prompt_cache('off'), false)
+        spec.equal(config.parse_prompt_cache(' FALSE '), false)
+        spec.equal(config.parse_prompt_cache(false), false)
+        spec.nil_value(config.parse_prompt_cache(nil))
+        spec.nil_value(config.parse_prompt_cache('on'))
     end)
 end)
 
