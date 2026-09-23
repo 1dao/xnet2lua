@@ -19,9 +19,14 @@
 --     on_done    = function(reason) end,         -- connection finished
 --     on_error   = function(err) end,            -- connect/transport error
 --   })
+--
+-- opts.proxy (optional) routes the request through a proxy: socks5://,
+-- socks5h:// or http:// with optional user:pass@ (see xproxy.lua). Default is
+-- a direct connection.
 
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
 local sse = dofile('scripts/core/share/xsse.lua')
+local xproxy = dofile('scripts/core/share/xproxy.lua')
 
 local M = {}
 
@@ -110,13 +115,17 @@ local function has_header(h, name)
     return false
 end
 
-local function build_request_bytes(opts, host, path)
+-- extra: headers only this hop needs (Proxy-Authorization for a forward proxy).
+local function build_request_bytes(opts, host, path, extra)
     local method = (opts.method or 'GET'):upper()
     local out = { method .. ' ' .. path .. ' HTTP/1.1\r\n' }
 
     local h = {}
     if type(opts.headers) == 'table' then
         for k, v in pairs(opts.headers) do h[k] = v end
+    end
+    if extra then
+        for k, v in pairs(extra) do h[k] = v end
     end
     if not has_header(h, 'host') then h['Host'] = host end
     if not has_header(h, 'user-agent') then h['User-Agent'] = DEFAULT_USER_AGENT end
@@ -134,6 +143,8 @@ local function build_request_bytes(opts, host, path)
 end
 
 -- ── public ─────────────────────────────────────────────────────────────────
+-- Returns the connection, or the proxy tunnel handle while one is being set
+-- up, or nil when the request failed synchronously (on_error already fired).
 function M.request(opts, cb)
     assert(type(opts) == 'table' and opts.url, 'stream.request: opts.url required')
     cb = cb or {}
@@ -168,10 +179,28 @@ function M.request(opts, cb)
         end
     end
 
+    local proxy, perr = xproxy.parse(opts.proxy)
+    if perr then
+        if cb.on_error then cb.on_error('proxy config: ' .. tostring(perr)) end
+        return nil
+    end
+
+    -- An HTTP proxy forwards plaintext requests itself: absolute-form request
+    -- line to the proxy, no tunnel. Every other proxied case is a tunnel.
+    local forward = proxy and proxy.type == 'http' and scheme == 'http'
+    local request_bytes
+    if forward then
+        local auth = xproxy.auth_header(proxy)
+        request_bytes = build_request_bytes(opts, host, opts.url,
+            auth and { ['Proxy-Authorization'] = auth } or nil)
+    else
+        request_bytes = build_request_bytes(opts, host, path)
+    end
+
     local handler = {}
 
     function handler.on_connect(conn)
-        local ok, err = conn:send_raw(build_request_bytes(opts, host, path))
+        local ok, err = conn:send_raw(request_bytes)
         if not ok then
             conn:close('send_failed')
             if cb.on_error then cb.on_error('send failed: ' .. tostring(err)) end
@@ -222,8 +251,33 @@ function M.request(opts, cb)
         finish(reason)
     end
 
+    local function fail(msg)
+        if cb.on_error then cb.on_error(msg) end
+        return nil
+    end
+
+    if proxy and not forward then
+        if scheme == 'https' and not xnet.connect_tls_fd then
+            return fail('https not supported: xnet built without HTTPS')
+        end
+        return xproxy.open_tunnel(proxy, host, port, {
+            on_ready = function(tconn, extra)
+                local c, aerr = xproxy.attach(tconn, extra, handler, {
+                    tls = scheme == 'https', host = host, port = port,
+                    verify = opts.verify, ca_file = opts.ca_file,
+                })
+                if not c then fail(aerr) end
+            end,
+            on_error = fail,
+        })
+    end
+
     local conn, err
-    if scheme == 'https' then
+    if forward then
+        conn, err = xnet.connect(proxy.host, proxy.port, handler)
+        if not conn then return fail('proxy connect failed: ' .. tostring(err)) end
+        return conn
+    elseif scheme == 'https' then
         if type(rawget(_G, 'xnet')) ~= 'table' or not xnet.connect_tls then
             if cb.on_error then cb.on_error('https not supported: xnet built without HTTPS') end
             return nil

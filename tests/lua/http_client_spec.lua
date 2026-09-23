@@ -6,6 +6,8 @@
 local spec = dofile('tests/lua/spec_helper.lua')
 local codec = dofile('scripts/core/share/xhttp_codec.lua')
 local httpc = dofile('scripts/core/share/xhttp_client.lua')
+local xproxy = dofile('scripts/core/share/xproxy.lua')
+local xutils = require('xutils')
 local xcompress = require('xcompress')
 
 spec.describe('xhttp_codec.parse_url', function()
@@ -164,6 +166,26 @@ spec.describe('xhttp_client.parse_proxy', function()
         local p, err = httpc.parse_proxy('ftp://h:1')
         spec.nil_value(p)
         spec.truthy(err)
+    end)
+
+    spec.it('treats an empty proxy as none, without an error', function()
+        local p, err = httpc.parse_proxy('')
+        spec.nil_value(p)
+        spec.nil_value(err)
+    end)
+end)
+
+spec.describe('xproxy helpers', function()
+    spec.it('masks the password in a proxy url', function()
+        spec.equal(xproxy.redact('http://u:secret@h:3128'), 'http://u:***@h:3128')
+        spec.equal(xproxy.redact('socks5://h:1080'), 'socks5://h:1080')
+        spec.equal(xproxy.redact('socks5://u@h:1080'), 'socks5://u@h:1080')
+    end)
+
+    spec.it('builds Basic proxy auth only when creds are set', function()
+        spec.equal(xproxy.auth_header(xproxy.parse('http://u:p@h')),
+            'Basic ' .. xutils.base64_encode('u:p'))
+        spec.nil_value(xproxy.auth_header(xproxy.parse('http://h')))
     end)
 end)
 
