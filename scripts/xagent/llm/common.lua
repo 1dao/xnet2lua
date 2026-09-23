@@ -116,7 +116,7 @@ function M.stream_message(codec, cfg, params, cb)
 
         stream.request({
             url = req.url, method = 'POST', headers = req.headers, body = req.body,
-            verify = cfg.verify, ca_file = cfg.ca_file,
+            verify = cfg.verify, ca_file = cfg.ca_file, proxy = cfg.proxy,
         }, {
             on_headers = function(status) api_log.set_status(rec, status) end,
             on_body = function(chunk) api_log.append_raw(rec, chunk) end,

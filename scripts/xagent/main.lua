@@ -14,6 +14,7 @@ package.path = 'scripts/?.lua;' .. package.path
 local router      = dofile('scripts/core/share/xrouter.lua')   -- main needs the handler for subprocess RPC replies
 local xutils      = require('xutils')
 local config      = require('xagent.config')
+local xproxy      = dofile('scripts/core/share/xproxy.lua')
 local registry    = require('xagent.tools.registry')
 local loop        = require('xagent.core.loop')
 local system_prompt = require('xagent.context.system_prompt')
@@ -164,7 +165,8 @@ local function __init()
         if rem ~= '' then sys = sys .. '\n\n' .. rem end
         local messages = { { role = 'user', content = prompt } }
 
-        out('\27[90m# ' .. cfg.model .. ' @ ' .. cfg.base_url .. '\27[0m\n')
+        local via = cfg.proxy and (' via ' .. xproxy.redact(cfg.proxy)) or ''
+        out('\27[90m# ' .. cfg.model .. ' @ ' .. cfg.base_url .. via .. '\27[0m\n')
         out('\27[1m> ' .. prompt .. '\27[0m\n\n')
 
         local res = loop.run({

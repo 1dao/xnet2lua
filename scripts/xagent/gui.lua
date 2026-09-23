@@ -28,6 +28,7 @@ local complete      = require('xagent.ui.complete')
 local text          = dofile('scripts/core/share/xtext.lua') ---@type xtext
 local fs            = dofile('scripts/core/share/xfs.lua') ---@type xfs
 local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
+local xproxy        = dofile('scripts/core/share/xproxy.lua')
 local api_log       = require('xagent.llm.api_log')
 
 registry.register(require('xagent.tools.read'))
@@ -1235,10 +1236,23 @@ local function draw_tab_picker(W, H)
 end
 
 -- ── settings page: dropdowns + add-model form ──────────────────────────────
+-- Open tabs follow edits: each tab is rebound (by the profile's stable key) to
+-- the reloaded profile, so a changed model / proxy / token applies from its
+-- next turn (a turn already running keeps the cfg it started with). A tab whose
+-- profile was deleted keeps its old settings.
 local function reload_profiles()
     S.profiles = config.load_profiles()
     if S.model_sel < 1 then S.model_sel = 1 end
     if S.model_sel > #S.profiles then S.model_sel = #S.profiles end
+    local by_key = {}
+    for _, p in ipairs(S.profiles) do if p.key then by_key[p.key] = p end end
+    for _, tab in ipairs(S.tabs) do
+        local p = tab.cfg and tab.cfg.key and by_key[tab.cfg.key]
+        if p then
+            tab.cfg = p
+            if tab.sess then tab.sess.cfg = p end
+        end
+    end
 end
 
 -- A dropdown trigger: a button + a caret. Records its anchor while open so the
@@ -1307,28 +1321,71 @@ end
 
 local function open_add_model()
     S.dd_open = nil
-    S.add_model = { name = '', url = 'https://', model = '', token = '', api_format = nil,
-                    name_e = false, url_e = false, model_e = false, token_e = false, err = nil }
+    S.add_model = { name = '', url = 'https://', model = '', token = '', proxy = '', api_format = nil,
+                    name_e = false, url_e = false, model_e = false, token_e = false, proxy_e = false,
+                    err = nil }
 end
 
--- A centered modal to add a model (persisted to ~/.xagent/models.json). Only
+-- Open the same form prefilled with profile `p`. Fields hold the profile's OWN
+-- values (explicit name, own proxy — not the inherited default) so saving only
+-- records what the user actually changed; Token starts empty (= keep).
+local function open_edit_model(p)
+    S.dd_open = nil
+    local inferred = config.infer_api_format(p.base_url)
+    local pinned = (p.api_format ~= inferred) and p.api_format or nil
+    S.add_model = { edit = p, name = p.name_own or '', url = p.base_url or '', model = p.model or '',
+                    token = '', proxy = p.proxy_own or '', api_format = pinned,
+                    name_e = false, url_e = false, model_e = false, token_e = false, proxy_e = false,
+                    err = nil }
+    S.add_model.orig = { name = S.add_model.name, url = S.add_model.url, model = S.add_model.model,
+                         proxy = S.add_model.proxy, api_format = pinned }
+end
+
+-- Persist the edit form: a user model is updated in place; a cfg-file profile
+-- gets an override. Only fields that differ from what the form opened with are
+-- written, so untouched cfg values keep following the cfg file.
+local function save_edit_model(f, url, model, proxy, token)
+    local o, p = f.orig, f.edit
+    local name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    local e = {}
+    if name ~= o.name then e.name = name end
+    -- A name that was just the model id follows a model change.
+    if model ~= o.model and name == o.model then e.name = model end
+    if url ~= o.url then e.base_url = url end
+    if model ~= o.model then e.model = model end
+    if proxy ~= o.proxy then e.proxy = proxy end
+    if token ~= '' then e.api_key = token end
+    if f.api_format ~= o.api_format then e.api_format = f.api_format end
+    if next(e) == nil then return end
+    if p.source == 'json' then
+        config.update_user_model(p.json_index, e)
+    else
+        config.set_cfg_override(p.key, e)
+    end
+end
+
+-- A centered modal to add a model (persisted to ~/.xagent/models.json), or to
+-- edit one when S.add_model.edit is set (see open_edit_model). Only
 -- URL + 模型ID are required. The protocol follows the URL until the user picks
--- one; auth_style is derived from the protocol (x-api-key / Bearer). Esc / 取消
--- closes.
+-- one; auth_style is derived from the protocol (x-api-key / Bearer). 代理 is
+-- optional: empty inherits the shared XAGENT_PROXY, 'direct' opts out. Esc /
+-- 取消 closes.
 local function draw_add_model_modal(W, H)
     local f = S.add_model
     if not f then return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
         S.add_model = nil; return
     end
-    local mw, mh = 520, 336
+    local mw, mh = 520, 396
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
     raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
-    raygui.label(mx + 16, my + 12, mw - 32, 24, '新增模型（鉴权方式按协议自动选择）')
+    raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
+        and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?') .. '（Token 留空=不变）')
+        or '新增模型（鉴权方式按协议自动选择）')
 
     local pad, lblw = 16, 84
     local fx = mx + pad + lblw + 8
@@ -1343,6 +1400,9 @@ local function draw_add_model_modal(W, H)
     fld('API地址', 'url')
     fld('模型ID', 'model')
     fld('Token', 'token')
+    fld('代理', 'proxy')
+    raygui.label(fx, row - 8, fw, 20, '空=默认  socks5://h:1080  http://u:p@h:8080')
+    row = row + 16
 
     -- Protocol toggle. Until clicked it tracks the URL (…/chat/completions,
     -- api.openai.com → OpenAI); a click pins the choice.
@@ -1363,12 +1423,24 @@ local function draw_add_model_modal(W, H)
     if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
         local url = (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
         local model = (f.model or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local proxy = (f.proxy or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local _, perr = xproxy.parse(proxy)
         if url == '' or url == 'https://' or model == '' then
             f.err = '请至少填写 API地址 和 模型ID'
+        elseif perr and proxy:lower() ~= 'direct' and proxy:lower() ~= 'none' then
+            f.err = '代理格式错误: ' .. perr
+        elseif f.edit then
+            save_edit_model(f, url, model, proxy, (f.token or ''):gsub('^%s+', ''):gsub('%s+$', ''))
+            local key = f.edit.key
+            reload_profiles()
+            for i, p in ipairs(S.profiles) do if p.key == key then S.model_sel = i end end
+            S.add_model = nil
+            if T() then T().status = '已更新模型（下一轮对话生效）' end
         else
             config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
                 base_url = url, model = model, api_format = f.api_format,
-                api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '') })
+                api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', ''),
+                proxy = proxy })
             reload_profiles()
             S.model_sel = #S.profiles      -- select the model just added
             S.add_model = nil
@@ -1734,10 +1806,18 @@ local function __update()
                 det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
                 det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
                 det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))
+                det('代理: ' .. (selp.proxy and sanitize_label(xproxy.redact(selp.proxy)) or '直连'))
+                if selp.overridden then det('（已在界面修改，覆盖配置文件）') end
+                dy = dy + 4
+                if raygui.button(pad, dy, 88, 28, '编辑') then open_edit_model(selp) end
                 if selp.source == 'json' and selp.json_index then
-                    dy = dy + 4
-                    if raygui.button(pad, dy, 120, 28, '删除此模型') then
+                    if raygui.button(pad + 96, dy, 120, 28, '删除此模型') then
                         config.delete_user_model(selp.json_index)
+                        reload_profiles()
+                    end
+                elseif selp.overridden then
+                    if raygui.button(pad + 96, dy, 120, 28, '恢复配置文件') then
+                        config.clear_cfg_override(selp.key)
                         reload_profiles()
                     end
                 end

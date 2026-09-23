@@ -219,6 +219,109 @@ spec.describe('anthropic.build_request', function()
     end)
 end)
 
+spec.describe('proxy config', function()
+    local config = require('xagent.config')
+
+    spec.it('prefers the profile proxy over the shared default', function()
+        spec.equal(config.resolve_proxy('socks5://a:1', 'http://b:2'), 'socks5://a:1')
+        spec.equal(config.resolve_proxy(nil, 'http://b:2'), 'http://b:2')
+        spec.equal(config.resolve_proxy('  ', ' http://b:2 '), 'http://b:2')
+    end)
+
+    spec.it('lets a profile opt out of the shared default', function()
+        spec.nil_value(config.resolve_proxy('direct', 'http://b:2'))
+        spec.nil_value(config.resolve_proxy('NONE', 'http://b:2'))
+        spec.nil_value(config.resolve_proxy(nil, nil))
+    end)
+
+    -- models.json edits, against a throwaway file (never the user's real one).
+    local real_models_file = config.models_file
+    local tmp_models = (os.getenv('TEMP') or os.getenv('TMPDIR') or '.') .. '/xagent_models_spec.json'
+    local function with_tmp_models(fn)
+        os.remove(tmp_models)
+        config.models_file = function() return tmp_models end
+        local ok, err = pcall(fn)
+        config.models_file = real_models_file
+        os.remove(tmp_models)
+        if not ok then error(err, 0) end
+    end
+    local function find(key)
+        for _, p in ipairs(config.load_profiles()) do if p.key == key then return p end end
+    end
+
+    spec.it('edits a user model in place and keeps its key', function()
+        with_tmp_models(function()
+            config.add_user_model({ base_url = 'https://api.openai.com/v1', model = 'm1', api_key = 'k1' })
+            config.add_user_model({ base_url = 'https://x.test/anthropic', model = 'other' })
+            local p = config.load_profiles()
+            local key
+            for _, q in ipairs(p) do if q.model == 'm1' then key = q.key end end
+            spec.truthy(key)
+            config.update_user_model(find(key).json_index,
+                { model = 'm2', name = 'm2', proxy = 'socks5://127.0.0.1:1080', api_key = '' })
+            local e = find(key)
+            spec.equal(e.model, 'm2')
+            spec.equal(e.name, 'm2')
+            spec.equal(e.proxy, 'socks5://127.0.0.1:1080')
+            spec.equal(e.api_key, 'k1')                 -- blank token = unchanged
+            spec.equal(e.api_format, 'openai')          -- protocol kept
+            spec.equal(e.auth_style, 'bearer')
+            -- deleting an earlier model must not re-key this one
+            for _, q in ipairs(config.load_profiles()) do
+                if q.model == 'other' then config.delete_user_model(q.json_index) end
+            end
+            spec.equal(find(key).model, 'm2')
+            config.update_user_model(find(key).json_index, { proxy = '' })
+            spec.equal(find(key).proxy_own, nil)
+        end)
+    end)
+
+    spec.it('keeps keys stable for models saved before ids existed', function()
+        with_tmp_models(function()
+            local f = assert(io.open(tmp_models, 'wb'))
+            f:write(xutils.json_pack({ models = {
+                { base_url = 'https://a.test/anthropic', model = 'a' },
+                { base_url = 'https://b.test/anthropic', model = 'b' },
+            } }))
+            f:close()
+            local key_b
+            for _, q in ipairs(config.load_profiles()) do if q.model == 'b' then key_b = q.key end end
+            for _, q in ipairs(config.load_profiles()) do
+                if q.model == 'a' then config.delete_user_model(q.json_index) end
+            end
+            spec.equal(find(key_b).model, 'b')
+        end)
+    end)
+
+    spec.it('overrides a cfg profile without touching the cfg, and resets', function()
+        with_tmp_models(function()
+            local base = config.load_profiles()[1]
+            spec.equal(base.source, 'cfg')
+            config.set_cfg_override(base.key, { model = 'edited-model', proxy = 'http://u:p@h:8080' })
+            local e = find(base.key)
+            spec.equal(e.model, 'edited-model')
+            spec.equal(e.proxy, 'http://u:p@h:8080')
+            spec.equal(e.base_url, base.base_url)
+            spec.truthy(e.overridden)
+            config.set_cfg_override(base.key, { proxy = 'direct' })   -- merges
+            e = find(base.key)
+            spec.equal(e.model, 'edited-model')
+            spec.nil_value(e.proxy)
+            config.clear_cfg_override(base.key)
+            e = find(base.key)
+            spec.equal(e.model, base.model)
+            spec.nil_value(e.overridden)
+        end)
+    end)
+
+    spec.it('reports a malformed proxy through on_error, not a raise', function()
+        local got
+        stream.request({ url = 'http://127.0.0.1:1/', proxy = 'localhost:1080' },
+            { on_error = function(e) got = e end })
+        spec.truthy(got and got:find('proxy config', 1, true))
+    end)
+end)
+
 return {
     __init = function()
         local failed = spec.finish()
