@@ -39,6 +39,50 @@ spec.describe('session persistence', function()
     end)
 end)
 
+spec.describe('session skills listing', function()
+    local skills = require('xagent.skills')
+    local listing = '<system-reminder>\nskills A\n</system-reminder>'
+    local function with_listing(text, fn)
+        local saved = skills.reminder
+        skills.reminder = function() return text end
+        local ok, err = pcall(fn)
+        skills.reminder = saved
+        assert(ok, err)
+    end
+
+    spec.it('rides on the turn\'s user message, not the system prompt', function()
+        with_listing(listing, function()
+            local s = session.new({ cfg = {}, cwd = '/w', system = 'SYS' })
+            s:add_user('hello')
+            s:inject_skills_listing()
+            spec.equal(s.system, 'SYS')
+            spec.equal(s.messages[1].content[1].text, 'hello')
+            spec.equal(s.messages[1].content[2].text, listing)
+            s:ensure_title()
+            spec.equal(s.title, 'hello')
+        end)
+    end)
+
+    spec.it('is not repeated while the history already carries it', function()
+        with_listing(listing, function()
+            local s = session.new({ cfg = {}, cwd = '/w', system = 'SYS' })
+            s:add_user('one'); s:inject_skills_listing()
+            s.messages[#s.messages + 1] = { role = 'assistant', content = 'ok' }
+            s:add_user('two'); s:inject_skills_listing()
+            spec.equal(s.messages[3].content, 'two')
+        end)
+    end)
+
+    spec.it('is appended again once the listing changes', function()
+        local s = session.new({ cfg = {}, cwd = '/w', system = 'SYS' })
+        with_listing(listing, function() s:add_user('one'); s:inject_skills_listing() end)
+        s.messages[#s.messages + 1] = { role = 'assistant', content = 'ok' }
+        local newer = listing:gsub('skills A', 'skills A, B')
+        with_listing(newer, function() s:add_user('two'); s:inject_skills_listing() end)
+        spec.equal(s.messages[3].content[2].text, newer)
+    end)
+end)
+
 spec.describe('project_md', function()
     spec.it('loads AGENT.md from a directory', function()
         local dir = '_xa_pmtest'

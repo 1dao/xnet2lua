@@ -575,7 +575,11 @@ local function rebuild_entries(messages)
                     elseif b.type == 'image' then
                         parts[#parts + 1] = '[图片]'
                     elseif b.type == 'text' then
-                        parts[#parts + 1] = b.text or ''
+                        -- The skills listing the session injects is for the
+                        -- model, not something the user typed.
+                        if (b.text or ''):sub(1, 17) ~= '<system-reminder>' then
+                            parts[#parts + 1] = b.text or ''
+                        end
                     end
                 end
                 if #parts > 0 then push('user', table.concat(parts, '\n')) end

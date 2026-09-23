@@ -27,7 +27,8 @@ local function first_user_text(messages)
                 -- the resume hint that replaces stripped images on re-save)
                 for _, b in ipairs(m.content) do
                     if b.type == 'text' and (b.text or '') ~= ''
-                       and b.text:sub(1, #'[图片') ~= '[图片' then
+                       and b.text:sub(1, #'[图片') ~= '[图片'
+                       and b.text:sub(1, 17) ~= '<system-reminder>' then
                         return b.text
                     end
                 end
@@ -89,28 +90,51 @@ function Session:ensure_title()
     if t and t ~= '(no prompt)' and t ~= '（已压缩的会话）' then self.title = t end
 end
 
+local function history_has_text(messages, text)
+    for _, m in ipairs(messages) do
+        if m.role == 'user' and type(m.content) == 'table' then
+            for _, b in ipairs(m.content) do
+                if b.type == 'text' and b.text == text then return true end
+            end
+        end
+    end
+    return false
+end
+
+-- The skills listing rides in the conversation, not the system prompt: the
+-- system prompt heads every request, so changing it (a conditional skill
+-- activated by a file touch) re-bills the whole history at uncached price.
+-- Appended as a trailing text block of the turn's user message, only when the
+-- history does not already carry this exact listing — the first turn, after
+-- the listing changed, or after compaction folded it away. Only appends, so
+-- the cached prefix is untouched.
+function Session:inject_skills_listing()
+    local rem = require('xagent.skills').reminder()
+    if rem == '' or history_has_text(self.messages, rem) then return end
+    local last = self.messages[#self.messages]
+    if not last or last.role ~= 'user' then return end
+    local c = last.content
+    if type(c) == 'string' then
+        c = (c ~= '') and { { type = 'text', text = c } } or {}
+    elseif type(c) ~= 'table' then
+        c = {}
+    end
+    c[#c + 1] = { type = 'text', text = rem }
+    last.content = c
+end
+
 -- Run one assistant turn over the accumulated history. loop.run appends the
 -- assistant message (and any tool_result turns) to self.messages in place, and
 -- may compact the history when it nears the context window. The usage anchor is
 -- threaded across turns so the token estimate stays cheap and accurate.
--- The system prompt a turn sends. The skills listing is appended fresh each
--- turn so conditional skills activated by the previous turn's file touches
--- become visible.
-function Session:turn_system()
-    local system = self.system
-    local rem = require('xagent.skills').reminder()
-    if rem ~= '' then system = system .. '\n\n' .. rem end
-    return system
-end
-
 function Session:run(on_event)
     self:ensure_title()
-    local system = self:turn_system()
+    self:inject_skills_listing()
 
     local res = loop.run({
         cfg = self.cfg,
         messages = self.messages,
-        system = system,
+        system = self.system,
         tools = self.tools,
         ctx = { cwd = self.cwd, session_id = self.id, confirm = self.confirm },
         max_tokens = self.max_tokens,
@@ -133,7 +157,7 @@ function Session:compact(focus, on_event)
     local compaction = require('xagent.context.compaction')
     local res = compaction.auto_compact_if_needed({
         -- Same system + tools as a turn, so the summary reuses the cached prefix.
-        messages = self.messages, cfg = self.cfg, system = self:turn_system(), tools = self.tools,
+        messages = self.messages, cfg = self.cfg, system = self.system, tools = self.tools,
         usage = self.last_usage, usage_anchor_index = self.usage_anchor_index,
         focus = focus, force = true,
     })
