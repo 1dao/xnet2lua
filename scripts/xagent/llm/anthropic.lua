@@ -17,6 +17,38 @@ local DEFAULT_BASE = 'https://api.anthropic.com'
 local DEFAULT_MAX_TOKENS = 4096
 local ANTHROPIC_VERSION = '2023-06-01'
 
+-- History may hold tool_use blocks decoded by the OpenAI codec, which keeps
+-- Gemini's thought signature on them as `extra_content` (a tab can switch
+-- models mid-conversation). Anthropic rejects unknown block fields, so send a
+-- copy without it; untouched messages are passed through as-is.
+local function wire_messages(messages)
+    local out = {}
+    for i, m in ipairs(messages or {}) do
+        local c = m.content
+        if type(c) == 'table' then
+            local nc
+            for j, b in ipairs(c) do
+                if type(b) == 'table' and b.extra_content ~= nil then
+                    nc = nc or table.move(c, 1, #c, 1, {})
+                    local nb = {}
+                    for k, v in pairs(b) do nb[k] = v end
+                    nb.extra_content = nil
+                    nc[j] = nb
+                end
+            end
+            if nc then
+                local nm = {}
+                for k, v in pairs(m) do nm[k] = v end
+                nm.content = nc
+                m = nm
+            end
+        end
+        out[i] = m
+    end
+    return out
+end
+M._wire_messages = wire_messages
+
 -- Build { url, headers, body } for a streaming Messages request.
 function M.build_request(cfg, params)
     local base = (cfg.base_url or DEFAULT_BASE):gsub('/+$', '')
@@ -34,7 +66,7 @@ function M.build_request(cfg, params)
     local payload = {
         model = params.model or cfg.model,
         max_tokens = params.max_tokens or cfg.max_tokens or DEFAULT_MAX_TOKENS,
-        messages = params.messages,
+        messages = wire_messages(params.messages),
         stream = true,
     }
     if params.system then payload.system = params.system end

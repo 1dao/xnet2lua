@@ -51,12 +51,16 @@ function M.parse_tool_input(acc, tool_name)
     return { _raw = acc, _error = reason }
 end
 
--- Both Anthropic and OpenAI wrap HTTP errors as { error = { message = ... } }.
+-- Both Anthropic and OpenAI wrap HTTP errors as { error = { message = ... } };
+-- Gemini's OpenAI-compat layer wraps that object in a one-element array.
 function M.format_http_error(status, body)
     local msg = body or ''
     local ok, parsed = pcall(xutils.json_unpack, body or '')
+    if ok and type(parsed) == 'table' and type(parsed[1]) == 'table' and parsed.error == nil then
+        parsed = parsed[1]
+    end
     if ok and type(parsed) == 'table' and type(parsed.error) == 'table'
-        and parsed.error.message then
+        and type(parsed.error.message) == 'string' then
         msg = parsed.error.message
     end
     if #tostring(msg) > 500 then msg = tostring(msg):sub(1, 500) .. '...' end

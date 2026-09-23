@@ -11,6 +11,13 @@
 -- Kimi, Zhipu, OpenRouter, vLLM, Ollama …), including their non-standard
 -- `reasoning_content` stream, which becomes a `thinking` block.
 --
+-- Gemini (generativelanguage.googleapis.com/…/openai/) attaches a thought
+-- signature to the first tool call of each step, at
+-- tool_calls[i].extra_content.google.thought_signature, and rejects the next
+-- request (HTTP 400) unless it comes back on that call. The decoder keeps it on
+-- the tool_use block as `extra_content`; convert_assistant echoes it to Gemini
+-- endpoints only (other servers never see the field).
+--
 -- Config (cfg): { api_key, base_url?, model?, auth_style?, max_tokens_param?,
 --                 echo_reasoning? }
 --   auth_style:       'bearer' (default) | 'api-key' (Azure) | 'x-api-key'
@@ -130,16 +137,43 @@ local function convert_user(out, msg)
     end
 end
 
+-- Gemini's documented placeholder for a tool call it did not sign itself
+-- (history from before signatures were kept, or from another model).
+local GEMINI_DUMMY_SIGNATURE = 'skip_thought_signature_validator'
+
+function M.is_gemini(cfg, model)
+    local url = tostring(cfg and cfg.base_url or ''):lower()
+    local m = tostring(model or (cfg and cfg.model) or ''):lower()
+    return url:find('generativelanguage%.googleapis%.com') ~= nil
+        or url:find('aiplatform%.googleapis%.com') ~= nil
+        or m:find('gemini', 1, true) ~= nil
+end
+
+local function has_signature(extra)
+    return type(extra) == 'table' and type(extra.google) == 'table'
+        and type(extra.google.thought_signature) == 'string'
+end
+
 local function convert_assistant(out, msg, cfg)
     local texts, calls, reasoning = {}, {}, {}
+    local gemini = cfg._gemini
     for _, b in ipairs(blocks_of(msg.content)) do
         if b.type == 'text' then
             texts[#texts + 1] = b.text or ''
         elseif b.type == 'tool_use' then
-            calls[#calls + 1] = {
+            local call = {
                 id = b.id, type = 'function',
                 ['function'] = { name = b.name, arguments = xutils.json_pack(b.input or {}) or '{}' },
             }
+            if gemini then
+                -- Only the first call of a step must carry the signature.
+                if has_signature(b.extra_content) then
+                    call.extra_content = b.extra_content
+                elseif #calls == 0 then
+                    call.extra_content = { google = { thought_signature = GEMINI_DUMMY_SIGNATURE } }
+                end
+            end
+            calls[#calls + 1] = call
         elseif b.type == 'thinking' and not b.signature and b.thinking and b.thinking ~= '' then
             -- Unsigned thinking came from a compatible server's reasoning_content
             -- (Anthropic's own thinking is always signed). DeepSeek's thinking
@@ -198,6 +232,7 @@ end
 -- Anthropic-shaped history → chat-completions messages array.
 function M.convert_messages(messages, system, cfg)
     cfg = cfg or {}
+    cfg = setmetatable({ _gemini = M.is_gemini(cfg) }, { __index = cfg })
     local out = {}
     local sys = system and system_text(system) or ''
     if sys ~= '' then out[1] = { role = 'system', content = sys } end
@@ -272,6 +307,8 @@ function M.new_decoder(cb)
         think_block = nil,    -- current thinking block
         tools = {},           -- tool_calls index -> { block, args, started }
         tool_order = {},      -- tool_calls indices in arrival order
+        tool_ids = {},        -- server call id -> index (for deltas without one)
+        last_tool = nil,      -- index of the most recent call
         usage = { input_tokens = 0, output_tokens = 0 },
         got_usage = false,    -- did the server report usage at all?
         stop_reason = '',
@@ -300,14 +337,29 @@ function M.new_decoder(cb)
         self.usage.cache_read_input_tokens = (cached > 0) and cached or nil
     end
 
+    -- Slot for a delta that has no `index`. Gemini omits it and sends each
+    -- parallel call whole in its own delta, so calls are told apart by id; an
+    -- id-less fragment continues the latest call. Defaulting every such delta
+    -- to slot 0 would glue the calls' arguments into invalid JSON.
+    local function index_without(tc, pos)
+        local id = str(tc.id)
+        if id and id ~= '' then
+            if self.tool_ids[id] then return self.tool_ids[id] end
+            return #self.tool_order
+        end
+        if pos == 1 and self.last_tool then return self.last_tool end
+        return #self.tool_order
+    end
+
     local function on_tool_delta(tc, pos)
-        local i = tonumber(tc.index) or (pos - 1)
+        local i = tonumber(tc.index) or index_without(tc, pos)
         local fn = type(tc['function']) == 'table' and tc['function'] or {}
         local slot = self.tools[i]
         if not slot then
             -- A few servers (Gemini's compat layer, some vLLM builds) send an
             -- empty id; the id only has to pair tool_use with tool_result.
             local id = str(tc.id)
+            if id and id ~= '' then self.tool_ids[id] = i end
             if not id or id == '' then id = 'call_' .. i .. '_' .. tostring(os.time()) end
             slot = { block = { type = 'tool_use', id = id, name = '', input = {} }, args = {} }
             self.tools[i] = slot
@@ -315,6 +367,8 @@ function M.new_decoder(cb)
             self.blocks[#self.blocks + 1] = slot.block
             self.text_block, self.think_block = nil, nil
         end
+        self.last_tool = i
+        if type(tc.extra_content) == 'table' then slot.block.extra_content = tc.extra_content end
         local name = str(fn.name)
         if name and name ~= '' and slot.block.name == '' then slot.block.name = name end
         if not slot.started and slot.block.name ~= '' then

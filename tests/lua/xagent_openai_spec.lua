@@ -252,6 +252,86 @@ spec.describe('openai decoder', function()
     end)
 end)
 
+spec.describe('gemini thought signatures', function()
+    local GEMINI = { base_url = 'https://generativelanguage.googleapis.com/v1beta/openai/',
+                     model = 'gemini-3.5-flash-lite' }
+    local SIG = { google = { thought_signature = 'sig-abc' } }
+
+    -- The shape Gemini actually streams: no `index`, one whole call per delta,
+    -- the signature only on the first call of the step.
+    local function gemini_stream()
+        return decode({
+            chunk({ role = 'assistant', tool_calls = { { id = 'call_1', type = 'function',
+                extra_content = SIG,
+                ['function'] = { name = 'get_weather', arguments = '{"city":"Paris"}' } } } }),
+            chunk({ role = 'assistant', tool_calls = { { id = 'call_2', type = 'function',
+                ['function'] = { name = 'get_weather', arguments = '{"city":"Tokyo"}' } } } }),
+            chunk({ role = 'assistant' }, 'stop'),
+            '[DONE]',
+        })
+    end
+
+    spec.it('keeps index-less parallel calls apart and captures the signature', function()
+        local r, err = gemini_stream()
+        spec.nil_value(err)
+        local c = r.message.content
+        spec.equal(#c, 2)
+        spec.equal(c[1].id, 'call_1')
+        spec.equal(c[1].input.city, 'Paris')
+        spec.equal(c[2].id, 'call_2')
+        spec.equal(c[2].input.city, 'Tokyo')
+        spec.equal(c[1].extra_content.google.thought_signature, 'sig-abc')
+        spec.nil_value(c[2].extra_content)
+        spec.equal(r.stop_reason, 'tool_use')
+    end)
+
+    spec.it('continues an index-less call from id-less fragments', function()
+        local r = decode({
+            chunk({ tool_calls = { { id = 'c1', ['function'] = { name = 'Read', arguments = '{"file_path":' } } } }),
+            chunk({ tool_calls = { { ['function'] = { arguments = '"a.lua"}' } } } }),
+            chunk({}, 'tool_calls'), '[DONE]',
+        })
+        spec.equal(#r.message.content, 1)
+        spec.equal(r.message.content[1].input.file_path, 'a.lua')
+    end)
+
+    spec.it('echoes the signature back to Gemini on the call that carried it', function()
+        local r = gemini_stream()
+        local msgs = openai.convert_messages({ r.message }, nil, GEMINI)
+        local calls = msgs[1].tool_calls
+        spec.equal(calls[1].extra_content.google.thought_signature, 'sig-abc')
+        spec.nil_value(calls[2].extra_content)
+    end)
+
+    spec.it('uses the placeholder when a Gemini step has no signature', function()
+        local msgs = openai.convert_messages({ { role = 'assistant', content = {
+            { type = 'tool_use', id = 'a', name = 'x', input = {} },
+            { type = 'tool_use', id = 'b', name = 'x', input = {} } } } }, nil, GEMINI)
+        local calls = msgs[1].tool_calls
+        spec.equal(calls[1].extra_content.google.thought_signature, 'skip_thought_signature_validator')
+        spec.nil_value(calls[2].extra_content)
+    end)
+
+    spec.it('never sends the field to other endpoints', function()
+        local r = gemini_stream()
+        local msgs = openai.convert_messages({ r.message }, nil,
+            { base_url = 'https://api.openai.com/v1', model = 'gpt-4.1' })
+        spec.nil_value(msgs[1].tool_calls[1].extra_content)
+        -- nor to Anthropic, which rejects unknown block fields
+        local anthropic = require('xagent.llm.anthropic')
+        local req = anthropic.build_request({ api_key = 'k' }, { messages = { r.message } })
+        spec.nil_value(req.body:find('extra_content', 1, true))
+        spec.equal(r.message.content[1].extra_content.google.thought_signature, 'sig-abc')  -- history untouched
+    end)
+
+    spec.it("reads Gemini's array-wrapped HTTP error", function()
+        local common = require('xagent.llm.common')
+        local msg = common.format_http_error(400,
+            '[{"error":{"code":400,"message":"Function call is missing a thought_signature","status":"INVALID_ARGUMENT"}}]')
+        spec.equal(msg, 'HTTP 400: Function call is missing a thought_signature')
+    end)
+end)
+
 spec.describe('provider + config', function()
     spec.it('dispatches on api_format', function()
         spec.equal(provider.codec({ api_format = 'openai' }), openai)
