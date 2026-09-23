@@ -13,6 +13,10 @@ local CODING = {
     'Operate directly, be concise, and take concrete actions with tools when useful.',
     'When solving a task: first understand the relevant files, then make focused changes, then verify with the least expensive effective command.',
     'Prefer the Read tool to read files and the Bash tool only when shell execution is actually needed.',
+    -- Every round-trip resends the whole conversation, so fewer turns and
+    -- smaller tool results are the main lever on token cost.
+    'When several tool calls do not depend on each other (reading multiple files, unrelated searches), issue them together in one response instead of one per turn.',
+    'For large files, locate the relevant part with Grep first, then Read only that range with offset/limit instead of the whole file; do not re-read content already in the conversation.',
     'When you have finished the task, stop and give a short summary of what you did or found.',
 }
 
