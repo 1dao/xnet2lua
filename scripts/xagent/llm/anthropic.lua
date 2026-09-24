@@ -229,8 +229,16 @@ function M.new_decoder(cb)
             end
 
         elseif t == 'message_delta' then
-            if ev.usage and ev.usage.output_tokens then
-                self.usage.output_tokens = ev.usage.output_tokens
+            -- message_delta usage is cumulative, so any count it carries
+            -- supersedes message_start. Qwen on Bailian reports the real
+            -- input/cache split only here; its message_start input_tokens is
+            -- the whole prompt with no cache fields.
+            local u = ev.usage
+            if u then
+                for _, k in ipairs({ 'input_tokens', 'output_tokens',
+                                     'cache_creation_input_tokens', 'cache_read_input_tokens' }) do
+                    if type(u[k]) == 'number' then self.usage[k] = u[k] end
+                end
             end
             if ev.delta and ev.delta.stop_reason then
                 self.stop_reason = ev.delta.stop_reason

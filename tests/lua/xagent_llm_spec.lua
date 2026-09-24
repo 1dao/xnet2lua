@@ -161,6 +161,31 @@ spec.describe('anthropic reassembler', function()
         spec.equal(content[2].input.file_path, 'a.txt')
     end)
 
+    spec.it('takes the cache split from message_delta usage (Qwen/Bailian)', function()
+        local result
+        local dec = anthropic.new_decoder({
+            on_done = function(r) result = r end,
+            on_error = function(m) error('unexpected on_error: ' .. m) end,
+        })
+        dec:on_sse('message_start', pack({ type = 'message_start',
+            message = { id = 'm', usage = { input_tokens = 900, output_tokens = 0 } } }))
+        dec:on_sse('content_block_start', pack({ type = 'content_block_start', index = 0,
+            content_block = { type = 'text', text = '' } }))
+        dec:on_sse('content_block_delta', pack({ type = 'content_block_delta', index = 0,
+            delta = { type = 'text_delta', text = 'ok' } }))
+        dec:on_sse('content_block_stop', pack({ type = 'content_block_stop', index = 0 }))
+        dec:on_sse('message_delta', pack({ type = 'message_delta', delta = { stop_reason = 'end_turn' },
+            usage = { input_tokens = 6, output_tokens = 62, cache_read_input_tokens = 1989,
+                      cache_creation_input_tokens = 170 } }))
+        dec:on_sse('message_stop', pack({ type = 'message_stop' }))
+
+        spec.truthy(result, 'on_done fired')
+        spec.equal(result.usage.input_tokens, 6)
+        spec.equal(result.usage.output_tokens, 62)
+        spec.equal(result.usage.cache_read_input_tokens, 1989)
+        spec.equal(result.usage.cache_creation_input_tokens, 170)
+    end)
+
     spec.it('surfaces an SSE error event', function()
         local got
         local dec = anthropic.new_decoder({ on_error = function(m) got = m end })
