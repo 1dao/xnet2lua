@@ -26,6 +26,16 @@ local function wire_messages(messages)
     for i, m in ipairs(messages or {}) do
         local c = m.content
         if type(c) == 'table' then
+            local filtered = {}
+            for _, b in ipairs(c) do
+                if not b.responses_item then filtered[#filtered + 1] = b end
+            end
+            if #filtered ~= #c then
+                local copy = {}; for k, v in pairs(m) do copy[k] = v end
+                copy.content = filtered; m = copy; c = filtered
+            end
+        end
+        if type(c) == 'table' then
             local nc
             for j, b in ipairs(c) do
                 if type(b) == 'table' and b.extra_content ~= nil then

@@ -49,7 +49,7 @@ end
 -- provider picks its own header (x-api-key, Azure's api-key, …), and a new one
 -- must not slip through unmasked.
 local function is_secret_header(lk)
-    return lk == 'authorization' or lk == 'proxy-authorization'
+    return lk == 'authorization' or lk == 'proxy-authorization' or lk == 'chatgpt-account-id'
         or lk:find('api%-?key') ~= nil or lk:find('token') ~= nil
 end
 

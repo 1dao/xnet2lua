@@ -174,7 +174,7 @@ local function convert_assistant(out, msg, cfg)
                 end
             end
             calls[#calls + 1] = call
-        elseif b.type == 'thinking' and not b.signature and b.thinking and b.thinking ~= '' then
+        elseif b.type == 'thinking' and not b.responses_item and not b.signature and b.thinking and b.thinking ~= '' then
             -- Unsigned thinking came from a compatible server's reasoning_content
             -- (Anthropic's own thinking is always signed). DeepSeek's thinking
             -- mode rejects a tool-call continuation that omits it, so echo it
