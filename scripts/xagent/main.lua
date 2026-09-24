@@ -104,7 +104,7 @@ end
 
 local function __init()
     local cfg = config.load()
-    if not cfg.api_key or cfg.api_key == '' then
+    if cfg.auth_type ~= 'chatgpt' and (not cfg.api_key or cfg.api_key == '') then
         io.stderr:write('ERROR: no token — set XAGENT_AUTH_TOKEN in xagent.local.cfg\n')
         xthread.stop(2); return
     end

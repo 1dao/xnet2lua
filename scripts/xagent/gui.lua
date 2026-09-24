@@ -534,7 +534,7 @@ end
 local function submit()
     local tab = T()
     if tab.busy or not tab.sess then return end
-    if not tab.cfg or not tab.cfg.api_key or tab.cfg.api_key == '' then
+    if not tab.cfg or (tab.cfg.auth_type ~= 'chatgpt' and (not tab.cfg.api_key or tab.cfg.api_key == '')) then
         tab.status = '该模型未配置 token'; return
     end
     local text = (tab.input or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -952,7 +952,7 @@ function new_tab(cfg, cwd)
     S.tabs[#S.tabs + 1] = tab
     S.active = #S.tabs
     S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
-    if not cfg.api_key or cfg.api_key == '' then
+    if cfg.auth_type ~= 'chatgpt' and (not cfg.api_key or cfg.api_key == '') then
         add(tab, 'error', '该模型（' .. (cfg.name or cfg.model or '?') ..
             '）未配置 token：在 xagent.local.cfg 设置 XAGENT_AUTH_TOKEN。')
     else
@@ -1400,13 +1400,16 @@ end
 -- one; auth_style is derived from the protocol (x-api-key / Bearer). 代理 is
 -- optional: empty inherits the shared XAGENT_PROXY, 'direct' opts out. Esc /
 -- 取消 closes.
+local chatgpt_login = require('xagent.auth.login')
+local chatgpt_auth = require('xagent.auth.chatgpt')
+
 local function draw_add_model_modal(W, H)
     local f = S.add_model
     if not f then return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
-        S.add_model = nil; return
+        chatgpt_login.cancel(); S.add_model = nil; return
     end
-    local mw, mh = 520, 396
+    local mw, mh = 520, 444
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
@@ -1438,9 +1441,34 @@ local function draw_add_model_modal(W, H)
     -- api.openai.com → OpenAI); a click pins the choice.
     local fmt = f.api_format or config.infer_api_format(f.url)
     raygui.label(mx + pad, row + 4, lblw, 22, '协议')
-    local fmt_label = (fmt == 'openai') and 'OpenAI (Chat Completions)' or 'Anthropic (Messages)'
+    local fmt_label = ({openai='OpenAI (Chat Completions)', responses='OpenAI (Responses)', anthropic='Anthropic (Messages)'})[fmt] or fmt
     if raygui.button(fx, row, fw, rh - 4, fmt_label) then
-        f.api_format = (fmt == 'openai') and 'anthropic' or 'openai'
+        f.api_format = ({anthropic='openai', openai='responses', responses='anthropic'})[fmt] or 'anthropic'
+    end
+    row = row + rh + 6
+
+    if raygui.button(fx, row, fw / 2 - 4, rh - 4, chatgpt_login.running() and '取消 ChatGPT 登录' or '登录 ChatGPT') then
+        if chatgpt_login.running() then chatgpt_login.cancel(); f.err = nil
+        else
+            local ok, url = pcall(chatgpt_login.start, {
+                proxy = config.resolve_proxy(f.proxy, xutils.get_config('XAGENT_PROXY')),
+                on_done = function(success, err)
+                    if success then
+                        f.url = chatgpt_auth.endpoint; f.api_format = 'responses'; f.token = ''
+                        f.err = 'ChatGPT 已登录，请填写模型 ID 并保存'
+                    else f.err = err end
+                end,
+            })
+            if ok then
+                local opened = open_url.open(url)
+                if not opened then chatgpt_login.cancel(); f.err = '无法打开浏览器' else f.err = '请在浏览器完成登录' end
+            else f.err = tostring(url) end
+        end
+    end
+    if raygui.button(fx + fw / 2 + 4, row, fw / 2 - 4, rh - 4, '退出 ChatGPT') then
+        chatgpt_login.cancel()
+        local ok, err = pcall(chatgpt_auth.logout)
+        f.err = ok and 'ChatGPT 已退出' or tostring(err)
     end
     row = row + rh + 6
 
@@ -1477,7 +1505,7 @@ local function draw_add_model_modal(W, H)
             if T() then T().status = '已添加模型' end
         end
     end
-    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then S.add_model = nil end
+    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then chatgpt_login.cancel(); S.add_model = nil end
 end
 
 local function __init()
@@ -1578,6 +1606,7 @@ local function __init()
 end
 
 local function __update()
+    chatgpt_login.tick()
     if raygui.should_close() then xthread.stop(0); return end
     local tab = T()
     if not tab then return end
@@ -2007,6 +2036,7 @@ local function __update()
 end
 
 local function __uninit()
+    chatgpt_login.cancel()
     -- Join the process workers while this state is still alive (see xproc.shutdown).
     subprocess.shutdown()
     if S.started then raygui.close() end

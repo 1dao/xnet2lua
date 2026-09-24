@@ -41,6 +41,7 @@ local MAX_PROFILES = 32
 -- (…/anthropic vs. the bare host), so only unambiguous URLs flip to openai.
 function M.infer_api_format(url)
     local u = tostring(url or ''):lower()
+    if u:find('/responses') or u:find('^https://chatgpt%.com/backend%-api/codex') then return 'responses' end
     if u:find('/anthropic') or u:find('api%.anthropic%.com') then return 'anthropic' end
     if u:find('/chat/completions') or u:find('api%.openai%.com')
         or u:find('openai%.azure%.com') or u:find('/compatible%-mode/') then
@@ -166,7 +167,7 @@ end
 -- OpenAI-format endpoints use a Bearer token, except Azure's `api-key` header.
 -- The user can hand-edit models.json to override.
 function M.infer_auth_style(url, api_format)
-    if (api_format or M.infer_api_format(url)) == 'openai' then
+    if (api_format or M.infer_api_format(url)) == 'openai' or api_format == 'responses' then
         if tostring(url or ''):lower():find('openai%.azure%.com') then return 'api-key' end
         return 'bearer'
     end
@@ -390,6 +391,9 @@ function M.load_profiles()
 
     for _, p in ipairs(profiles) do
         p.proxy = M.resolve_proxy(p.proxy_own, shared_proxy)
+        if (p.base_url or ''):match('^https://chatgpt%.com/backend%-api/codex/?') then
+            p.auth_type = 'chatgpt'; p.api_format = 'responses'; p.api_key = nil
+        end
     end
     return name_profiles(profiles)
 end
