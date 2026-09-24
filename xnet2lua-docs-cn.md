@@ -20,6 +20,7 @@
 10. [xutils 模块——工具函数](#10-xutils-模块工具函数)
 10A. [xcompress 模块——压缩与校验和](#10a-xcompress-模块压缩与校验和)
 10B. [xrecord 模块——通用紧凑记录池](#10b-xrecord-模块通用紧凑记录池)
+10C. [xscan 模块——可配置词法器](#10c-xscan-模块可配置词法器)
 11. [配置文件](#11-配置文件)
 12. [线程 ID 常量表](#12-线程-id-常量表)
 13. [完整示例：TCP 服务器](#13-完整示例tcp-服务器)
@@ -1879,6 +1880,49 @@ items:close()                             -- 立即释放池子的 C 内存
 字段类型 `int8`/`int16`/`int32`/`int`（64 位）/`float` 按各自类型的自然对齐紧凑打包（不是统一按 8 字节填充），所以窄类型在大量记录的场景下能真正省内存。数值跨越 Lua 边界时统一按普通 Lua number 处理，与字段实际宽度无关；写入时会按字段声明的宽度做范围检查：写入 int 字段的非整数值、超出宽度范围的数值（比如往 `int8` 字段写 `300`，或往 `float` 写超过 `FLT_MAX` 的值）、以及写入 float 的 NaN/Inf，都会**直接报错，而不是静默截断、clamp 或变成 ±Inf**——业务层捕获到这类错误应当当成"数据非法"的信号处理（比如把发出这个请求的客户端踢下线），而不是想办法兼容它。`string` 字段是变长的，多次写入之间、以及 `destroy` 后槽位被复用时都会尽量复用已分配的内存。
 
 这套方案用"单次读写变慢"（比原生 Lua table 字段访问慢一个数量级，绝对值仍是几十纳秒级别）换"彻底消除单个对象的 GC 压力"：记录本身不管有多少条，在 Lua GC 眼里都是 0 字节，而等价的 Lua table 大约要占 ~150 字节/条——只有池子 handle 是 GC 对象（每玩家一个池子时每线程几千个，取代它们本要产生的几十万张 table）。只有在真正的规模量级下（每线程存活对象数以万计甚至更多）才划算——如果只是几百个对象，直接用 Lua table 更简单，GC 开销也不是瓶颈。完整冒烟示例见 `demo/xrecord_main.lua`。
+
+---
+
+## 10C. xscan 模块——可配置词法器
+
+`xscan` 是给源码索引用的通用词法器：用一张 Lua 表描述语言（标识符字符、关键字、运算符、注释、字符串形式，以及 C 预处理和 Python 缩进两个开关），它在 C 里完成逐字节扫描，并预先算好括号配对表。各语言的解析器用 Lua 写，只遍历 token 数组；函数体可以通过配对表整段跳过。
+
+```lua
+local C = xscan.lang({
+    keywords = { "if", "return", "struct" },
+    ops = { "->", "<<=", ">>=", "::" },            -- 多字符运算符，最长匹配
+    line_comment = { "//" },
+    block_comment = { { "/*", "*/" } },
+    strings = { { '"', '"', escape = "\\" }, { "'", "'", escape = "\\" } },
+    string_prefixes = "LuU8",                       -- 引号前允许的前缀字母
+    directive = "#",                                -- 行首整行指令
+    pp_first_branch = true,                         -- C 预处理分支策略，见下
+})
+
+local T = C:tokenize(source)
+for _, x in ipairs(T:calls(1, T.n)) do            -- 所有 “标识符(” 调用点
+    print(T:text(x), T:line(x))
+end
+```
+
+| 接口 | 说明 |
+|---|---|
+| `xscan.lang(cfg)` | 编译语言配置，返回可复用的 lang 对象 |
+| `lang:tokenize(src)` | 返回 token 表 `T` |
+| `T.n` / `T.src` | token 数 / 源码 |
+| `T.k[i]` `T.s[i]` `T.e[i]` `T.l[i]` `T.el[i]` `T.m[i]` | 种类、起止字节（1 起、闭区间）、起止行、配对 token（无配对为 nil）；热循环里直接下标访问 |
+| `T:kind(i)` `T:text(i)` `T:line(i)` `T:eline(i)` `T:match(i)` | 同上，越界返回 nil（`text` 返回空串） |
+| `T:is(i, s)` | token `i` 是否为非字符串 token 且文本等于 `s` |
+| `T:calls(i, j)` | `[i, j)` 内紧跟 `(` 的标识符下标 |
+| `T:idents(i, j)` | `[i, j]` 内不跟 `(` 的标识符下标 |
+
+token 种类：`id` `kw` `op` `str` `num` `dir`（预处理行，含 `\` 续行）`nl` `indent` `dedent`（后三个仅 `indent = true` 时产生）。
+
+- `pp_first_branch`：文件作用域（括号深度 0）的 `#if/#else` 所有分支都保留，平台变体函数都能被索引；括号内部只保留第一个有效分支，避免 `if (a) {` 在两个分支各出现一次导致括号失配；`#if 0` 分支丢弃。
+- `indent = true`（Python）：括号外的换行产生 `nl`，缩进变化产生 `indent`/`dedent`，且 `indent`/`dedent` 也写入配对表，一个块的范围查一次 `T.m` 即可。
+- 不配对的闭括号保持未配对，不会让后续所有配对错位。
+
+lang 对象和 token 表都只属于当前线程的 Lua state，不能跨线程传递。单测见 `tests/lua/xscan_spec.lua`。
 
 ---
 

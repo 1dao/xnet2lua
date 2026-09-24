@@ -108,14 +108,14 @@ set "UNIT_EXE=%BIN_DIR%\test_core%PROGRAM_SUFFIX%.exe"
 
 set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemon.c xlog.c xshared.c xrecord.c"
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
-set "XNET_SOURCES=xlua\xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c xlua\lua_xshared.c xlua\lua_xrecord.c 3rd\yyjson.c xframe_aead.c"
+set "XNET_SOURCES=xlua\xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c xlua\lua_xshared.c xlua\lua_xrecord.c xlua\lua_xscan.c 3rd\yyjson.c xframe_aead.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
 set "LUAJIT_DIR=3rd\luajit\src"
 set "LUAJIT_INC=3rd\luajit\src"
 
-set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua"
+set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 

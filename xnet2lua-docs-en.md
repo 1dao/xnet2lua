@@ -20,6 +20,7 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 10. xutils Module — Utility Functions  
 10A. xcompress Module — Compression and Checksums
 10B. xrecord Module — Schema-Defined Compact Record Pools
+10C. xscan Module — Configurable Tokenizer
 11. Configuration Files  
 12. Thread ID Constants  
 13. Complete Example: TCP Server  
@@ -1906,6 +1907,49 @@ items:close()                             -- release the pool's C memory immedia
 Field types: `int8`/`int16`/`int32`/`int` (64-bit) and `float` are packed at each type's natural alignment (not padded to a uniform width), so the narrow widths are a real memory saving at high record counts. Numeric values cross the Lua boundary as ordinary Lua numbers regardless of field width; writes range-check against the field's declared width and reject fractional values into an int field, magnitudes outside the width (e.g. `300` into an `int8` field, or a value past `FLT_MAX` into a `float`), and NaN/Inf into a `float`, all as a **hard error rather than clamping, truncating, or turning into ±Inf** — treat a caught error here as a bad-data signal (e.g. kick the client that sent it), not something to silently coerce. `string` fields are variable length and reuse their allocation across writes and across slot reuse after `destroy`.
 
 This trades slower per-field access (roughly an order of magnitude versus a raw Lua table field, still tens of nanoseconds) for removing per-object GC pressure entirely: the records themselves cost 0 bytes of Lua-GC-visible memory regardless of count, versus ~150 bytes/record for equivalent Lua tables — only the pool handles are GC objects (a couple thousand per thread with one pool per player, versus the hundreds of thousands of tables they replace). Only worth it at real scale (tens of thousands of live objects per thread or more) — for a few hundred objects a plain Lua table is simpler and the GC cost is not the bottleneck. Complete smoke example: `demo/xrecord_main.lua`.
+
+---
+
+## 10C. xscan Module — Configurable Tokenizer
+
+`xscan` is a general-purpose tokenizer for source indexing. A Lua table describes the language (identifier characters, keywords, operators, comments, string forms, plus switches for the C preprocessor and Python indentation); the byte-level scan and a bracket match table are computed in C. Per-language parsers are written in Lua and only walk the token arrays, skipping bodies through the match table.
+
+```lua
+local C = xscan.lang({
+    keywords = { "if", "return", "struct" },
+    ops = { "->", "<<=", ">>=", "::" },            -- multi-char operators, longest match
+    line_comment = { "//" },
+    block_comment = { { "/*", "*/" } },
+    strings = { { '"', '"', escape = "\\" }, { "'", "'", escape = "\\" } },
+    string_prefixes = "LuU8",                       -- letters allowed before a quote
+    directive = "#",                                -- whole-line directive at line start
+    pp_first_branch = true,                         -- C preprocessor branch policy, see below
+})
+
+local T = C:tokenize(source)
+for _, x in ipairs(T:calls(1, T.n)) do            -- every `identifier(` call site
+    print(T:text(x), T:line(x))
+end
+```
+
+| API | Description |
+|---|---|
+| `xscan.lang(cfg)` | Compile a language config into a reusable lang object |
+| `lang:tokenize(src)` | Return the token table `T` |
+| `T.n` / `T.src` | Token count / source |
+| `T.k[i]` `T.s[i]` `T.e[i]` `T.l[i]` `T.el[i]` `T.m[i]` | Kind, start/end byte (1-based, inclusive), start/end line, matching token (nil when unmatched); index directly in hot loops |
+| `T:kind(i)` `T:text(i)` `T:line(i)` `T:eline(i)` `T:match(i)` | Same as above; nil outside the range (`text` returns `""`) |
+| `T:is(i, s)` | Whether token `i` is a non-string token whose text equals `s` |
+| `T:calls(i, j)` | Indices of identifiers in `[i, j)` directly followed by `(` |
+| `T:idents(i, j)` | Indices of identifiers in `[i, j]` not followed by `(` |
+
+Token kinds: `id` `kw` `op` `str` `num` `dir` (preprocessor line, `\` continuations included) `nl` `indent` `dedent` (the last three only with `indent = true`).
+
+- `pp_first_branch`: at file scope (bracket depth 0) every `#if/#else` arm is kept, so platform variants of whole functions are all indexed; inside brackets only the first live arm is kept, so `if (a) {` appearing in both arms cannot unbalance braces; `#if 0` arms are dropped.
+- `indent = true` (Python): newlines outside brackets produce `nl`, indentation changes produce `indent`/`dedent`, and indent/dedent pairs go into the match table, so a block's extent is one `T.m` lookup.
+- An unbalanced closing bracket stays unmatched instead of shifting every later pair.
+
+Lang objects and token tables belong to the current thread's Lua state and must not cross threads. Unit specs: `tests/lua/xscan_spec.lua`.
 
 ---
 
