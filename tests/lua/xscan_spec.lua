@@ -147,6 +147,46 @@ spec.describe('xscan indentation', function()
     end)
 end)
 
+spec.describe('xscan long brackets', function()
+    local Lua = xscan.lang({
+        keywords = { 'local', 'function', 'end' },
+        ops = { '..', '...', '==', '~=' },
+        line_comment = { '--' },
+        strings = { { '"', '"', escape = '\\' }, { "'", "'", escape = '\\' } },
+        long_brackets = true,
+    })
+
+    spec.it('reads leveled long strings as one token', function()
+        local T = Lua:tokenize('local s = [==[ a ]] ]=] b\n]==] .. x')
+        spec.equal(kinds(T), 'kw id op str op id')
+        spec.equal(T:text(4), '[==[ a ]] ]=] b\n]==]')
+        spec.equal(T:line(4), 1)
+        spec.equal(T:eline(4), 2)
+        spec.equal(T:line(6), 2)
+    end)
+
+    spec.it('skips long comments but keeps short ones to end of line', function()
+        local T = Lua:tokenize('a --[[ x\ny ]] b\n--[=[ ]] ]=] c\n-- [[ not long\nd')
+        spec.equal(texts(T), 'a b c d')
+        spec.equal(T:line(2), 2)
+        spec.equal(T:line(3), 3)
+        spec.equal(T:line(4), 5)
+    end)
+
+    spec.it('leaves index brackets alone', function()
+        local T = Lua:tokenize('t[i][ [=[k]=] ] = 1')
+        spec.equal(texts(T), 't [ i ] [ [=[k]=] ] = 1')
+        spec.equal(T:match(2), 4)
+        spec.equal(T:match(5), 7)
+    end)
+
+    spec.it('runs an unterminated long string to the end', function()
+        local T = Lua:tokenize('x = [[ open')
+        spec.equal(T:kind(3), 'str')
+        spec.equal(T:text(3), '[[ open')
+    end)
+end)
+
 local failures = spec.finish()
 
 return {

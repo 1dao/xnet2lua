@@ -1947,6 +1947,7 @@ Token kinds: `id` `kw` `op` `str` `num` `dir` (preprocessor line, `\` continuati
 
 - `pp_first_branch`: at file scope (bracket depth 0) every `#if/#else` arm is kept, so platform variants of whole functions are all indexed; inside brackets only the first live arm is kept, so `if (a) {` appearing in both arms cannot unbalance braces; `#if 0` arms are dropped.
 - `indent = true` (Python): newlines outside brackets produce `nl`, indentation changes produce `indent`/`dedent`, and indent/dedent pairs go into the match table, so a block's extent is one `T.m` lookup.
+- `long_brackets = true` (Lua): `[[ ]]` and `[==[ ]==]` are read as one `str` token, matched by `=` level; a line-comment prefix directly followed by a long bracket (`--[[ ]]`, `--[=[ ]=]`) is skipped as a block comment; an unclosed bracket runs to the end of the source.
 - An unbalanced closing bracket stays unmatched instead of shifting every later pair.
 
 Lang objects and token tables belong to the current thread's Lua state and must not cross threads. Unit specs: `tests/lua/xscan_spec.lua`.

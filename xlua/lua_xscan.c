@@ -17,6 +17,7 @@
 **       directive = '#',                                     -- whole-line directive at line start
 **       pp_first_branch = true,                              -- C: see directive() below
 **       indent = true,                                       -- Python: nl/indent/dedent tokens
+**       long_brackets = true,                                -- Lua: [==[ str ]==], --[==[ comment ]==]
 **   }
 **   local T = L:tokenize(src)
 **
@@ -80,6 +81,7 @@ typedef struct {
     int directive;  /* -1 for none */
     int pp_first_branch;
     int indent;
+    int long_brackets;  /* Lua [==[ strings ]==] and --[==[ comments ]==] */
 } XsLang;
 
 typedef struct {
@@ -202,6 +204,7 @@ static void xs_lang_load(lua_State* L, XsLang* g) {
     g->directive = (r && n > 0) ? (uint8_t)r[0] : -1;
     g->pp_first_branch = xs_opt_bool(L, "pp_first_branch");
     g->indent = xs_opt_bool(L, "indent");
+    g->long_brackets = xs_opt_bool(L, "long_brackets");
 
     /* keywords: open addressing at <= 50% load */
     lua_getfield(L, 1, "keywords");
@@ -377,6 +380,27 @@ static int xs_count_nl(const XsScan* sc, int a, int b) {
     int n = 0;
     for (int p = a; p <= b && p <= sc->len; p++) if (sc->src[p - 1] == '\n') n++;
     return n;
+}
+
+/* Lua long bracket opening at p: '[' '='* '['. Returns its level (the
+** number of '='), or -1 when p does not open one. */
+static int xs_long_open(const XsScan* sc, int p) {
+    if (B(p) != '[') return -1;
+    int q = p + 1, level = 0;
+    while (B(q) == '=') { q++; level++; }
+    return B(q) == '[' ? level : -1;
+}
+
+/* Last byte of the long bracket opened at p: the first ']' '='*level ']'
+** after it, or the end of the source when it is never closed. */
+static int xs_long_close(const XsScan* sc, int p, int level) {
+    for (int q = p + level + 2; q <= sc->len; q++) {
+        if (B(q) != ']') continue;
+        int k = 0;
+        while (k < level && B(q + 1 + k) == '=') k++;
+        if (k == level && B(q + 1 + level) == ']') return q + level + 1;
+    }
+    return sc->len;
 }
 
 static void xs_push(XsScan* sc, int kind, int a, int b, int l1, int l2) {
@@ -584,8 +608,17 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
         if (!handled) {
             for (int i = 0; i < g->nlc; i++) {
                 if (xs_starts(sc, pos, &g->lc[i])) {
-                    const char* nlp = (const char*)memchr(src + pos - 1, '\n', (size_t)(len - pos + 1));
-                    pos = nlp ? (int)(nlp - src) + 1 : len + 1;
+                    int after = pos + (int)g->lc[i].len;
+                    int lb = g->long_brackets ? xs_long_open(sc, after) : -1;
+                    if (lb >= 0) {
+                        /* --[==[ block comment ]==] */
+                        int stop = xs_long_close(sc, after, lb);
+                        sc->line += xs_count_nl(sc, pos, stop);
+                        pos = stop + 1;
+                    } else {
+                        const char* nlp = (const char*)memchr(src + pos - 1, '\n', (size_t)(len - pos + 1));
+                        pos = nlp ? (int)(nlp - src) + 1 : len + 1;
+                    }
                     handled = 1;
                     break;
                 }
@@ -604,6 +637,17 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
                     handled = 1;
                     break;
                 }
+            }
+        }
+        if (!handled && g->long_brackets) {
+            int lb = xs_long_open(sc, pos);
+            if (lb >= 0) {
+                int stop = xs_long_close(sc, pos, lb);
+                int l0 = sc->line;
+                sc->line += xs_count_nl(sc, pos, stop);
+                xs_push(sc, K_STR, pos, stop, l0, sc->line);
+                pos = stop + 1;
+                handled = 1;
             }
         }
         if (!handled) {
