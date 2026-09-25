@@ -26,7 +26,7 @@ Un pequeño runtime de red en C con una capa de scripting de Lua embebida. El n�
 |  Núcleo C: xpoll / xchannel / xsock / xtimer / xthread    |
 +-----------------------------------------------------------+
 |  Terceros: minilua / LuaJIT / mbedTLS / yyjson /          |
-|               rpmalloc / libdeflate / lpegrex             |
+|               rpmalloc / libdeflate                       |
 +-----------------------------------------------------------+
 ```
 
@@ -71,7 +71,6 @@ Cada uno se activa mediante una bandera de compilación y reside en `3rd/` como 
 | rpmalloc    | `WITH_RPMALLOC=1` (activo por def)| Asignador por hilo vía `xmacro.h`    | `3rd/rpmalloc/` |
 | yyjson      | siempre                        | JSON en `xutils.json_*`                | `3rd/yyjson.c`     |
 | libdeflate  | siempre                        | `xcompress` y `Content-Encoding: gzip/deflate` en xhttp | `3rd/libdeflate/` |
-| lpegrex     | opcional, embebido por el usuario| Librería de parseo PEG                | `3rd/lpegrex/`     |
 
 Obtener todos los submódulos:
 

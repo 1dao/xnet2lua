@@ -26,7 +26,7 @@ A small C networking runtime with an embedded Lua scripting layer. The C core ha
 |  C core: xpoll / xchannel / xsock / xtimer / xthread      |
 +-----------------------------------------------------------+
 |  Third-party: minilua / LuaJIT / mbedTLS / yyjson /       |
-|               rpmalloc / libdeflate / lpegrex             |
+|               rpmalloc / libdeflate                       |
 +-----------------------------------------------------------+
 ```
 
@@ -71,7 +71,6 @@ Each is activated by a build flag and lives under `3rd/` as a submodule (or in-t
 | rpmalloc    | `WITH_RPMALLOC=1` (default on)| Per-thread allocator routed via `xmacro.h` | `3rd/rpmalloc/` |
 | yyjson      | always                        | JSON in `xutils.json_*`                | `3rd/yyjson.c`     |
 | libdeflate  | always                        | `xcompress` and `Content-Encoding: gzip/deflate` in xhttp | `3rd/libdeflate/` |
-| lpegrex     | optional, embed yourself      | PEG parser library                    | `3rd/lpegrex/`     |
 
 Fetch all submodules:
 
