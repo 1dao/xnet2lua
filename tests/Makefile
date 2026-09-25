@@ -143,7 +143,8 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xhttp_client_main.lua \
 	demo/xrecord_main.lua \
 	tests/lua/xshared_race_test.lua \
-	tests/lua/conn_close_leak_test.lua
+	tests/lua/conn_close_leak_test.lua \
+	tests/lua/timer_coroutine_test.lua
 
 ifeq ($(WITH_XPROC),1)
 LUA_TEST_CORE_SCRIPTS += tests/lua/xproc_pipe_test.lua

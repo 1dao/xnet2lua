@@ -32,6 +32,7 @@
 
 #include "xtimer.h"
 #include "xlog.h"
+#include "lua_xnet.h"   /* main_lua_state */
 
 #define LUA_XTIMER_META "xtimer.handle"
 
@@ -173,7 +174,13 @@ static int l_xtimer_show(lua_State* L) {
 static int xtimer_create_lua(lua_State* L, const char* fname, int64_t interval_ms,
                              int callback_idx, int repeat_num) {
     LuaTimer* t = (LuaTimer*)lua_newuserdata(L, sizeof(*t));
-    t->L = L;
+    /* This state's main coroutine, never L itself: L may be a coroutine, and
+    ** one that finishes while the timer is armed is collected, leaving the
+    ** callback to run on freed memory (a delayed segfault, e.g. xthread.rpc
+    ** with a timeout, or xhttp_client from a request coroutine). The main
+    ** coroutine lives as long as the thread and shares the registry the refs
+    ** below go into. Same thread, same VM -- only the stack differs. */
+    t->L = main_lua_state(L);
     t->handle = NULL;
     t->callback_ref = LUA_NOREF;
     t->self_ref = LUA_NOREF;

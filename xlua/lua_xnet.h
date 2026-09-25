@@ -1,4 +1,5 @@
-/* lua_xnet.h - internal header shared by lua_xnet.c and lua_xnet_tls.c.
+/* lua_xnet.h - internal header shared by lua_xnet.c and lua_xnet_tls.c
+** (lua_xtimer.c includes it for main_lua_state only).
 **
 ** Two things live here:
 **   1. Small Lua-glue helpers that were previously verbatim-duplicated across

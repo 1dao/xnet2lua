@@ -120,7 +120,7 @@ set "LUAJIT_DIR=3rd\luajit\src"
 set "LUAJIT_INC=3rd\luajit\src"
 
 set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua"
-set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua tests/lua/conn_close_leak_test.lua"
+set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua tests/lua/conn_close_leak_test.lua tests/lua/timer_coroutine_test.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG% /DXNET_WITH_XPROC=%WITH_XPROC%"
