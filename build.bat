@@ -15,6 +15,7 @@ set "WITH_HTTP=1"
 set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
 set "WITH_XDEBUG=0"
+set "WITH_XPROC=1"
 set "WITH_RPMALLOC=1"
 set "WITH_ASAN=0"
 set "LUA_BACKEND=minilua"
@@ -30,6 +31,8 @@ for %%A in (%*) do (
     if /I "!ARG!"=="nohttps" set "WITH_HTTPS=0"
     if /I "!ARG!"=="xdebug" set "WITH_XDEBUG=1"
     if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
+    if /I "!ARG!"=="xproc" set "WITH_XPROC=1"
+    if /I "!ARG!"=="noxproc" set "WITH_XPROC=0"
     if /I "!ARG!"=="norpmalloc" set "WITH_RPMALLOC=0"
     if /I "!ARG!"=="asan" (
         set "WITH_ASAN=1"
@@ -70,7 +73,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% xproc=%WITH_XPROC% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -110,6 +113,7 @@ set "COMMON_SOURCES=xthread.c xpoll.c xsock.c xchannel.c xargs.c xtimer.c xdaemo
 if "%WITH_RPMALLOC%"=="1" set "COMMON_SOURCES=%COMMON_SOURCES% 3rd\rpmalloc\rpmalloc.c"
 set "XNET_SOURCES=xlua\xnet_main.c xlua\lua_xthread.c xlua\lua_xnet.c xlua\lua_xnet_tls.c xlua\lua_cmsgpack.c xlua\lua_xutils.c xlua\lua_xtimer.c xlua\lua_xcompress.c xlua\lua_xshared.c xlua\lua_xrecord.c xlua\lua_xscan.c 3rd\yyjson.c xframe_aead.c"
 if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
+if "%WITH_XPROC%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xproc.c xlua\lua_xproc.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
 set "LUAJIT_DIR=3rd\luajit\src"
@@ -119,7 +123,7 @@ set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG%"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG% /DXNET_WITH_XPROC=%WITH_XPROC%"
 if "%WITH_RPMALLOC%"=="1" (
     set "DEFS=%DEFS% /DENABLE_OVERRIDE=0 /DXMACRO_USE_RPMALLOC=1"
 ) else (
