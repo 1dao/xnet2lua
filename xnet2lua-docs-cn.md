@@ -1921,6 +1921,10 @@ token 种类：`id` `kw` `op` `str` `num` `dir`（预处理行，含 `\` 续行�
 - `pp_first_branch`：文件作用域（括号深度 0）的 `#if/#else` 所有分支都保留，平台变体函数都能被索引；括号内部只保留第一个有效分支，避免 `if (a) {` 在两个分支各出现一次导致括号失配；`#if 0` 分支丢弃。
 - `indent = true`（Python）：括号外的换行产生 `nl`，缩进变化产生 `indent`/`dedent`，且 `indent`/`dedent` 也写入配对表，一个块的范围查一次 `T.m` 即可。
 - `long_brackets = true`（Lua）：`[[ ]]`、`[==[ ]==]` 按等号层级读成一个 `str` token；行注释前缀后紧跟长括号（`--[[ ]]`、`--[=[ ]=]`）时整段作为注释跳过；未闭合时一直到文件末尾。
+- `template_literals = true`（JS/TS）：`` `a ${b} c` `` 读成一个 `str` token，`${ }` 里可以嵌套字符串和模板字符串。
+- `regex_literals = true`（JS/TS）：`/` 出现在操作数可以开始的位置时按正则 `/re/flags` 读成 `str`；前一个 token 是标识符、数字、字符串、`)` `]` `}` 或 `this`/`super`/`true`/`false`/`null` 时仍是除号；行尾前没闭合则回退为除号。
+- `lifetimes = true`（Rust）：`'a` 生命周期读成 `id`，`'a'` / `'\n'` 仍是字符字面量。
+- `raw_strings = true`（Rust）：`r"..."`、`r#"..."#`、`br##"..."##` 按 `#` 层数读成一个 `str`。
 - 不配对的闭括号保持未配对，不会让后续所有配对错位。
 
 lang 对象和 token 表都只属于当前线程的 Lua state，不能跨线程传递。单测见 `tests/lua/xscan_spec.lua`。

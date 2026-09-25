@@ -18,6 +18,8 @@
 **       pp_first_branch = true,                              -- C: see directive() below
 **       indent = true,                                       -- Python: nl/indent/dedent tokens
 **       long_brackets = true,                                -- Lua: [==[ str ]==], --[==[ comment ]==]
+**       template_literals = true, regex_literals = true,     -- JS/TS: `a ${b} c`, /re/g
+**       lifetimes = true, raw_strings = true,                -- Rust: 'a, r#"..."#
 **   }
 **   local T = L:tokenize(src)
 **
@@ -82,6 +84,10 @@ typedef struct {
     int pp_first_branch;
     int indent;
     int long_brackets;  /* Lua [==[ strings ]==] and --[==[ comments ]==] */
+    int template_literals;  /* JS `a ${b} c` with nested templates */
+    int regex_literals;     /* JS /re/flags where an operand may start */
+    int lifetimes;          /* Rust 'a lifetimes vs 'a' chars */
+    int raw_strings;        /* Rust r"..", r#".."#, br#".."# */
 } XsLang;
 
 typedef struct {
@@ -205,6 +211,10 @@ static void xs_lang_load(lua_State* L, XsLang* g) {
     g->pp_first_branch = xs_opt_bool(L, "pp_first_branch");
     g->indent = xs_opt_bool(L, "indent");
     g->long_brackets = xs_opt_bool(L, "long_brackets");
+    g->template_literals = xs_opt_bool(L, "template_literals");
+    g->regex_literals = xs_opt_bool(L, "regex_literals");
+    g->lifetimes = xs_opt_bool(L, "lifetimes");
+    g->raw_strings = xs_opt_bool(L, "raw_strings");
 
     /* keywords: open addressing at <= 50% load */
     lua_getfield(L, 1, "keywords");
@@ -401,6 +411,121 @@ static int xs_long_close(const XsScan* sc, int p, int level) {
         if (k == level && B(q + 1 + level) == ']') return q + level + 1;
     }
     return sc->len;
+}
+
+/* End of a quoted run opened at p by quote byte q (backslash escapes; stops
+** at a newline so a stray quote cannot swallow the file). */
+static int xs_skip_quoted(const XsScan* sc, int p, int q) {
+    int x = p + 1;
+    while (x <= sc->len) {
+        int b = B(x);
+        if (b == '\\') x += 2;
+        else if (b == q || b == '\n') return x;
+        else x++;
+    }
+    return sc->len;
+}
+
+static int xs_skip_template(const XsScan* sc, int p);
+
+/* Matching '}' of the `${` expression whose '{' is at p. */
+static int xs_skip_braces(const XsScan* sc, int p) {
+    int depth = 0;
+    for (int x = p; x <= sc->len; x++) {
+        int b = B(x);
+        if (b == '{') depth++;
+        else if (b == '}') { if (--depth == 0) return x; }
+        else if (b == '`') x = xs_skip_template(sc, x);
+        else if (b == '"' || b == '\'') x = xs_skip_quoted(sc, x, b);
+    }
+    return sc->len;
+}
+
+/* Closing backtick of a JS template literal opened at p; `${ ... }` parts
+** may nest strings and further templates. */
+static int xs_skip_template(const XsScan* sc, int p) {
+    int x = p + 1;
+    while (x <= sc->len) {
+        int b = B(x);
+        if (b == '\\') x += 2;
+        else if (b == '`') return x;
+        else if (b == '$' && B(x + 1) == '{') x = xs_skip_braces(sc, x + 1) + 1;
+        else x++;
+    }
+    return sc->len;
+}
+
+/* Whether a '/' at this point starts a JS regex rather than a division:
+** a regex can only appear where an operand may start. After an operand
+** (identifier, number, string, `)`, `]`, `}`, or a value keyword such as
+** `this`) it is a division. */
+static int xs_regex_allowed(const XsScan* sc) {
+    const XsRaw* t = sc->t;
+    if (t->n == 0) return 1;
+    int i = t->n - 1;
+    int k = t->k[i];
+    const char* s = sc->src + t->s[i] - 1;
+    int n = t->e[i] - t->s[i] + 1;
+    if (k == K_ID || k == K_NUM || k == K_STR) return 0;
+    if (k == K_OP) return !(n == 1 && (s[0] == ')' || s[0] == ']' || s[0] == '}'));
+    if (k == K_KW) {
+        static const char* const values[] = { "this", "super", "true", "false", "null", NULL };
+        for (int v = 0; values[v]; v++)
+            if ((int)strlen(values[v]) == n && memcmp(values[v], s, (size_t)n) == 0) return 0;
+    }
+    return 1;
+}
+
+/* Last byte (flags included) of a regex literal opened at p, or 0 when the
+** line ends first (then the '/' was a division after all). */
+static int xs_scan_regex(const XsScan* sc, int p) {
+    int x = p + 1, in_class = 0;
+    while (x <= sc->len) {
+        int b = B(x);
+        if (b == '\\') { x += 2; continue; }
+        if (b == '\n') return 0;
+        if (in_class) { if (b == ']') in_class = 0; }
+        else if (b == '[') in_class = 1;
+        else if (b == '/') {
+            x++;
+            while (x <= sc->len && sc->g->id_char[B(x)]) x++;
+            return x - 1;
+        }
+        x++;
+    }
+    return 0;
+}
+
+/* Rust raw string at p: [bc]?r#*" ... "#* (same number of '#'). Returns the
+** last byte, or 0 when p does not start one. */
+static int xs_scan_raw_string(const XsScan* sc, int p) {
+    int x = p;
+    if (x > 1 && sc->g->id_char[B(x - 1)]) return 0;
+    if (B(x) == 'b' || B(x) == 'c') x++;
+    if (B(x) != 'r') return 0;
+    x++;
+    int hashes = 0;
+    while (B(x) == '#') { hashes++; x++; }
+    if (B(x) != '"') return 0;
+    for (int q = x + 1; q <= sc->len; q++) {
+        if (B(q) != '"') continue;
+        int k = 0;
+        while (k < hashes && B(q + 1 + k) == '#') k++;
+        if (k == hashes) return q + hashes;
+    }
+    return sc->len;
+}
+
+/* Rust `'a` lifetime (not a `'a'` char) at p: returns its last byte or 0. */
+static int xs_scan_lifetime(const XsScan* sc, int p) {
+    int c = B(p + 1);
+    if (c == '\\' || !sc->g->id_start[c]) return 0;
+    /* one UTF-8 character then a quote is a char literal: 'a', 'é' */
+    int w = c < 0x80 ? 1 : c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : 2;
+    if (B(p + 1 + w) == '\'') return 0;
+    int x = p + 1;
+    while (x <= sc->len && sc->g->id_char[B(x)]) x++;
+    return x - 1;
 }
 
 static void xs_push(XsScan* sc, int kind, int a, int b, int l1, int l2) {
@@ -637,6 +762,40 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
                     handled = 1;
                     break;
                 }
+            }
+        }
+        if (!handled && g->template_literals && c == '`') {
+            int stop = xs_skip_template(sc, pos);
+            int l0 = sc->line;
+            sc->line += xs_count_nl(sc, pos, stop);
+            xs_push(sc, K_STR, pos, stop, l0, sc->line);
+            pos = stop + 1;
+            handled = 1;
+        }
+        if (!handled && g->regex_literals && c == '/' && xs_regex_allowed(sc)) {
+            int stop = xs_scan_regex(sc, pos);
+            if (stop) {
+                xs_push(sc, K_STR, pos, stop, sc->line, sc->line);
+                pos = stop + 1;
+                handled = 1;
+            }
+        }
+        if (!handled && g->lifetimes && c == '\'') {
+            int stop = xs_scan_lifetime(sc, pos);
+            if (stop) {
+                xs_push(sc, K_ID, pos, stop, sc->line, sc->line);
+                pos = stop + 1;
+                handled = 1;
+            }
+        }
+        if (!handled && g->raw_strings && (c == 'r' || c == 'b' || c == 'c')) {
+            int stop = xs_scan_raw_string(sc, pos);
+            if (stop) {
+                int l0 = sc->line;
+                sc->line += xs_count_nl(sc, pos, stop);
+                xs_push(sc, K_STR, pos, stop, l0, sc->line);
+                pos = stop + 1;
+                handled = 1;
             }
         }
         if (!handled && g->long_brackets) {

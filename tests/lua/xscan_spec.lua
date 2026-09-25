@@ -187,6 +187,70 @@ spec.describe('xscan long brackets', function()
     end)
 end)
 
+spec.describe('xscan JS literals', function()
+    local JS = xscan.lang({
+        keywords = { 'return', 'this', 'typeof' },
+        ops = { '=>', '===', '/=' },
+        line_comment = { '//' },
+        block_comment = { { '/*', '*/' } },
+        strings = { { '"', '"', escape = '\\' }, { "'", "'", escape = '\\' } },
+        template_literals = true,
+        regex_literals = true,
+    })
+
+    spec.it('reads nested template literals as one token', function()
+        local T = JS:tokenize('f(`a ${ g(`x${ "}" }y`) } b\nc`, z)')
+        spec.equal(kinds(T), 'id op str op id op')
+        spec.equal(T:eline(3), 2)
+        spec.equal(T:match(2), 6)
+    end)
+
+    spec.it('tells regex literals from division by the previous token', function()
+        local T = JS:tokenize('x = a / b / c; r = /[{(]\\//g.test(s); return /}/;')
+        local strs = {}
+        for i = 1, T.n do if T:kind(i) == 'str' then strs[#strs + 1] = T:text(i) end end
+        spec.equal(table.concat(strs, ' '), '/[{(]\\//g /}/')
+        local T2 = JS:tokenize('this / 2; (a) / 2; x /= 3')
+        for i = 1, T2.n do spec.truthy(T2:kind(i) ~= 'str', 'division, not regex') end
+    end)
+
+    spec.it('falls back to division when the line ends first', function()
+        local T = JS:tokenize('( a\n/ b )')
+        spec.equal(T:match(1), 5)
+    end)
+end)
+
+spec.describe('xscan Rust literals', function()
+    local RS = xscan.lang({
+        keywords = { 'fn', 'let' },
+        ops = { '->', '::' },
+        line_comment = { '//' },
+        strings = { { '"', '"', escape = '\\', multiline = true }, { "'", "'", escape = '\\' } },
+        string_prefixes = 'bc',
+        lifetimes = true,
+        raw_strings = true,
+    })
+
+    spec.it('reads lifetimes as identifiers and chars as strings', function()
+        local T = RS:tokenize("fn f<'a>(x: &'a str) -> char { 'x' } 'é' '\\n'")
+        local lt, chars = {}, {}
+        for i = 1, T.n do
+            if T:kind(i) == 'id' and T:text(i):sub(1, 1) == "'" then lt[#lt + 1] = T:text(i) end
+            if T:kind(i) == 'str' then chars[#chars + 1] = T:text(i) end
+        end
+        spec.equal(table.concat(lt, ' '), "'a 'a")
+        spec.equal(table.concat(chars, ' '), "'x' 'é' '\\n'")
+        spec.equal(T:match(6), 12)
+    end)
+
+    spec.it('reads hash-leveled raw strings', function()
+        local T = RS:tokenize('let s = r#"a "quoted" { b"#; let t = br"x\\"; let u = r##"#"# "##;')
+        local strs = {}
+        for i = 1, T.n do if T:kind(i) == 'str' then strs[#strs + 1] = T:text(i) end end
+        spec.equal(table.concat(strs, ' | '), 'r#"a "quoted" { b"# | br"x\\" | r##"#"# "##')
+    end)
+end)
+
 local failures = spec.finish()
 
 return {
