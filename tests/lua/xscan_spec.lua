@@ -220,6 +220,51 @@ spec.describe('xscan JS literals', function()
     end)
 end)
 
+spec.describe('xscan JS literal edge cases', function()
+    local JS = xscan.lang({
+        keywords = { 'if', 'while', 'for', 'with', 'function', 'return' },
+        ops = { '=>', '===' },
+        line_comment = { '//' },
+        block_comment = { { '/*', '*/' } },
+        strings = { { '"', '"', escape = '\\' }, { "'", "'", escape = '\\' } },
+        template_literals = true,
+        regex_literals = true,
+    })
+
+    spec.it('reads a regex after a control-statement condition', function()
+        local T = JS:tokenize('function f(x) { if (x) /}/.test(x); while (y) /{/.exec(z); return (a) / 2 }')
+        local strs = {}
+        for i = 1, T.n do if T:kind(i) == 'str' then strs[#strs + 1] = T:text(i) end end
+        spec.equal(table.concat(strs, ' '), '/}/ /{/')
+        spec.equal(T:text(T:match(6)), '}', 'the function body still closes at the end')
+        spec.equal(T:match(6), T.n)
+    end)
+
+    spec.it('skips comments inside template substitutions', function()
+        local T = JS:tokenize('const x = `${1 /* { */} and ${2 // }\n}`;\nfunction g() {}')
+        spec.equal(T:kind(4), 'str')
+        spec.equal(T:text(6), 'function', 'the template ends before the next statement')
+    end)
+end)
+
+spec.describe('xscan nesting and continuations', function()
+    spec.it('nests block comments when asked (Rust)', function()
+        local RS = xscan.lang({ keywords = { 'fn' }, block_comment = { { '/*', '*/' } }, nested_comments = true })
+        local T = RS:tokenize('/* outer /* inner */ fn ghost() {} */\nfn real() {}')
+        spec.equal(texts(T), 'fn real ( ) { }')
+        spec.equal(T:line(1), 2)
+        local C = xscan.lang({ keywords = { 'fn' }, block_comment = { { '/*', '*/' } } })
+        spec.equal(texts(C:tokenize('/* a /* b */ x')), 'x', 'C-style comments do not nest')
+    end)
+
+    spec.it('joins Python backslash continuations into one logical line', function()
+        local P = xscan.lang({ keywords = { 'def' }, line_comment = { '#' }, indent = true })
+        local T = P:tokenize('def f():\n    x = 1 + \\\n        2\n    y = 3\ndef g():\n    pass\n')
+        spec.equal(kinds(T), 'kw id op op op nl indent id op num op num nl id op num nl dedent kw id op op op nl indent id nl dedent')
+        spec.equal(T:line(12), 3, 'line numbers keep counting across the continuation')
+    end)
+end)
+
 spec.describe('xscan Rust literals', function()
     local RS = xscan.lang({
         keywords = { 'fn', 'let' },

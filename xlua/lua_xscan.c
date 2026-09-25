@@ -20,6 +20,7 @@
 **       long_brackets = true,                                -- Lua: [==[ str ]==], --[==[ comment ]==]
 **       template_literals = true, regex_literals = true,     -- JS/TS: `a ${b} c`, /re/g
 **       lifetimes = true, raw_strings = true,                -- Rust: 'a, r#"..."#
+**       nested_comments = true,                              -- Rust: block comments nest
 **   }
 **   local T = L:tokenize(src)
 **
@@ -88,6 +89,7 @@ typedef struct {
     int regex_literals;     /* JS /re/flags where an operand may start */
     int lifetimes;          /* Rust 'a lifetimes vs 'a' chars */
     int raw_strings;        /* Rust r"..", r#".."#, br#".."# */
+    int nested_comments;    /* Rust: block comments nest */
 } XsLang;
 
 typedef struct {
@@ -215,6 +217,7 @@ static void xs_lang_load(lua_State* L, XsLang* g) {
     g->regex_literals = xs_opt_bool(L, "regex_literals");
     g->lifetimes = xs_opt_bool(L, "lifetimes");
     g->raw_strings = xs_opt_bool(L, "raw_strings");
+    g->nested_comments = xs_opt_bool(L, "nested_comments");
 
     /* keywords: open addressing at <= 50% load */
     lua_getfield(L, 1, "keywords");
@@ -375,6 +378,12 @@ typedef struct {
     int line, depth, skip;
     XsPP* pp;
     int npp, cap_pp;
+    /* regex_literals: one flag per open '(' -- whether it follows
+    ** if/while/for/with -- and the token index of the last ')' that closed
+    ** such a condition, after which a '/' starts a regex, not a division */
+    uint8_t* parens;
+    int nparens, cap_parens;
+    int ctrl_close;
     int oom;
 } XsScan;
 
@@ -437,6 +446,13 @@ static int xs_skip_braces(const XsScan* sc, int p) {
         else if (b == '}') { if (--depth == 0) return x; }
         else if (b == '`') x = xs_skip_template(sc, x);
         else if (b == '"' || b == '\'') x = xs_skip_quoted(sc, x, b);
+        else if (b == '/' && B(x + 1) == '/') {
+            while (x <= sc->len && B(x) != '\n') x++;          /* // comment */
+        } else if (b == '/' && B(x + 1) == '*') {
+            x += 2;                                           /* block comment */
+            while (x < sc->len && !(B(x) == '*' && B(x + 1) == '/')) x++;
+            x++;
+        }
     }
     return sc->len;
 }
@@ -467,13 +483,42 @@ static int xs_regex_allowed(const XsScan* sc) {
     const char* s = sc->src + t->s[i] - 1;
     int n = t->e[i] - t->s[i] + 1;
     if (k == K_ID || k == K_NUM || k == K_STR) return 0;
-    if (k == K_OP) return !(n == 1 && (s[0] == ')' || s[0] == ']' || s[0] == '}'));
+    /* `if (x) /re/.test(s)`: a ')' closing a control condition ends no operand */
+    if (k == K_OP && n == 1 && s[0] == ')') return sc->ctrl_close == t->n;
+    if (k == K_OP) return !(n == 1 && (s[0] == ']' || s[0] == '}'));
     if (k == K_KW) {
         static const char* const values[] = { "this", "super", "true", "false", "null", NULL };
         for (int v = 0; values[v]; v++)
             if ((int)strlen(values[v]) == n && memcmp(values[v], s, (size_t)n) == 0) return 0;
     }
     return 1;
+}
+
+/* After pushing the single-char operator c: remember which '(' opened a
+** control condition (`if (`, `while (`, `for (`, `with (`), and mark the
+** ')' that closes one so xs_regex_allowed() can let a regex follow it. */
+static void xs_track_paren(XsScan* sc, int c) {
+    const XsRaw* t = sc->t;
+    if (c == '(') {
+        uint8_t ctrl = 0;
+        if (t->n >= 2 && t->k[t->n - 2] == K_KW) {
+            const char* s = sc->src + t->s[t->n - 2] - 1;
+            int n = t->e[t->n - 2] - t->s[t->n - 2] + 1;
+            ctrl = (n == 2 && memcmp(s, "if", 2) == 0) || (n == 5 && memcmp(s, "while", 5) == 0)
+                || (n == 3 && memcmp(s, "for", 3) == 0) || (n == 4 && memcmp(s, "with", 4) == 0);
+        }
+        if (sc->nparens == sc->cap_parens) {
+            int cap = sc->cap_parens ? sc->cap_parens * 2 : 64;
+            uint8_t* grown = (uint8_t*)realloc(sc->parens, (size_t)cap);
+            if (!grown) { sc->oom = 1; return; }
+            sc->parens = grown;
+            sc->cap_parens = cap;
+        }
+        sc->parens[sc->nparens++] = ctrl;
+    } else if (c == ')') {
+        int ctrl = sc->nparens > 0 ? sc->parens[--sc->nparens] : 0;
+        sc->ctrl_close = ctrl ? t->n : 0;
+    }
 }
 
 /* Last byte (flags included) of a regex literal opened at p, or 0 when the
@@ -668,6 +713,13 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
             pos++;
             continue;
         }
+        /* Python line continuation: `\` at the end of a line joins the next
+        ** one to the same logical line (no nl, no indentation change). */
+        if (g->indent && c == '\\' && (B(pos + 1) == '\n' || (B(pos + 1) == '\r' && B(pos + 2) == '\n'))) {
+            pos += B(pos + 1) == '\n' ? 2 : 3;
+            sc->line++;
+            continue;
+        }
 
         /* Indentation (Python): measured at the first real token of a line. */
         if (g->indent && bol && sc->depth == 0) {
@@ -754,8 +806,15 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
                 const XsDelim* d = &g->bc[i];
                 if (xs_starts(sc, pos, &d->open)) {
                     int stop = len;
+                    int nest = 1;                          /* > 1 only with nested_comments */
                     for (int p = pos + (int)d->open.len; p + (int)d->close.len - 1 <= len; p++) {
-                        if (xs_starts(sc, p, &d->close)) { stop = p + (int)d->close.len - 1; break; }
+                        if (g->nested_comments && xs_starts(sc, p, &d->open)) {
+                            nest++;
+                            p += (int)d->open.len - 1;
+                        } else if (xs_starts(sc, p, &d->close)) {
+                            if (--nest == 0) { stop = p + (int)d->close.len - 1; break; }
+                            p += (int)d->close.len - 1;
+                        }
                     }
                     sc->line += xs_count_nl(sc, pos, stop);
                     pos = stop + 1;
@@ -874,6 +933,7 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
                     else if (xs_open_of(c) && sc->depth > 0) sc->depth--;
                 }
                 xs_push(sc, K_OP, pos, pos + w - 1, sc->line, sc->line);
+                if (g->regex_literals && w == 1 && !sc->skip && !sc->oom) xs_track_paren(sc, c);
                 pos += w;
             }
         }
@@ -884,6 +944,7 @@ static int xs_tokenize(const XsLang* g, const char* src, int len, XsRaw* t) {
     }
     free(ind);
     free(sc->pp);
+    free(sc->parens);
     if (sc->oom) return 0;
     return xs_matches(t);
 }
