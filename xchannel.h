@@ -91,6 +91,9 @@ void      xchannel_set_max_packet(xChannel* ch, size_t max_packet);
 void      xchannel_set_max_send(xChannel* ch, size_t max);
 void      xchannel_set_max_recv(xChannel* ch, size_t max);
 
+/* Channels created and not yet freed on the calling thread. */
+int       xchannel_live_count(void);
+
 void      xchannel_get_stats(xChannel* ch,
                               size_t* send_buf, size_t* recv_buf,
                               uint64_t* bytes_sent, uint64_t* bytes_recv);

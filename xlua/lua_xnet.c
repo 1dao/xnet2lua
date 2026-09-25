@@ -232,10 +232,14 @@ static void lua_conn_close_cb(xChannel* ch, const char* reason, void* ud) {
         g_conn_count--;
     }
     c->closed = true;
-    if (c->ch == ch) {
-        xchannel_set_userdata(ch, NULL);
-        c->ch = NULL;
-    }
+    /* Detach the callbacks but keep c->ch: it is the conn's owner reference
+    ** (refcount 1 from xchannel_create), and close_internal never drops it.
+    ** Clearing c->ch here left l_conn_gc nothing to destroy, so every closed
+    ** connection leaked its xChannel and both buffers. Destroying it here is
+    ** not an option either -- xchannel_send_file_raw reaches this callback
+    ** through flush_output without holding a retain, and reads ch afterwards.
+    ** l_conn_gc frees it once Lua drops the conn. */
+    if (c->ch == ch) xchannel_set_userdata(ch, NULL);
     conn_unref_lua(c);
     lua_settop(L, base);
 }
@@ -825,13 +829,18 @@ static int l_xnet_poll(lua_State* L) {
 
 static int l_xnet_get_stats(lua_State* L) {
     int cur_id = xthread_current_id();
-    lua_createtable(L, 0, 7);
+    lua_createtable(L, 0, 8);
 
     lua_pushinteger(L, xpoll_fd_count());
     lua_setfield(L, -2, "fd_count");
 
     lua_pushinteger(L, g_conn_count < 0 ? 0 : g_conn_count);
     lua_setfield(L, -2, "conn_count");
+
+    /* Unlike conn_count (open connections), this counts channel memory not
+    ** yet freed -- closed conns stay here until Lua collects them. */
+    lua_pushinteger(L, xchannel_live_count());
+    lua_setfield(L, -2, "channel_count");
 
     lua_pushinteger(L, (lua_Integer)g_acc_sent);
     lua_setfield(L, -2, "bytes_sent");

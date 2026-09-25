@@ -244,6 +244,19 @@ static uint16_t read_u16be(const char* p) {
     return (uint16_t)(((uint16_t)b[0] << 8) | (uint16_t)b[1]);
 }
 
+/* Channels allocated and not yet freed, on this thread. A channel lives and
+** dies on the thread whose event loop owns it, so this needs no atomics. It is
+** the number to watch for a leak: it must fall back once connections close. */
+#ifdef _MSC_VER
+static __declspec(thread) int g_live_channels = 0;
+#else
+static __thread int g_live_channels = 0;
+#endif
+
+int xchannel_live_count(void) {
+    return g_live_channels;
+}
+
 static void xchannel_retain(xChannel* ch) {
     if (ch) ch->refcount++;
 }
@@ -259,6 +272,7 @@ static void xchannel_free_storage(xChannel* ch) {
     xbuf_free(&ch->in);
     xbuf_free(&ch->out);
     free(ch);
+    g_live_channels--;
 }
 
 static void xchannel_release(xChannel* ch) {
@@ -1046,6 +1060,7 @@ xChannel* xchannel_create(SOCKET_T fd, const xChannelConfig* cfg) {
         if (cfg->userdata) ch->userdata = cfg->userdata;
     }
 
+    g_live_channels++;   /* counted only once creation can no longer fail */
     return ch;
 }
 
