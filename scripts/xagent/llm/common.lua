@@ -24,8 +24,11 @@ local M = {}
 -- go through json_pack, so numbers/strings are byte-identical to before and
 -- invalid UTF-8 still fails the encode (nil) exactly as json_pack does. Table
 -- shape follows json_pack: consecutive integer keys 1..n (n > 0) are an
--- array, anything else (including {}) an object; json_null is null.
+-- array, anything else an object; json_null is null. An empty table is {}
+-- unless it carries xutils.json_array_mt, which json_unpack sets on every
+-- decoded array, so a decoded [] re-encodes as [] (older runtimes lack the tag).
 local json_null = xutils.json_null
+local json_array_mt = xutils.json_array_mt
 
 local function encode(v, out)
     if v == json_null then out[#out + 1] = 'null'; return true end
@@ -40,7 +43,8 @@ local function encode(v, out)
         count = count + 1
         if type(k) ~= 'number' or k < 1 or k > n or k % 1 ~= 0 then array = false end
     end
-    if array and n > 0 and count == n then
+    if array and count == n
+        and (n > 0 or (json_array_mt ~= nil and getmetatable(v) == json_array_mt)) then
         out[#out + 1] = '['
         for i = 1, n do
             if i > 1 then out[#out + 1] = ',' end

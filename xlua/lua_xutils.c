@@ -5,6 +5,7 @@
 **   xutils.json_pack(value)   -> JSON string
 **   xutils.json_unpack(text)  -> Lua value
 **   xutils.json_null          -> sentinel for JSON null
+**   xutils.json_array_mt      -> metatable marking a table as a JSON array
 **   xutils.load_config(path)  -> true | false,err
 **   xutils.get_config(key[, default]) -> value | default | nil
 **   xutils.get_int(key[, default])    -> integer | nil   (default: integer)
@@ -153,6 +154,34 @@ static int is_json_null(lua_State *L, int idx) {
     return lua_touserdata(L, idx) == &g_json_null_token;
 }
 
+/* Lua cannot tell an empty array from an empty object, so json_unpack tags
+** every decoded array with this metatable and json_pack encodes a tagged
+** table as an array even when it is empty: [] round-trips as [] instead of
+** turning into {}. Code building an empty array itself uses
+** setmetatable({}, xutils.json_array_mt). Kept in the registry, so each
+** lua_State has its own; luaL_newmetatable creates it on first use. */
+#define JSON_ARRAY_MT "xutils.json_array_mt"
+
+static void push_json_array_mt(lua_State *L) {
+    luaL_newmetatable(L, JSON_ARRAY_MT);
+}
+
+static int is_json_array(lua_State *L, int idx) {
+    int tagged;
+    if (!lua_getmetatable(L, idx)) return 0;
+    push_json_array_mt(L);
+    tagged = lua_rawequal(L, -1, -2);
+    lua_pop(L, 2);
+    return tagged;
+}
+
+static int table_is_empty(lua_State *L, int idx) {
+    lua_pushnil(L);
+    if (!lua_next(L, idx)) return 1;
+    lua_pop(L, 2);
+    return 0;
+}
+
 static int json_error(lua_State *L, const char *msg) {
     lua_pushnil(L);
     lua_pushstring(L, msg ? msg : "json error");
@@ -232,7 +261,10 @@ static yyjson_mut_val *lua_json_from_table(lua_State *L, yyjson_mut_doc *doc,
     }
 
     idx = lua_absindex(L, idx);
-    if (lua_json_table_is_array(L, idx, &array_len)) {
+    /* The tag only decides the empty case; a non-empty table keeps the
+    ** usual shape detection, so the tag never changes what it encodes to. */
+    if (lua_json_table_is_array(L, idx, &array_len)
+        || (is_json_array(L, idx) && table_is_empty(L, idx))) {
         root = yyjson_mut_arr(doc);
         if (!root) {
             lua_settop(L, base);
@@ -334,6 +366,8 @@ static int lua_json_push_array(lua_State *L, const yyjson_val *val, int depth) {
         }
         lua_rawseti(L, -2, i++);
     }
+    push_json_array_mt(L);
+    lua_setmetatable(L, -2);
 
     return 1;
 }
@@ -1725,6 +1759,8 @@ LUALIB_API int luaopen_xutils(lua_State *L) {
     luaL_newlib(L, xutils_funcs);
     push_json_null(L);
     lua_setfield(L, -2, "json_null");
+    push_json_array_mt(L);
+    lua_setfield(L, -2, "json_array_mt");
 
     return 1;
 }
