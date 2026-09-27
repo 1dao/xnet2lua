@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <poll.h>
 #if defined(__APPLE__)
 #include <sys/attr.h>
 #include <sys/vnode.h>
@@ -1708,7 +1709,139 @@ static int l_util_hex_decode(lua_State *L) {
     return 1;
 }
 
+/* Canonical existing paths and atomic cache publication. The Windows runtime
+** embeds an UTF-8 activeCodePage manifest; A APIs therefore accept UTF-8. */
+static int l_util_realpath(lua_State *L) {
+    size_t n;
+    const char *path = luaL_checklstring(L, 1, &n);
+    luaL_argcheck(L, n > 0 && !memchr(path, 0, n), 1, "invalid path");
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                          NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) { lua_pushnil(L); lua_pushstring(L, "cannot resolve path"); return 2; }
+    DWORD cap = GetFinalPathNameByHandleA(h, NULL, 0, FILE_NAME_NORMALIZED);
+    char *buf = cap ? (char *)malloc((size_t)cap + 1) : NULL;
+    DWORD len = buf ? GetFinalPathNameByHandleA(h, buf, cap + 1, FILE_NAME_NORMALIZED) : 0;
+    CloseHandle(h);
+    if (!len || len > cap) { free(buf); lua_pushnil(L); lua_pushstring(L, "cannot resolve path"); return 2; }
+    if (strncmp(buf, "\\\\?\\UNC\\", 8) == 0) { buf[6] = '\\'; lua_pushstring(L, buf + 6); }
+    else lua_pushstring(L, strncmp(buf, "\\\\?\\", 4) == 0 ? buf + 4 : buf);
+    free(buf);
+#else
+    char buf[PATH_MAX];
+    if (!realpath(path, buf)) { lua_pushnil(L); lua_pushstring(L, strerror(errno)); return 2; }
+    lua_pushstring(L, buf);
+#endif
+    return 1;
+}
+
+static int l_util_replace_file(lua_State *L) {
+    size_t ns, nd;
+    const char *src = luaL_checklstring(L, 1, &ns);
+    const char *dst = luaL_checklstring(L, 2, &nd);
+    luaL_argcheck(L, ns && !memchr(src, 0, ns), 1, "invalid path");
+    luaL_argcheck(L, nd && !memchr(dst, 0, nd), 2, "invalid path");
+#ifdef _WIN32
+    int ok = MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    int ok = rename(src, dst) == 0;
+#endif
+    if (!ok) { lua_pushnil(L); lua_pushstring(L, "atomic file replacement failed"); return 2; }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+/* Reserve a unique empty file in the destination directory, on the same
+** filesystem as the eventual rename. The caller owns and removes it. */
+static int l_util_temp_file(lua_State *L) {
+    size_t n;
+    const char *dir = luaL_checklstring(L, 1, &n);
+    luaL_argcheck(L, n && !memchr(dir, 0, n), 1, "invalid directory");
+#ifdef _WIN32
+    char buf[MAX_PATH + 1];
+    if (!GetTempFileNameA(dir, "cix", 0, buf)) {
+        lua_pushnil(L); lua_pushstring(L, "cannot create temporary file"); return 2;
+    }
+    lua_pushstring(L, buf);
+#else
+    char *buf = (char *)malloc(n + 20);
+    if (!buf) return luaL_error(L, "out of memory");
+    snprintf(buf, n + 20, "%s/.cix-XXXXXX", dir);
+    int fd = mkstemp(buf);
+    if (fd < 0) { free(buf); lua_pushnil(L); lua_pushstring(L, strerror(errno)); return 2; }
+    close(fd);
+    lua_pushstring(L, buf);
+    free(buf);
+#endif
+    return 1;
+}
+
+/* Poll redirected stdin without blocking the network/protocol event loop.
+** Returns bytes, empty string when idle, or nil + "eof" / error. */
+static int l_util_read_stdin(lua_State *L) {
+    int cap = (int)luaL_optinteger(L, 1, 65536);
+    luaL_argcheck(L, cap > 0 && cap <= 1048576, 1, "invalid read limit");
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) return luaL_error(L, "out of memory");
+    int n = 0;
+    const char *err = NULL;
+#ifdef _WIN32
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD available = 0, read_count = 0;
+    if (GetFileType(h) == FILE_TYPE_DISK) available = (DWORD)cap;
+    else if (!PeekNamedPipe(h, NULL, 0, NULL, &available, NULL)) {
+        err = GetLastError() == ERROR_BROKEN_PIPE ? "eof" : "stdio requires redirected stdin";
+    }
+    if (!err && available) {
+        if (available > (DWORD)cap) available = (DWORD)cap;
+        if (!ReadFile(h, buf, available, &read_count, NULL)) err = "stdin read failed";
+        else if (!read_count) err = "eof";
+        n = (int)read_count;
+    }
+#else
+    struct pollfd p = { STDIN_FILENO, POLLIN, 0 };
+    int ready = poll(&p, 1, 0);
+    if (ready < 0 && errno != EINTR) err = "stdin poll failed";
+    if (ready > 0) {
+        n = (int)read(STDIN_FILENO, buf, (size_t)cap);
+        if (!n) err = "eof";
+        else if (n < 0) { if (errno != EINTR && errno != EAGAIN) err = "stdin read failed"; n = 0; }
+    }
+#endif
+    if (err) { free(buf); lua_pushnil(L); lua_pushstring(L, err); return 2; }
+    lua_pushlstring(L, buf, (size_t)n);
+    free(buf);
+    return 1;
+}
+
+static int l_util_random_bytes(lua_State *L) {
+    int n = (int)luaL_optinteger(L, 1, 32);
+    luaL_argcheck(L, n > 0 && n <= 4096, 1, "invalid random byte count");
+    unsigned char buf[4096];
+    int ok = 0;
+#ifdef _WIN32
+    HMODULE library = LoadLibraryA("bcrypt.dll");
+    if (library) {
+        typedef LONG (WINAPI *random_fn)(void *, unsigned char *, ULONG, ULONG);
+        random_fn generate = (random_fn)GetProcAddress(library, "BCryptGenRandom");
+        ok = generate && generate(NULL, buf, (ULONG)n, 2) == 0;
+        FreeLibrary(library);
+    }
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) { ok = fread(buf, 1, (size_t)n, f) == (size_t)n; fclose(f); }
+#endif
+    if (!ok) return luaL_error(L, "OS random source unavailable");
+    lua_pushlstring(L, (const char *)buf, (size_t)n);
+    return 1;
+}
+
 static const luaL_Reg xutils_funcs[] = {
+    { "read_stdin",   l_util_read_stdin },
+    { "random_bytes", l_util_random_bytes },
+    { "realpath",     l_util_realpath },
+    { "replace_file", l_util_replace_file },
+    { "temp_file",    l_util_temp_file },
     { "json_pack",    l_util_json_pack },
     { "json_unpack",  l_util_json_unpack },
     { "load_config",  l_util_load_config },

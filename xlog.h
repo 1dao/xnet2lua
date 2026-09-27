@@ -66,6 +66,7 @@ enum {
 void xlog_init(const char* log_dir, const char* process_name, int enable_console);
 void xlog_uninit(void);
 void xlog_set_level(int min_level);
+void xlog_set_console_stderr(int enabled);
 int  xlog_get_level(void);
 int  xlog_is_enabled(int level);
 void xlog_printf(int level, const char* level_name, const char* console_tag, const char* fmt, ...);

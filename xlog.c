@@ -80,6 +80,8 @@ static unsigned long long g_max_file_bytes = XLOG_MAX_FILE_BYTES;
 ** compiler reordering / caching across reads. Writes are infrequent. */
 static volatile int g_min_level = XLOG_LEVEL_VERBOSE;
 static volatile int g_console_enabled = 1;
+static int g_console_stderr = 0;
+void xlog_set_console_stderr(int enabled) { g_console_stderr = enabled != 0; }
 
 static XLOG_TLS xLogThreadState g_thread_log;
 
@@ -265,6 +267,7 @@ static int xlog_is_system_level_name(const char* level_name) {
 }
 
 static FILE* xlog_console_stream(int level, const char* level_name) {
+    if (g_console_stderr) return stderr;
     if (xlog_is_system_level_name(level_name)) return stdout;
     return (level >= XLOG_LEVEL_WARN) ? stderr : stdout;
 }
@@ -836,6 +839,7 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
     (void)process_name;
     (void)enable_console;
 }
+void xlog_set_console_stderr(int enabled) { (void)enabled; }
 
 void xlog_uninit(void) {}
 void xlog_set_thread(int id, const char* name, const char* thread_label) { (void)id; (void)name; (void)thread_label; }

@@ -563,6 +563,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    xlog_set_console_stderr(xargs_get_bool("LOG_STDERR") || xargs_get_bool("STDIO"));
     xlog_init("logs", g_process_name ? g_process_name : "xnet", !xdaemon_is_daemon());
     /* LOG_MAX_FILE_MB caps each log file; the next sequence number is opened
     ** once a file fills up (xnet_main_001.log -> xnet_main_002.log -> ...). */
