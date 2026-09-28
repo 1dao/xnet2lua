@@ -23,9 +23,12 @@ extern "C" {
  *   xproc_wait(pid, ...)             -> exit status once the fds report EOF
  *
  * PLATFORM
- * POSIX is the real implementation and the deployment target. On Windows
- * xproc_supported() returns 0 and xproc_spawn() fails. Callers keep their
- * existing file-staging path on Windows; POSIX is the deployment target.
+ * POSIX uses socketpairs as described above. Windows gives the child real
+ * anonymous pipes and bridges each one to a loopback socket pair with a pump
+ * thread, because WSAPoll only watches sockets; callers see the same fds and
+ * EOF behaviour. There xproc_kill terminates the child's job object (the whole
+ * tree) with exit code 143 / 137, since Windows has no SIGTERM to deliver, and
+ * a .bat/.cmd argv[0] is refused: run it as cmd.exe /d /c instead.
  */
 
 typedef struct {
@@ -68,6 +71,7 @@ int xproc_spawn(const char* const* argv, const xProcSpawnOpts* opts,
 int xproc_wait(long pid, int nohang, int* exit_code);
 
 /* Signal the child. force == 0 sends SIGTERM, non-zero sends SIGKILL.
+ * On Windows both terminate the child's job, reporting 143 / 137.
  * Targets the child's process GROUP, so a shell's grandchildren go too —
  * without that, killing a timed-out `sh -c "..."` leaves the real work running
  * and still holding the stdio channels open. */

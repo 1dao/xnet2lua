@@ -1,16 +1,15 @@
 -- xproc.lua — caller-side API for a pool of blocking process-runner threads.
 --
 -- NOT the module you get from require('xproc'). That name belongs to the C
--- binding (xproc.c / xlua/lua_xproc.c), which has real pollable pipes but is
--- compiled in only with WITH_XPROC=1 (off by default, so a stock bin/xnet lacks
--- it) and is POSIX-only even then: xproc.supported() returns false on Windows
--- and spawn() always fails there.
+-- binding (xproc.c / xlua/lua_xproc.c), which has real pollable pipes on POSIX
+-- and Windows but is compiled in only with WITH_XPROC=1 (off by default in the
+-- Makefile, so a stock bin/xnet may lack it).
 -- This file is the portable path that works on any build and any platform: the
 -- same job done by blocking os.execute on a worker thread instead of by pipes on
 -- the event loop. Load it by path with dofile, never with require.
 --
--- REBUILDING bin/xnet WITH THE C BINDING. WITH_XPROC defaults to 0 and build.bat
--- (MSVC) has no switch for it, so it must come from the Makefile:
+-- REBUILDING bin/xnet WITH THE C BINDING. build.bat (MSVC) enables it by default
+-- (`xproc` / `noxproc`); with the Makefile it must be requested:
 --     mingw32-make -j16 WITH_XPROC=1 xnet     # Windows  -> bin/xnet.exe
 --     make -j16 WITH_XPROC=1 xnet             # Linux    -> bin/xnet
 -- Keep HTTPS on: anything that talks to a TLS endpoint (xagent's LLM calls,

@@ -17,10 +17,10 @@
 --
 -- The cost is that the child's stdout must land on disk before we can look at
 -- it: no streaming, and a temp file per call. The real xproc C binding
--- (require('xproc'), pollable pipes) is the endgame for streaming, but it is
--- POSIX-only — xproc.supported() is false on Windows — so this module stays the
--- portable path. Its API is shaped so swapping the implementation underneath
--- changes nothing for callers.
+-- (require('xproc'), pollable pipes on POSIX and Windows) is the endgame for
+-- streaming, but it is an opt-in build, so this module stays the portable path.
+-- Its API is shaped so swapping the implementation underneath changes nothing
+-- for callers.
 --
 -- SPEC (table, msgpack'd across the thread boundary):
 --   argv           {string,...}  argv[1] is the program; quoted per-platform

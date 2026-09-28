@@ -13,6 +13,7 @@
 
 #include "xthread.h"
 #include "xpoll.h"      /* xPollState, xpoll_get_default, xpoll_add/del_event, SOCKET_T */
+#include "xsock.h"      /* xsock_socketpair, xsock_set_nonblock */
 #include "xmutex.h"
 #include "xlog.h"
 #include "xtimer.h"     /* time_clock_ms for per-task deadlines */
@@ -192,48 +193,6 @@ static int tls_get(void) {
     return (int)(intptr_t)pthread_getspecific(_tls);
 #endif
 }
-
-/* ============================================================================
-** Windows socketpair (TCP loopback)
-** ========================================================================== */
-
-#ifdef _WIN32
-static int win_socketpair(SOCKET fds[2]) {
-    struct sockaddr_in addr;
-    int addrlen = sizeof(addr);
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = 0;
-
-    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listener == INVALID_SOCKET) return -1;
-
-    if (bind  (listener, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
-        listen(listener, 1)                                      != 0 ||
-        getsockname(listener, (struct sockaddr*)&addr, &addrlen) != 0) {
-        closesocket(listener);
-        return -1;
-    }
-
-    fds[0] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (fds[0] == INVALID_SOCKET) { closesocket(listener); return -1; }
-
-    if (connect(fds[0], (struct sockaddr*)&addr, sizeof(addr)) != 0) {
-        closesocket(fds[0]); closesocket(listener); return -1;
-    }
-
-    fds[1] = accept(listener, NULL, NULL);
-    closesocket(listener);
-    if (fds[1] == INVALID_SOCKET) { closesocket(fds[0]); return -1; }
-
-    u_long mode = 1;
-    ioctlsocket(fds[0], FIONBIO, &mode);
-    ioctlsocket(fds[1], FIONBIO, &mode);
-    return 0;
-}
-#endif /* _WIN32 */
 
 /* ============================================================================
 ** xQueue  (static – never exposed to callers)
@@ -775,33 +734,25 @@ static int xthread_wakeup_init_ctx(xThread* ctx) {
 
     if (poll) {
         /* ── fd-based wakeup ─────────────────────────────────── */
-#ifdef _WIN32
-        SOCKET fds[2] = { INVALID_SOCKET, INVALID_SOCKET };
-        if (win_socketpair(fds) != 0) {
-            xloge("win_socketpair failed: %d", WSAGetLastError());
+        /* xsock_socketpair keeps the pair out of popen/exec children
+         * (close-on-exec / non-inheritable); both ends go non-blocking here. */
+        char err[XSOCK_ERR_LEN] = { 0 };
+        SOCKET_T fds[2];
+        if (xsock_socketpair(err, fds) != XSOCK_OK) {
+            xloge("%s", err);
             return -1;
         }
-#else
-        int fds[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, fds) != 0) {
-            xloge("socketpair failed: %s", strerror(errno));
+        if (xsock_set_nonblock(err, fds[0]) != XSOCK_OK ||
+            xsock_set_nonblock(err, fds[1]) != XSOCK_OK) {
+            xloge("%s", err);
+            xsock_close(fds[0]); xsock_close(fds[1]);
             return -1;
         }
-        fcntl(fds[0], F_SETFL, O_NONBLOCK);
-        fcntl(fds[1], F_SETFL, O_NONBLOCK);
-        /* close-on-exec: don't leak the wakeup pair into popen/exec children */
-        fcntl(fds[0], F_SETFD, fcntl(fds[0], F_GETFD, 0) | FD_CLOEXEC);
-        fcntl(fds[1], F_SETFD, fcntl(fds[1], F_GETFD, 0) | FD_CLOEXEC);
-#endif
         /* Register the read-end in the poll instance */
-        if (xpoll_add_event((SOCKET_T)fds[1], XPOLL_READABLE,
+        if (xpoll_add_event(fds[1], XPOLL_READABLE,
                             notify_read_cb, NULL, NULL, ctx) != 0) {
             xloge("xpoll_add_event failed");
-#ifdef _WIN32
-            closesocket(fds[0]); closesocket(fds[1]);
-#else
-            close(fds[0]); close(fds[1]);
-#endif
+            xsock_close(fds[0]); xsock_close(fds[1]);
             return -1;
         }
 

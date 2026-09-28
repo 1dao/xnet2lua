@@ -264,3 +264,100 @@ int xsock_write(SOCKET_T fd, const char *buf, int count) {
 void xsock_close(SOCKET_T fd) {
     if (fd != INVALID_SOCKET_VAL) CLOSE_SOCKET(fd);
 }
+
+/* ========== Socket Pair ========== */
+
+#ifdef _WIN32
+
+/* Sockets are inheritable by default; a pair that leaked into an
+ * os.execute/popen child would keep the channel open after we close it. */
+static void xsock_no_inherit(SOCKET_T s) {
+    SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
+}
+
+int xsock_socketpair(char *err, SOCKET_T fds[2]) {
+    struct sockaddr_in addr, peer, mine;
+    int len = sizeof(addr);
+    BOOL on = TRUE;
+    SOCKET_T listener = INVALID_SOCKET_VAL;
+    fds[0] = fds[1] = INVALID_SOCKET_VAL;
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET_VAL) goto fail;
+    xsock_no_inherit(listener);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&on, sizeof(on));
+    if (bind(listener, (struct sockaddr*)&addr, sizeof(addr)) != 0 ||
+        listen(listener, 4) != 0 ||
+        getsockname(listener, (struct sockaddr*)&addr, &len) != 0) goto fail;
+
+    fds[0] = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fds[0] == INVALID_SOCKET_VAL) goto fail;
+    xsock_no_inherit(fds[0]);
+    if (connect(fds[0], (struct sockaddr*)&addr, sizeof(addr)) != 0) goto fail;
+    len = sizeof(mine);
+    if (getsockname(fds[0], (struct sockaddr*)&mine, &len) != 0) goto fail;
+
+    /* Another local process can race to the ephemeral port; only accept the
+     * connection that came from our own socket. */
+    for (int attempts = 0; attempts < 4 && fds[1] == INVALID_SOCKET_VAL; attempts++) {
+        int plen = sizeof(peer);
+        SOCKET_T s = accept(listener, (struct sockaddr*)&peer, &plen);
+        if (s == INVALID_SOCKET_VAL) goto fail;
+        xsock_no_inherit(s);
+        if (peer.sin_port == mine.sin_port && peer.sin_addr.s_addr == mine.sin_addr.s_addr)
+            fds[1] = s;
+        else
+            closesocket(s);
+    }
+    if (fds[1] == INVALID_SOCKET_VAL) {
+        WSASetLastError(WSAECONNREFUSED);
+        goto fail;
+    }
+    closesocket(listener);
+    /* Small wakeups and request/response messages must not wait on Nagle. */
+    setsockopt(fds[0], IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
+    setsockopt(fds[1], IPPROTO_TCP, TCP_NODELAY, (const char*)&on, sizeof(on));
+    return XSOCK_OK;
+
+fail:
+    xsock_format_error(err, "socketpair");
+    if (listener != INVALID_SOCKET_VAL) closesocket(listener);
+    if (fds[0] != INVALID_SOCKET_VAL) closesocket(fds[0]);
+    fds[0] = fds[1] = INVALID_SOCKET_VAL;
+    return XSOCK_ERR;
+}
+
+#else
+
+int xsock_socketpair(char *err, SOCKET_T fds[2]) {
+    int sv[2];
+#ifdef SOCK_CLOEXEC
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == 0) {
+        fds[0] = sv[0]; fds[1] = sv[1];
+        return XSOCK_OK;
+    }
+    if (errno != EINVAL && errno != EPROTONOSUPPORT) goto fail;
+#endif
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) goto fail;
+    for (int i = 0; i < 2; i++) {
+        int fl = fcntl(sv[i], F_GETFD, 0);
+        if (fl == -1 || fcntl(sv[i], F_SETFD, fl | FD_CLOEXEC) == -1) {
+            int e = errno;
+            close(sv[0]); close(sv[1]);
+            errno = e;
+            goto fail;
+        }
+    }
+    fds[0] = sv[0]; fds[1] = sv[1];
+    return XSOCK_OK;
+
+fail:
+    xsock_format_error(err, "socketpair");
+    fds[0] = fds[1] = INVALID_SOCKET_VAL;
+    return XSOCK_ERR;
+}
+
+#endif

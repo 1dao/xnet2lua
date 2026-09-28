@@ -6,7 +6,7 @@
 ** Adding read/write here would fork that machinery for no gain.
 **
 **   local xproc = require('xproc')
-**   if not xproc.supported() then ... end          -- 0 on Windows
+**   if not xproc.supported() then ... end          -- POSIX and Windows
 **
 **   local h, err = xproc.spawn({
 **       argv = { 'git', 'upload-pack', '--stateless-rpc', '.' },

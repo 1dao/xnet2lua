@@ -255,6 +255,14 @@ int xsock_resolve(char *err, const char *host, char *ipbuf);
 int xsock_get_peer_info(SOCKET_T fd, char *ip, int *port);
 void xsock_close(SOCKET_T fd);
 
+/* A connected, bidirectional stream pair for in-process signalling or for
+ * bridging a child's stdio. POSIX: socketpair(AF_UNIX), close-on-exec.
+ * Windows: a loopback TCP pair whose accepted peer is verified to be our own
+ * connecting socket, non-inheritable and with TCP_NODELAY. Both ends are left
+ * BLOCKING; call xsock_set_nonblock on the ends that go into xpoll.
+ * Returns XSOCK_OK and fills fds, or XSOCK_ERR with both set invalid. */
+int xsock_socketpair(char *err, SOCKET_T fds[2]);
+
 #ifdef __cplusplus
 }
 #endif
