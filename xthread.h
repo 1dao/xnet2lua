@@ -62,7 +62,7 @@ extern "C" {
 #define XTHR_WORKER_GRP3    60  /* worker group 3 base          */
 #define XTHR_WORKER_GRP4    80  /* worker group 4 base          */
 #define XTHR_WORKER_GRP5    100  /* worker group 5 base          */
-#define XTHR_MAX            120
+#define XTHR_MAX            512
 #define XTHR_GROUP_MAX      20
 
 /* Error codes */
