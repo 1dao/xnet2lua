@@ -1,0 +1,4 @@
+# Every text file of this project uses LF, in the index and in working trees.
+* text=auto eol=lf
+# Vendored third-party code keeps its upstream bytes and line endings.
+3rd/** -text
