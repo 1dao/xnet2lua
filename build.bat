@@ -16,6 +16,7 @@ set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
 set "WITH_XDEBUG=0"
 set "WITH_XPROC=1"
+set "WITH_MPSCQ=0"
 set "WITH_RPMALLOC=1"
 set "WITH_ASAN=0"
 set "LUA_BACKEND=minilua"
@@ -33,6 +34,8 @@ for %%A in (%*) do (
     if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
     if /I "!ARG!"=="xproc" set "WITH_XPROC=1"
     if /I "!ARG!"=="noxproc" set "WITH_XPROC=0"
+    if /I "!ARG!"=="mpscq" set "WITH_MPSCQ=1"
+    if /I "!ARG!"=="nompscq" set "WITH_MPSCQ=0"
     if /I "!ARG!"=="norpmalloc" set "WITH_RPMALLOC=0"
     if /I "!ARG!"=="asan" (
         set "WITH_ASAN=1"
@@ -73,7 +76,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% xproc=%WITH_XPROC% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% xproc=%WITH_XPROC% mpscq=%WITH_MPSCQ% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -124,6 +127,8 @@ set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimer
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
 set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG% /DXNET_WITH_XPROC=%WITH_XPROC%"
+REM mpscq: lock-free MPSC thread queues (backpressure becomes a soft limit).
+if "%WITH_MPSCQ%"=="1" set "DEFS=%DEFS% /DXTHREAD_MPSCQ"
 if "%WITH_RPMALLOC%"=="1" (
     set "DEFS=%DEFS% /DENABLE_OVERRIDE=0 /DXMACRO_USE_RPMALLOC=1"
 ) else (

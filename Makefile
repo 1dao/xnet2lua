@@ -45,6 +45,9 @@ WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
 WITH_XDEBUG ?= 0
 WITH_XPROC ?= 0
+# WITH_MPSCQ=1: lock-free MPSC thread queues (-DXTHREAD_MPSCQ); backpressure
+#   becomes a soft limit that can briefly overshoot.
+WITH_MPSCQ ?= 0
 # WITH_RPMALLOC=1 (default): route allocs through rpmalloc via xmacro.h,
 #   link 3rd/rpmalloc/rpmalloc.c.
 # WITH_RPMALLOC=0: pass through to libc; useful for ASan/Valgrind/A-B perf.
@@ -87,6 +90,9 @@ ifeq ($(WITH_RPMALLOC),1)
     BASE_CFLAGS  += -DENABLE_OVERRIDE=0 -DXMACRO_USE_RPMALLOC=1
 else
     BASE_CFLAGS  += -DXMACRO_USE_RPMALLOC=0
+endif
+ifeq ($(WITH_MPSCQ),1)
+    BASE_CFLAGS  += -DXTHREAD_MPSCQ
 endif
 ifeq ($(BUILD_MODE),debug)
 	CFLAGS := $(BASE_CFLAGS) -O0 -g -DDEBUG $(SANITIZE_CFLAGS)
@@ -233,7 +239,7 @@ XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
-TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_XPROC="$(WITH_XPROC)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_XPROC="$(WITH_XPROC)" WITH_MPSCQ="$(WITH_MPSCQ)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
 ASAN_BUILD_ARGS := BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)

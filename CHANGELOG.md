@@ -17,6 +17,7 @@
 - xthread 唤醒通道与 xproc 数据通道统一使用 `xsock_socketpair`，删除各自的实现。Windows 上唤醒 socket 不再被 `os.execute`/`popen` 子进程继承，并关闭 Nagle。
 - 本项目文本文件统一为 LF，新增 `.gitattributes`；`3rd/` 下的第三方代码保持上游原样。
 - `tests/lua/xproc_pipe_test.lua` 改为跨平台，新增行请求/响应往返、进程树结束与批处理拒绝用例。
+- 线程上限 `XTHR_MAX` 由 120 调至 512。
 
 ### 修复
 
@@ -28,3 +29,4 @@
 ### 构建
 
 - MSVC 构建默认启用 xproc，可用 `xproc` / `noxproc` 切换。
+- 新增 MPSCQ 构建开关：Makefile `WITH_MPSCQ=1`、build.bat `mpscq` / `nompscq`，定义 `XTHREAD_MPSCQ`，线程队列改用无锁 MPSC 实现（背压变为软限制）。默认关闭；发布构建开启。

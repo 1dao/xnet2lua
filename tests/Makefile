@@ -6,6 +6,7 @@ WITH_RPMALLOC ?= 1
 WITH_XDEBUG ?= 0
 WITH_IO_URING ?= 0
 WITH_XPROC ?= 0
+WITH_MPSCQ ?= 0
 SANITIZE ?= none
 ifeq ($(OS),Windows_NT)
 ASAN_OPTIONS ?= halt_on_error=1:abort_on_error=1:strict_string_checks=1
@@ -37,6 +38,9 @@ ifeq ($(WITH_RPMALLOC),1)
 	BASE_CFLAGS += -DENABLE_OVERRIDE=0 -DXMACRO_USE_RPMALLOC=1
 else
 	BASE_CFLAGS += -DXMACRO_USE_RPMALLOC=0
+endif
+ifeq ($(WITH_MPSCQ),1)
+	BASE_CFLAGS += -DXTHREAD_MPSCQ
 endif
 ifeq ($(WITH_IO_URING),1)
 ifneq ($(OS),Windows_NT)
