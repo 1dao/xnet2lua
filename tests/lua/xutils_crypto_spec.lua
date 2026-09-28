@@ -130,6 +130,38 @@ spec.describe('xutils crypto in higher-level use', function()
     end)
 end)
 
+spec.describe('xutils source encoding', function()
+    spec.it('decodes UTF-8/BOM/GBK and reports malformed bytes', function()
+        local decode = assert(xutils.to_utf8)
+        local function expect(raw, mode, expected, encoding)
+            local result, detected = decode(raw, mode)
+            assert(result == expected, tostring(detected))
+            assert(detected == encoding)
+        end
+        expect('', 'auto', '', 'utf-8')
+        expect('', 'gbk', '', 'gbk')
+        expect('abc\0\r\n', 'auto', 'abc\0\r\n', 'utf-8')
+        expect('中文😀', 'auto', '中文😀', 'utf-8')
+        expect('\239\187\191中文', 'auto', '中文', 'utf-8-bom')
+        expect('\214\208\206\196', 'auto', '中文', 'gbk')
+        expect('\214\208\206\196', 'gbk', '中文', 'gbk')
+        expect('a\0\214\208\206\196\r\n', 'gbk', 'a\0中文\r\n', 'gbk')
+        expect('\129\92', 'gbk', '\228\185\151', 'gbk') -- GBK tail is ASCII backslash
+        for _, raw in ipairs({ '\192\128', '\237\160\128', '\244\144\128\128', '\245\128\128\128', '\226\130' }) do
+            local result, err, offset = decode(raw, 'utf-8')
+            assert(result == nil and err:find('UTF%-8') and offset == 1)
+        end
+        for _, raw in ipairs({ '\128', '\255', '\129', '\129\127', '\129\48' }) do
+            local result, err, offset = decode('a' .. raw, 'gbk')
+            assert(result == nil and err:find('GBK') and offset == 2)
+        end
+        local result, err, offset = decode('\239\187\191\255', 'auto')
+        assert(not result and err:find('UTF%-8') and offset == 4)
+        assert(not pcall(decode, 'abc', 'unknown'))
+        assert(xutils.set_gbk_decoder == nil, 'obsolete callback API must not be exported')
+    end)
+end)
+
 local failures = spec.finish()
 
 return {

@@ -31,6 +31,20 @@
 #include <limits.h>
 #include <errno.h>
 
+/* System headers must precede xmacro.h's allocator overrides. */
+#if defined(__ANDROID__)
+#include <jni.h>
+#elif defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <CoreFoundation/CoreFoundation.h>
+#else
+#include <iconv.h>
+#endif
+#elif !defined(_WIN32)
+#include <iconv.h>
+#endif
+
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1836,7 +1850,266 @@ static int l_util_random_bytes(lua_State *L) {
     return 1;
 }
 
+/* UTF-8 validation plus system-backed GBK decoding for lua_xutils.c.
+ * Android: JNI CharsetDecoder; iOS: CoreFoundation; desktop: Win32/iconv.
+ * No bundled mapping table or per-Lua-state callbacks.
+ */
+#if defined(__ANDROID__)
+static JavaVM *xutils_android_vm;
+
+/* Host calls once from JNI_OnLoad before creating workers; VM outlives them.
+ * Startup-only, not concurrent with worker use. 0 = success, -1 = invalid VM.
+ * Same VM is accepted; replacing a live VM is not supported. */
+JNIEXPORT int xutils_android_init(JavaVM *vm) {
+    if (!vm || (xutils_android_vm && xutils_android_vm != vm)) return -1;
+    if (!xutils_android_vm) xutils_android_vm = vm;
+    return 0;
+}
+
+/* No Lua allocation here: JNI references and temporary thread attachment must
+ * be released before returning to Lua, including all Java exception paths.
+ * output is caller-owned, at least 2 * n + 1 bytes. Bootstrap classes only.
+ */
+static const char *xutils_android_gbk(const unsigned char *s, size_t n,
+                                    char *output, size_t capacity, size_t *written) {
+    JavaVM *vm = xutils_android_vm;
+    JNIEnv *env = NULL;
+    jint state;
+    int attached = 0, frame = 0;
+    const char *error = "Android GBK conversion failed";
+    jclass charset_class, decoder_class, action_class, buffer_class, chars_class, string_class;
+    jmethodID for_name, new_decoder, malformed, unmappable, wrap, decode, to_string, get_bytes;
+    jfieldID report_field;
+    jobject charset, decoder, report, buffer, chars, configured;
+    jstring gbk_name, utf8_name, string;
+    jbyteArray input, encoded;
+    jsize length;
+
+    if (!vm) return "Android GBK requires xutils_android_init(JavaVM*) during host startup";
+    if (n > INT_MAX) return "GBK input exceeds JNI array limit";
+    state = (*vm)->GetEnv(vm, (void **)&env, JNI_VERSION_1_6);
+    if (state == JNI_EDETACHED) {
+        if ((*vm)->AttachCurrentThread(vm, (void *)&env, NULL) != JNI_OK)
+            return "Cannot attach GBK conversion thread to JavaVM";
+        attached = 1;
+    } else if (state != JNI_OK) {
+        return "Cannot obtain JNI environment for GBK conversion";
+    }
+    /* Do not consume an exception belonging to the host. */
+    if ((*env)->ExceptionCheck(env)) {
+        if (attached) (*vm)->DetachCurrentThread(vm);
+        return "JNI exception pending before GBK conversion";
+    }
+    if ((*env)->PushLocalFrame(env, 32) < 0) goto done;
+    frame = 1;
+
+#define XUTILS_JNI_GET(target, expression) do { \
+    target = (expression); \
+    if (!(target) || (*env)->ExceptionCheck(env)) goto done; \
+} while (0)
+    XUTILS_JNI_GET(charset_class, (*env)->FindClass(env, "java/nio/charset/Charset"));
+    XUTILS_JNI_GET(decoder_class, (*env)->FindClass(env, "java/nio/charset/CharsetDecoder"));
+    XUTILS_JNI_GET(action_class, (*env)->FindClass(env, "java/nio/charset/CodingErrorAction"));
+    XUTILS_JNI_GET(buffer_class, (*env)->FindClass(env, "java/nio/ByteBuffer"));
+    XUTILS_JNI_GET(chars_class, (*env)->FindClass(env, "java/nio/CharBuffer"));
+    XUTILS_JNI_GET(string_class, (*env)->FindClass(env, "java/lang/String"));
+    XUTILS_JNI_GET(for_name, (*env)->GetStaticMethodID(env, charset_class, "forName", "(Ljava/lang/String;)Ljava/nio/charset/Charset;"));
+    XUTILS_JNI_GET(new_decoder, (*env)->GetMethodID(env, charset_class, "newDecoder", "()Ljava/nio/charset/CharsetDecoder;"));
+    XUTILS_JNI_GET(malformed, (*env)->GetMethodID(env, decoder_class, "onMalformedInput", "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;"));
+    XUTILS_JNI_GET(unmappable, (*env)->GetMethodID(env, decoder_class, "onUnmappableCharacter", "(Ljava/nio/charset/CodingErrorAction;)Ljava/nio/charset/CharsetDecoder;"));
+    XUTILS_JNI_GET(report_field, (*env)->GetStaticFieldID(env, action_class, "REPORT", "Ljava/nio/charset/CodingErrorAction;"));
+    XUTILS_JNI_GET(wrap, (*env)->GetStaticMethodID(env, buffer_class, "wrap", "([B)Ljava/nio/ByteBuffer;"));
+    XUTILS_JNI_GET(decode, (*env)->GetMethodID(env, decoder_class, "decode", "(Ljava/nio/ByteBuffer;)Ljava/nio/CharBuffer;"));
+    XUTILS_JNI_GET(to_string, (*env)->GetMethodID(env, chars_class, "toString", "()Ljava/lang/String;"));
+    XUTILS_JNI_GET(get_bytes, (*env)->GetMethodID(env, string_class, "getBytes", "(Ljava/lang/String;)[B"));
+    XUTILS_JNI_GET(gbk_name, (*env)->NewStringUTF(env, "GBK"));
+    XUTILS_JNI_GET(utf8_name, (*env)->NewStringUTF(env, "UTF-8"));
+    XUTILS_JNI_GET(charset, (*env)->CallStaticObjectMethod(env, charset_class, for_name, gbk_name));
+    XUTILS_JNI_GET(decoder, (*env)->CallObjectMethod(env, charset, new_decoder));
+    XUTILS_JNI_GET(report, (*env)->GetStaticObjectField(env, action_class, report_field));
+    XUTILS_JNI_GET(configured, (*env)->CallObjectMethod(env, decoder, malformed, report));
+    XUTILS_JNI_GET(configured, (*env)->CallObjectMethod(env, decoder, unmappable, report));
+    XUTILS_JNI_GET(input, (*env)->NewByteArray(env, (jsize)n));
+    (*env)->SetByteArrayRegion(env, input, 0, (jsize)n, (const jbyte *)s);
+    if ((*env)->ExceptionCheck(env)) goto done;
+    XUTILS_JNI_GET(buffer, (*env)->CallStaticObjectMethod(env, buffer_class, wrap, input));
+    error = "Invalid or unmappable GBK in Android CharsetDecoder";
+    XUTILS_JNI_GET(chars, (*env)->CallObjectMethod(env, decoder, decode, buffer));
+    error = "Android UTF-8 conversion failed";
+    XUTILS_JNI_GET(string, (*env)->CallObjectMethod(env, chars, to_string));
+    /* getBytes("UTF-8") produces standard UTF-8, unlike GetStringUTFChars,
+     * whose modified UTF-8 would corrupt embedded NUL and supplementary text. */
+    XUTILS_JNI_GET(encoded, (*env)->CallObjectMethod(env, string, get_bytes, utf8_name));
+    length = (*env)->GetArrayLength(env, encoded);
+    if ((*env)->ExceptionCheck(env)) goto done;
+    if (length < 0 || (size_t)length > capacity) { error = "Android GBK output exceeds capacity"; goto done; }
+    (*env)->GetByteArrayRegion(env, encoded, 0, length, (jbyte *)output);
+    if ((*env)->ExceptionCheck(env)) goto done;
+    *written = (size_t)length;
+    error = NULL;
+done:
+    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+    if (frame) (*env)->PopLocalFrame(env, NULL);
+    if (attached && (*vm)->DetachCurrentThread(vm) != JNI_OK)
+        error = "Cannot detach GBK conversion thread from JavaVM";
+#undef XUTILS_JNI_GET
+    return error;
+}
+
+#endif
+
+static int xutils_encoding_failure(lua_State *L, const char *message) {
+    lua_pushnil(L);
+    lua_pushstring(L, message);
+    return 2;
+}
+
+/* Return SIZE_MAX on success, otherwise the zero-based invalid sequence offset. */
+static size_t xutils_utf8_error(const unsigned char *s, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        unsigned char b = s[i];
+        size_t width, j;
+        if (b < 0x80) { ++i; continue; }
+        width = b >= 0xc2 && b <= 0xdf ? 2 :
+            b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf4 ? 4 : 0;
+        if (!width || n - i < width) return i;
+        for (j = 1; j < width; ++j)
+            if (s[i+j] < 0x80 || s[i+j] > 0xbf) return i;
+        if ((b == 0xe0 && s[i+1] < 0xa0) || (b == 0xed && s[i+1] > 0x9f) ||
+            (b == 0xf0 && s[i+1] < 0x90) || (b == 0xf4 && s[i+1] > 0x8f)) return i;
+        i += width;
+    }
+    return SIZE_MAX;
+}
+
+static int xutils_decode_error(lua_State *L, const char *encoding, size_t offset) {
+    char message[96];
+    snprintf(message, sizeof(message), "Invalid %s at byte %llu", encoding,
+        (unsigned long long)(offset + 1));
+    lua_pushnil(L);
+    lua_pushstring(L, message);
+    lua_pushinteger(L, (lua_Integer)(offset + 1));
+    return 3;
+}
+
+/* to_utf8(bytes [, 'auto' | 'utf-8' | 'gbk']) -> text, encoding | nil, error, byte */
+static int l_util_to_utf8(lua_State *L) {
+    size_t n, offset = 0, bad, i;
+    const unsigned char *s = (const unsigned char *)luaL_checklstring(L, 1, &n);
+    const char *mode = luaL_optstring(L, 2, "auto");
+    int gbk = strcmp(mode, "gbk") == 0;
+    int automatic = strcmp(mode, "auto") == 0;
+    luaL_argcheck(L, gbk || automatic || strcmp(mode, "utf-8") == 0, 2,
+        "expected auto, utf-8 or gbk");
+    if (!gbk) {
+        if (n >= 3 && s[0] == 0xef && s[1] == 0xbb && s[2] == 0xbf) offset = 3;
+        bad = xutils_utf8_error(s + offset, n - offset);
+        if (bad == SIZE_MAX) {
+            if (!offset) lua_pushvalue(L, 1);
+            else lua_pushlstring(L, (const char *)s + offset, n - offset);
+            lua_pushstring(L, offset ? "utf-8-bom" : "utf-8");
+            return 2;
+        }
+        /* An explicit BOM is authoritative; never reinterpret corrupt UTF-8 as GBK. */
+        if (!automatic || offset) return xutils_decode_error(L, "UTF-8", offset + bad);
+    }
+    /* Reject malformed GBK byte structure; mapping comes from the platform. */
+    for (i = 0; i < n;) {
+        unsigned char b = s[i];
+        if (b < 0x80) { ++i; continue; }
+        if (b < 0x81 || b > 0xfe || n - i < 2 || s[i+1] < 0x40 || s[i+1] > 0xfe || s[i+1] == 0x7f)
+            return xutils_decode_error(L, "GBK", i);
+        i += 2;
+    }
+    if (n == 0) { lua_pushliteral(L, ""); lua_pushliteral(L, "gbk"); return 2; }
+#if defined(__ANDROID__)
+    {
+        char *output;
+        size_t capacity, written = 0;
+        const char *error;
+        if (n > INT_MAX || n > (SIZE_MAX - 1) / 2)
+            return xutils_encoding_failure(L, "GBK input exceeds JNI array limit");
+        capacity = n * 2 + 1;
+        /* Allocate before acquiring JNI resources: Lua allocation may longjmp. */
+        output = (char *)lua_newuserdata(L, capacity);
+        error = xutils_android_gbk(s, n, output, capacity, &written);
+        if (error) return xutils_encoding_failure(L, error);
+        lua_pushlstring(L, output, written);
+    }
+#elif defined(__APPLE__) && TARGET_OS_IPHONE
+    {
+        CFStringRef decoded;
+        CFIndex length, consumed, written = 0, capacity;
+        UInt8 *output;
+        if (n > ((size_t)LONG_MAX - 1) / 2)
+            return xutils_encoding_failure(L, "GBK input exceeds CoreFoundation limit");
+        capacity = (CFIndex)(n * 2 + 1);
+        output = (UInt8 *)lua_newuserdata(L, (size_t)capacity);
+        if (!CFStringIsEncodingAvailable(kCFStringEncodingGBK_95))
+            return xutils_encoding_failure(L, "CoreFoundation does not provide GBK conversion");
+        decoded = CFStringCreateWithBytes(kCFAllocatorDefault, s, (CFIndex)n,
+                                         kCFStringEncodingGBK_95, false);
+        if (!decoded) return xutils_encoding_failure(L, "Invalid or unmappable GBK in CoreFoundation");
+        length = CFStringGetLength(decoded);
+        consumed = CFStringGetBytes(decoded, CFRangeMake(0, length), kCFStringEncodingUTF8,
+                                   0, false, output, capacity, &written);
+        CFRelease(decoded);
+        if (consumed != length || written < 0 || written > capacity)
+            return xutils_encoding_failure(L, "CoreFoundation UTF-8 conversion failed");
+        lua_pushlstring(L, (const char *)output, (size_t)written);
+    }
+#elif defined(_WIN32)
+    {
+        int wide_len, utf8_len;
+        WCHAR *wide;
+        char *out;
+        if (n > INT_MAX) return xutils_encoding_failure(L, "GBK input exceeds Windows API limit");
+        wide_len = MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, (const char *)s, (int)n, NULL, 0);
+        if (!wide_len) return xutils_encoding_failure(L, "GBK conversion failed in MultiByteToWideChar");
+        wide = (WCHAR *)lua_newuserdata(L, (size_t)wide_len * sizeof(WCHAR));
+        if (MultiByteToWideChar(936, MB_ERR_INVALID_CHARS, (const char *)s, (int)n, wide, wide_len) != wide_len)
+            return xutils_encoding_failure(L, "GBK conversion failed in MultiByteToWideChar");
+        utf8_len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, wide_len, NULL, 0, NULL, NULL);
+        if (!utf8_len) return xutils_encoding_failure(L, "GBK conversion failed in WideCharToMultiByte");
+        out = (char *)lua_newuserdata(L, (size_t)utf8_len);
+        if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, wide_len, out, utf8_len, NULL, NULL) != utf8_len)
+            return xutils_encoding_failure(L, "GBK conversion failed in WideCharToMultiByte");
+        lua_pushlstring(L, out, (size_t)utf8_len);
+    }
+#else
+    {
+        iconv_t converter;
+        char *input = (char *)s, *output, *cursor;
+        size_t remaining = n, capacity, available, result;
+        int error;
+        if (n > (SIZE_MAX - 1) / 2) return xutils_encoding_failure(L, "GBK input too large");
+        capacity = n * 2 + 1;
+        output = (char *)lua_newuserdata(L, capacity);
+        cursor = output;
+        available = capacity;
+        converter = iconv_open("UTF-8", "GBK");
+        if (converter == (iconv_t)-1)
+            return xutils_encoding_failure(L, "System iconv does not provide GBK to UTF-8 conversion");
+        result = iconv(converter, &input, &remaining, &cursor, &available);
+        error = errno;
+        iconv_close(converter);
+        if (result == (size_t)-1) {
+            if (error == EILSEQ || error == EINVAL)
+                return xutils_decode_error(L, "GBK", n - remaining);
+            return xutils_encoding_failure(L, "GBK conversion failed in iconv");
+        }
+        if (result != 0 || remaining != 0)
+            return xutils_encoding_failure(L, "GBK conversion was not lossless");
+        lua_pushlstring(L, output, capacity - available);
+    }
+#endif
+    lua_pushliteral(L, "gbk");
+    return 2;
+}
+
 static const luaL_Reg xutils_funcs[] = {
+    { "to_utf8", l_util_to_utf8 },
     { "read_stdin",   l_util_read_stdin },
     { "random_bytes", l_util_random_bytes },
     { "realpath",     l_util_realpath },

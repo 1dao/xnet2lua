@@ -16,6 +16,21 @@ do return end
 ---@class xutils
 local xutils = {}
 
+---UTF-8 validation and system-backed GBK decoding; no bundled mapping table.
+---auto: strip UTF-8 BOM and validate; otherwise prefer valid UTF-8, then try GBK.
+---A corrupt UTF-8 BOM document never falls back to GBK. No replacement characters.
+---Windows uses code page 936; Linux/macOS use iconv. Mapping extensions are platform-defined.
+---Malformed GBK byte sequences and the CP936 single-byte euro extension are rejected.
+---Android uses JNI CharsetDecoder after one native xutils_android_init(JavaVM*) call.
+---iOS uses CoreFoundation directly; no Lua callback registration is required.
+---Ambiguous BOM-less input prefers UTF-8; use mode='gbk' to override.
+---@param bytes string
+---@param mode? 'auto'|'utf-8'|'gbk'
+---@return string? text UTF-8 on success; nil on decoding failure
+---@return string encoding_or_error Detected encoding on success, diagnostic on failure
+---@return integer? error_byte One-based start of invalid sequence in original bytes
+function xutils.to_utf8(bytes, mode) end
+
 -- A unique sentinel that round-trips JSON `null`. Use it as a table value to
 -- emit null, and test decoded values against it (`v == xutils.json_null`).
 -- 用于往返 JSON null 的唯一哨兵值。作为表的值写入即输出 null，解码后可用

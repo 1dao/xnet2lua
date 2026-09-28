@@ -125,6 +125,9 @@ ifeq ($(OS),Windows_NT)
 	MV := /usr/bin/mv -f
 else
 	SYS_LDFLAGS += -lpthread -lm
+ifeq ($(shell uname -s),Darwin)
+	SYS_LDFLAGS += -liconv
+endif
 endif
 
 XNET_DEFS := -DXNET_WITH_HTTP=$(WITH_HTTP) -DXNET_WITH_HTTPS=$(WITH_HTTPS) -DXNET_WITH_XPROC=$(WITH_XPROC)

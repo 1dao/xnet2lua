@@ -466,6 +466,24 @@ lua tools/raygui_smoke_test.lua frames=120
 
 ## Lua Modules
 
+`xutils.to_utf8(bytes [, 'auto' | 'utf-8' | 'gbk'])` validates UTF-8 or converts GBK
+using system APIs. It returns text and detected encoding, or `nil, error` and an
+optional one-based error byte. Auto mode strips a UTF-8 BOM, otherwise prefers
+valid UTF-8 and falls back to GBK. Invalid data is rejected, not replaced. GBK
+mapping extensions can vary by platform; GB18030 four-byte sequences are not accepted.
+All C implementation is in `xlua/lua_xutils.c`; no mapping table or Lua callbacks.
+
+Windows uses code page 936, Linux/macOS use iconv, and iOS uses CoreFoundation
+(link `-framework CoreFoundation`). Android uses JNI CharsetDecoder. The Android
+host must declare `extern int xutils_android_init(JavaVM *vm);` in C (use
+`extern "C"` in C++) and call it from its existing `JNI_OnLoad`, before workers
+start. It returns 0 on success/same VM and -1 for NULL/different VM. The VM must
+outlive all workers; initialization must not race with worker use. Each conversion
+obtains its own JNIEnv and detaches only threads it attached. No Java helper class
+or per-Lua-state registration is required. Without initialization, UTF-8 still works
+but nonempty GBK conversion returns an error. Android native processes without a
+JVM cannot use this GBK backend. iOS requires no initialization.
+
 C-registered (auto-loaded via `luaL_requiref` in `xlua/xnet_main.c`; `require()` works without a search path):
 
 | Module      | Purpose                                                            | Reference            |
