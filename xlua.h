@@ -7,6 +7,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua/xlua_compat.h"
 #endif
 
 #ifdef __cplusplus

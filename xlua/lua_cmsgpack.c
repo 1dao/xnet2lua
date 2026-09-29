@@ -9,6 +9,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #endif
 
 #define LUACMSGPACK_NAME        "cmsgpack"

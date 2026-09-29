@@ -24,6 +24,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #endif
 
 #ifndef XNET_WITH_HTTPS
@@ -37,17 +38,18 @@
 
 /* ── Shared Lua-glue helpers ─────────────────────────────────────────────── */
 
-/* The main thread's lua_State, where registry refs and userdata live. Falls
-** back to L on Lua builds without LUA_RIDX_MAINTHREAD. */
+/* The main thread's lua_State, where registry refs and userdata live. LuaJIT
+** has no LUA_RIDX_MAINTHREAD; the runtime records it at state creation. */
 static inline lua_State* main_lua_state(lua_State* L) {
+    lua_State* mainL;
 #ifdef LUA_RIDX_MAINTHREAD
     lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
-    lua_State* mainL = lua_tothread(L, -1);
+#else
+    lua_getfield(L, LUA_REGISTRYINDEX, XLUA_MAINTHREAD_KEY);
+#endif
+    mainL = lua_tothread(L, -1);
     lua_pop(L, 1);
     return mainL ? mainL : L;
-#else
-    return L;
-#endif
 }
 
 static inline void ref_unref(lua_State* L, int* ref) {

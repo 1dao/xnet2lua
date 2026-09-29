@@ -45,6 +45,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #endif
 
 #define XSCAN_LANG_META   "xscan.lang"

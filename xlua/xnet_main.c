@@ -27,6 +27,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #include "lualib.h"
 #if defined(XLUA_USE_LUAJIT)
 #include "luajit.h"
@@ -128,6 +129,8 @@ static void lua_runtime_post_init(lua_State* L) {
 #if defined(XLUA_USE_LUAJIT)
     /* Explicitly keep the JIT engine enabled when running with LuaJIT. */
     if (L) luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    if (L) xlua_open_utf8(L);
+    if (L) xlua_set_mainthread(L);
 #else
     (void)L;
 #endif

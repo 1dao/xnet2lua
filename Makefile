@@ -133,6 +133,8 @@ else
 	SYS_LDFLAGS += -lpthread -lm
 ifeq ($(shell uname -s),Darwin)
 	SYS_LDFLAGS += -liconv
+	# LuaJIT's own Makefile refuses to build on macOS without a deployment target.
+	LUAJIT_MAKE_ENV := MACOSX_DEPLOYMENT_TARGET=$${MACOSX_DEPLOYMENT_TARGET:-11.0}
 endif
 endif
 
@@ -292,6 +294,17 @@ $(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_S
 	$(RM) $(XNET_BUILD)
 	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(XNET_RES_OBJ) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)
+
+# LuaJIT backend: build the vendored static library on demand, as build.bat
+# does on Windows. LUA52COMPAT supplies table.pack/unpack and the other 5.2
+# library behavior the scripts rely on. A custom LUAJIT_LIB is taken as
+# prebuilt; after changing these flags, clean 3rd/luajit to rebuild.
+ifeq ($(LUA_BACKEND),luajit)
+ifeq ($(LUAJIT_LIB),$(LUAJIT_DIR)/src/libluajit.a)
+$(LUAJIT_LIB):
+	$(LUAJIT_MAKE_ENV) $(MAKE) -C $(LUAJIT_DIR)/src libluajit.a CC="$(CC)" BUILDMODE=static XCFLAGS=-DLUAJIT_ENABLE_LUA52COMPAT
+endif
+endif
 
 $(OBJ_DIR):
 	$(MKDIR) $(OBJ_DIR)

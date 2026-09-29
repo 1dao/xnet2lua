@@ -94,7 +94,7 @@ Tunable variables (override on the command line as `KEY=VALUE`):
 | `WITH_IO_URING` | `0` | `1` / `0` | On Linux, define `XPOLL_USE_IO_URING` and `XCHANNEL_USE_IO_URING`; links `liburing` |
 | `WITH_XDEBUG` | `0` | `1` / `0` | Compile the native Lua debugger into `bin/xnet`; this only adds the capability and does not start the debug service |
 | `WITH_RPMALLOC` | `1` | `1` / `0` | Route the project's own `malloc`/`free` through rpmalloc via `xmacro.h`. With `=0` the macros pass through to libc and `rpmalloc.c` is not linked (see §2.7) |
-| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | Use the embedded mini Lua or LuaJIT. For `luajit`, fetch the `3rd/luajit` submodule and build `libluajit.a` first |
+| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | Use the embedded mini Lua or LuaJIT. For `luajit`, fetch the `3rd/luajit` submodule; the build compiles the static library (see 2.5) |
 
 ```bash
 # Examples
@@ -218,13 +218,43 @@ When LuaJIT is in use, the framework calls — once per Lua state, right after
 luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 ```
 
-so the JIT is guaranteed to be on for the main thread and every worker thread.
-The handful of APIs that Lua 5.1 lacks (`luaL_requiref`, `lua_isinteger`,
-`luaL_tolstring`, plus the `LUA_MAXINTEGER` / `LUA_MININTEGER` bounds) are
-polyfilled inline in `xnet_main.c`, `xlua/lua_xthread.c`, and
-`xlua/lua_xutils.c`. **The xnet/xthread/xutils/cmsgpack binding APIs are
-identical between the two backends** — application Lua code does not need any
-module-name or signature changes.
+so the JIT is guaranteed to be on for the main thread and every worker thread;
+the same hook registers the `utf8` library and records the main thread (see
+below). **The xnet/xthread/xutils/cmsgpack binding APIs are identical between
+the two backends** — application Lua code does not need any module-name or
+signature changes.
+
+**Building.** `make LUA_BACKEND=luajit` compiles `3rd/luajit/src/libluajit.a`
+on demand; `build.bat luajit` runs `msvcbuild.bat lua52compat static` for
+`lua51.lib` and gives LuaJIT the same CRT as xnet (`/MD`, `/MDd`, or a `/MT`
+passed through the caller's `_CL_`). Both enable `LUAJIT_ENABLE_LUA52COMPAT`
+for `table.pack`/`table.unpack` and the other 5.2 behavior. macOS defaults to
+`MACOSX_DEPLOYMENT_TARGET=11.0`. An existing static library is reused as is:
+after changing flags or switching debug/release, clean `3rd/luajit` first
+(on macOS the clean needs that variable too).
+
+**Compatibility layer.** The Lua 5.2–5.4 C API the modules use (`lua_rawlen`,
+`luaL_len`, `lua_newuserdatauv`/`lua_setiuservalue`, `luaL_buffinitsize`,
+`lua_geti`/`lua_seti`, `lua_isinteger`, `luaL_tolstring`, …) lives in
+`xlua/xlua_compat.h`, a no-op for the embedded Lua build. Two runtime pieces
+complete it:
+
+- `utf8` library (`xlua/lua_xutils.c`): `char`/`codepoint`/`codes`/`len`/
+  `offset` with Lua 5.4 semantics — strict decoding by default, optional
+  `lax`. `utf8.charpattern` uses `%z`, since 5.1 patterns cannot hold a NUL.
+- Main thread: 5.1 has no `LUA_RIDX_MAINTHREAD`, so the runtime records the
+  main thread in the registry. Timers and connections armed inside a
+  coroutine call back on it, never on a coroutine that may be collected.
+
+**Behavior differences.**
+
+- Numbers are doubles, exact for integers up to 2^53; on 32-bit targets
+  (Android armv7/x86) `lua_Integer` is 32 bits.
+- `pairs` order differs from the embedded Lua; never rely on object key order.
+- Count and line hooks do not fire inside JIT-compiled code. xdebug flushes
+  traces and turns the JIT off from the first hook of a debug session; code
+  that cancels work via a `debug.sethook` count needs explicit checkpoints.
+- iOS runs interpreter-only (the OS forbids runtime code generation).
 
 > 💡 **Note for application code**: Lua 5.4's bitwise operators `& | ~ << >>`
 > are a **syntax error** under LuaJIT (5.1). To stay portable across both
@@ -270,6 +300,8 @@ lua_State* L = luaL_newstate();
 luaL_openlibs(L);
 #if defined(XLUA_USE_LUAJIT)
     luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    xlua_open_utf8(L);        // xlua/xlua_compat.h
+    xlua_set_mainthread(L);   // main thread for timer/connection callbacks
 #endif
 
 // Register Lua modules

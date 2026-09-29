@@ -15,7 +15,11 @@
 #include "../3rd/minilua.h"
 #else
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #include "lualib.h"
+#if defined(XLUA_USE_LUAJIT)
+#include "luajit.h"
+#endif
 #endif
 
 #ifdef _WIN32
@@ -87,6 +91,7 @@ typedef struct {
     lua_State* stop_L;
     int active;
     int hook_enabled;
+    int jit_off;
     int thread_id;
     int stopped;
     int pause_requested;
@@ -875,6 +880,17 @@ static void xdbg_hook(lua_State* L, lua_Debug* ar) {
         else if (xdbg_has_break_locked(file, line)) should_stop = 1;
         if (should_stop) xdbg_stop_locked(st, L, file, line, depth);
     }
+#if defined(XLUA_USE_LUAJIT)
+    /* Line hooks never fire inside JIT-compiled traces, so breakpoints and
+     * steps would be skipped. Hooks run only in the interpreter on the owning
+     * thread, which makes this the safe place to drop traces and keep the VM
+     * interpreted for the rest of the debug session. */
+    if (st && st->active && !st->jit_off) {
+        st->jit_off = 1;
+        luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_FLUSH);
+        luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_OFF);
+    }
+#endif
     xdbg_mutex_unlock(&g_dbg.lock);
 }
 
@@ -1236,6 +1252,7 @@ void xdebug_detach_state(lua_State* L) {
         xdbg_set_state(L, NULL);
         st->active = 0;
         st->hook_enabled = 0;
+        st->jit_off = 0;
         st->stopped = 0;
         st->stop_L = NULL;
         st->req = XDBG_REQ_NONE;

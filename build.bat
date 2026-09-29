@@ -122,7 +122,7 @@ set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
 set "LUAJIT_DIR=3rd\luajit\src"
 set "LUAJIT_INC=3rd\luajit\src"
 
-set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua"
+set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua tests/lua/utf8_spec.lua"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua tests/lua/conn_close_leak_test.lua tests/lua/timer_coroutine_test.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
@@ -152,9 +152,15 @@ if /I "%LUA_BACKEND%"=="luajit" (
 
     if not defined XNET_LUA_LIB (
         if exist "%LUAJIT_DIR%\msvcbuild.bat" (
-            echo %GREEN%[INFO]%RESET% LuaJIT .lib not found, running msvcbuild.bat static...
+            echo %GREEN%[INFO]%RESET% LuaJIT .lib not found, running msvcbuild.bat lua52compat static...
+            REM msvcbuild's cl defaults to the static CRT (/MT). Give LuaJIT the
+            REM CRT xnet links with: our /MD(d), then any caller _CL_ (appended
+            REM last, so e.g. tools that force /MT still win on both sides).
+            set "XNET_SAVED_CL=!_CL_!"
+            if /I "%BUILD_MODE%"=="debug" (set "_CL_=/MDd !_CL_!") else (set "_CL_=/MD !_CL_!")
             pushd "%LUAJIT_DIR%"
-            call msvcbuild.bat static
+            call msvcbuild.bat lua52compat static
+            set "_CL_=!XNET_SAVED_CL!"
             if errorlevel 1 (
                 popd
                 echo %RED%[ERROR]%RESET% Failed to build LuaJIT static library.

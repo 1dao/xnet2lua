@@ -69,6 +69,7 @@
 #else
 #include "lua.h"
 #include "lauxlib.h"
+#include "xlua_compat.h"
 #endif
 
 /* yyjson.h has inline funcs that call alc.free(ctx, ptr) — that field name
@@ -122,23 +123,6 @@ static const yyjson_alc g_xj_alc = {
     xj_alc_free,
     NULL    /* no ctx needed — the allocator is process-global */
 };
-
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
-static int lua_isinteger(lua_State *L, int idx) {
-    if (!lua_isnumber(L, idx)) return 0;
-    lua_Number n = lua_tonumber(L, idx);
-    lua_Integer i = lua_tointeger(L, idx);
-    return ((lua_Number)i == n);
-}
-
-static const char *luaL_tolstring(lua_State *L, int idx, size_t *len) {
-    idx = (idx > 0 || idx <= LUA_REGISTRYINDEX) ? idx : lua_gettop(L) + idx + 1;
-    lua_getglobal(L, "tostring");
-    lua_pushvalue(L, idx);
-    lua_call(L, 1, 1);
-    return lua_tolstring(L, -1, len);
-}
-#endif
 
 static lua_Integer lua_integer_max(void) {
     if (sizeof(lua_Integer) >= sizeof(long long)) return (lua_Integer)LLONG_MAX;
@@ -2160,6 +2144,223 @@ static const luaL_Reg xutils_funcs[] = {
 
     { NULL, NULL }
 };
+
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM < 502
+/* utf8 library for LuaJIT, following Lua 5.4's lutf8lib: strict decoding by
+ * default; the optional `lax` argument also accepts surrogates and code points
+ * up to 0x7FFFFFFF. Lua strings are NUL-terminated, so reading one byte past
+ * the end (as 5.4 does) is safe. */
+#define XU8_MAXUNICODE 0x10FFFFu
+#define XU8_MAXUTF     0x7FFFFFFFu
+/* 5.1 patterns stop at an embedded NUL, so the class spells it %z. */
+#define XU8_PATTERN    "[%z\x01-\x7F\xC2-\xFD][\x80-\xBF]*"
+#define xu8_iscont(c)  (((unsigned char)(c) & 0xC0) == 0x80)
+
+static lua_Integer xu8_posrelat(lua_Integer pos, size_t len) {
+    if (pos >= 0) return pos;
+    if ((size_t)-pos > len) return 0;
+    return (lua_Integer)len + pos + 1;
+}
+
+static const char *xu8_decode(const char *s, unsigned int *val, int strict) {
+    static const unsigned int limits[] = { ~0u, 0x80, 0x800, 0x10000u, 0x200000u, 0x4000000u };
+    unsigned int c = (unsigned char)s[0];
+    unsigned int res = 0;
+    if (c < 0x80) {
+        res = c;
+    } else {
+        int count = 0;
+        for (; c & 0x40; c <<= 1) {
+            unsigned int cc = (unsigned char)s[++count];
+            if ((cc & 0xC0) != 0x80) return NULL;
+            res = (res << 6) | (cc & 0x3F);
+        }
+        res |= (unsigned int)(c & 0x7F) << (count * 5);
+        if (count > 5 || res > XU8_MAXUTF || res < limits[count]) return NULL;
+        s += count;
+    }
+    if (strict && (res > XU8_MAXUNICODE || (res >= 0xD800u && res <= 0xDFFFu))) return NULL;
+    if (val) *val = res;
+    return s + 1;
+}
+
+/* Same byte layout as Lua's luaO_utf8esc (up to 6 bytes). */
+static int xu8_encode(char *out, unsigned long x) {
+    char buf[8];
+    int n = 1;
+    if (x < 0x80) {
+        buf[7] = (char)x;
+    } else {
+        unsigned int mfb = 0x3f;
+        do {
+            buf[8 - (n++)] = (char)(0x80 | (x & 0x3f));
+            x >>= 6;
+            mfb >>= 1;
+        } while (x > mfb);
+        buf[8 - n] = (char)((~mfb << 1) | x);
+    }
+    memcpy(out, buf + 8 - n, (size_t)n);
+    return n;
+}
+
+static int xu8_len(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_Integer posi = xu8_posrelat(luaL_optinteger(L, 2, 1), len);
+    lua_Integer posj = xu8_posrelat(luaL_optinteger(L, 3, -1), len);
+    int lax = lua_toboolean(L, 4);
+    lua_Integer n = 0;
+    luaL_argcheck(L, 1 <= posi && --posi <= (lua_Integer)len, 2, "initial position out of bounds");
+    luaL_argcheck(L, --posj < (lua_Integer)len, 3, "final position out of bounds");
+    while (posi <= posj) {
+        const char *s1 = xu8_decode(s + posi, NULL, !lax);
+        if (!s1) {
+            lua_pushnil(L);
+            lua_pushinteger(L, posi + 1);
+            return 2;
+        }
+        posi = s1 - s;
+        n++;
+    }
+    lua_pushinteger(L, n);
+    return 1;
+}
+
+static int xu8_codepoint(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_Integer posi = xu8_posrelat(luaL_optinteger(L, 2, 1), len);
+    lua_Integer pose = xu8_posrelat(luaL_optinteger(L, 3, posi), len);
+    int lax = lua_toboolean(L, 4);
+    const char *se;
+    int n;
+    luaL_argcheck(L, posi >= 1, 2, "out of bounds");
+    luaL_argcheck(L, pose <= (lua_Integer)len, 3, "out of bounds");
+    if (posi > pose) return 0;
+    if (pose - posi >= INT_MAX) return luaL_error(L, "string slice too long");
+    luaL_checkstack(L, (int)(pose - posi) + 1, "string slice too long");
+    n = 0;
+    se = s + pose;
+    for (s += posi - 1; s < se;) {
+        unsigned int code;
+        s = xu8_decode(s, &code, !lax);
+        if (!s) return luaL_error(L, "invalid UTF-8 code");
+        lua_pushinteger(L, (lua_Integer)code);
+        n++;
+    }
+    return n;
+}
+
+static int xu8_char(lua_State *L) {
+    int n = lua_gettop(L), i;
+    luaL_Buffer b;
+    luaL_buffinit(L, &b);
+    for (i = 1; i <= n; i++) {
+        lua_Number code = luaL_checknumber(L, i);
+        char buf[8];
+        luaL_argcheck(L, code >= 0 && code <= XU8_MAXUTF && code == (lua_Number)(unsigned long)code,
+                      i, "value out of range");
+        luaL_addlstring(&b, buf, (size_t)xu8_encode(buf, (unsigned long)code));
+    }
+    luaL_pushresult(&b);
+    return 1;
+}
+
+static int xu8_offset(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_Integer n = luaL_checkinteger(L, 2);
+    lua_Integer posi = n >= 0 ? 1 : (lua_Integer)len + 1;
+    posi = xu8_posrelat(luaL_optinteger(L, 3, posi), len);
+    luaL_argcheck(L, 1 <= posi && --posi <= (lua_Integer)len, 3, "position out of bounds");
+    if (n == 0) {
+        while (posi > 0 && xu8_iscont(s[posi])) posi--;
+    } else {
+        if (xu8_iscont(s[posi])) return luaL_error(L, "initial position is a continuation byte");
+        if (n < 0) {
+            while (n < 0 && posi > 0) {
+                do { posi--; } while (posi > 0 && xu8_iscont(s[posi]));
+                n++;
+            }
+        } else {
+            n--;
+            while (n > 0 && posi < (lua_Integer)len) {
+                do { posi++; } while (xu8_iscont(s[posi]));
+                n--;
+            }
+        }
+    }
+    if (n == 0) lua_pushinteger(L, posi + 1);
+    else lua_pushnil(L);
+    return 1;
+}
+
+static int xu8_iter_aux(lua_State *L, int strict) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    lua_Integer pos = lua_tointeger(L, 2);
+    size_t n = pos < 0 ? len : (size_t)pos;
+    unsigned int code;
+    const char *next;
+    if (n < len) {
+        while (xu8_iscont(s[n])) n++;
+    }
+    if (n >= len) return 0;
+    next = xu8_decode(s + n, &code, strict);
+    if (!next || xu8_iscont(*next)) return luaL_error(L, "invalid UTF-8 code");
+    lua_pushinteger(L, (lua_Integer)n + 1);
+    lua_pushinteger(L, (lua_Integer)code);
+    return 2;
+}
+static int xu8_iter_strict(lua_State *L) { return xu8_iter_aux(L, 1); }
+static int xu8_iter_lax(lua_State *L) { return xu8_iter_aux(L, 0); }
+
+static int xu8_codes(lua_State *L) {
+    int lax = lua_toboolean(L, 2);
+    const char *s = luaL_checkstring(L, 1);
+    luaL_argcheck(L, !xu8_iscont(*s), 1, "invalid UTF-8 code");
+    lua_pushcfunction(L, lax ? xu8_iter_lax : xu8_iter_strict);
+    lua_pushvalue(L, 1);
+    lua_pushinteger(L, 0);
+    return 3;
+}
+
+static const luaL_Reg xu8_funcs[] = {
+    { "char",      xu8_char },
+    { "codepoint", xu8_codepoint },
+    { "codes",     xu8_codes },
+    { "len",       xu8_len },
+    { "offset",    xu8_offset },
+    { NULL, NULL }
+};
+
+/* Registers global `utf8` and package.loaded.utf8 unless one already exists. */
+int xlua_open_utf8(lua_State *L) {
+    lua_getglobal(L, "utf8");
+    if (!lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    lua_pop(L, 1);
+    lua_newtable(L);
+    luaL_register(L, NULL, xu8_funcs);
+    lua_pushlstring(L, XU8_PATTERN, sizeof(XU8_PATTERN) - 1);
+    lua_setfield(L, -2, "charpattern");
+    lua_pushvalue(L, -1);
+    lua_setglobal(L, "utf8");
+    lua_getglobal(L, "package");
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "loaded");
+        if (lua_istable(L, -1)) {
+            lua_pushvalue(L, -3);
+            lua_setfield(L, -2, "utf8");
+        }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 2);
+    return 0;
+}
+#endif
 
 LUALIB_API int luaopen_xutils(lua_State *L) {
     luaL_newlib(L, xutils_funcs);

@@ -145,9 +145,14 @@ eq('empty table -> object',
     xutils.json_pack({}),
     '{}')
 
-eq('sparse [1]+[3] -> object (NOT array)',
-    xutils.json_pack({ [1] = 'a', [3] = 'c' }),
-    '{"1":"a","3":"c"}')
+-- Key order follows table iteration, which differs between Lua and LuaJIT.
+do
+    local sparse = xutils.json_pack({ [1] = 'a', [3] = 'c' })
+    local back = xutils.json_unpack(sparse)
+    ok('sparse [1]+[3] -> object (NOT array)',
+        sparse:sub(1, 1) == '{' and type(back) == 'table'
+        and back['1'] == 'a' and back['3'] == 'c' and back['2'] == nil)
+end
 
 -- Mixed: integer + string keys -> object. Order undefined; verify by parsing back.
 do

@@ -44,6 +44,28 @@ jobs:
             with_rpmalloc: 1
             test_target: unit
             coverage: false
+          # LuaJIT backend (vendored 3rd/luajit, built by the Makefile).
+          - os: ubuntu-latest
+            name: luajit-debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            test_target: test
+            coverage: false
+            lua_backend: luajit
+          - os: macos-latest
+            name: luajit-debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            test_target: test
+            coverage: false
+            lua_backend: luajit
+
+    env:
+      LUA_BACKEND: ${{ matrix.lua_backend || 'minilua' }}
 
     steps:
       - name: Checkout
@@ -52,10 +74,10 @@ jobs:
           submodules: recursive
 
       - name: Build
-        run: make all CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}
+        run: make all CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }} LUA_BACKEND=$LUA_BACKEND
 
       - name: Test
-        run: make -C tests ${{ matrix.test_target }} ROOT=.. CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }}
+        run: make -C tests ${{ matrix.test_target }} ROOT=.. CC=${{ matrix.cc }} BUILD_MODE=${{ matrix.build_mode }} WITH_HTTPS=${{ matrix.with_https }} WITH_RPMALLOC=${{ matrix.with_rpmalloc }} LUA_BACKEND=$LUA_BACKEND
 
       - name: Coverage
         if: matrix.coverage == true

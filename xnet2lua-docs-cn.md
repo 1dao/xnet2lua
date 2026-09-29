@@ -91,7 +91,7 @@ make clean
 | `WITH_IO_URING` | `0` | `1` / `0` | Linux 下启用 `XPOLL_USE_IO_URING` 与 `XCHANNEL_USE_IO_URING`，需链接 `liburing` |
 | `WITH_XDEBUG` | `0` | `1` / `0` | 是否把原生 Lua 调试器编进 `bin/xnet`；只编译能力，不会自动启动调试服务 |
 | `WITH_RPMALLOC` | `1` | `1` / `0` | 把项目自己的 `malloc/free` 通过 `xmacro.h` 路由到 rpmalloc；`=0` 时退回 libc，`rpmalloc.c` 不参与链接（详见 §2.7） |
-| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | 内置 Lua 还是 LuaJIT；选 `luajit` 时需要先把 `3rd/luajit` 子模块拉下来并构建 `libluajit.a` |
+| `LUA_BACKEND` | `minilua` | `minilua` / `luajit` | 内置 Lua 还是 LuaJIT；选 `luajit` 时需拉取 `3rd/luajit` 子模块，静态库由构建自动生成（见 2.5） |
 
 ```bash
 # 示例
@@ -199,7 +199,21 @@ xnet2lua 同时支持两种 Lua 运行时：
 luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
 ```
 
-确保主线程和所有 worker 线程的 JIT 都开启。Lua 5.1 缺失的若干 API（`luaL_requiref`、`lua_isinteger`、`luaL_tolstring`，以及 `LUA_MAXINTEGER`/`LUA_MININTEGER` 边界）由 `xnet_main.c`、`xlua/lua_xthread.c`、`xlua/lua_xutils.c` 内联补齐，**绑定层 API 在两种后端下完全一致**，业务代码不需要改 Lua 模块名或函数签名。
+确保主线程和所有 worker 线程的 JIT 都开启，同时注册 `utf8` 库并记录主线程（见下）。**绑定层 API 在两种后端下完全一致**，业务代码不需要改 Lua 模块名或函数签名。
+
+**构建。** `make LUA_BACKEND=luajit` 会自动编译 `3rd/luajit/src/libluajit.a`，`build.bat luajit` 会调用 `msvcbuild.bat lua52compat static` 生成 `lua51.lib`，并让 LuaJIT 与 xnet 使用同一种 CRT（`/MD`、`/MDd`，或调用方 `_CL_` 指定的 `/MT`）。两者都开启 `LUAJIT_ENABLE_LUA52COMPAT`，提供 `table.pack`/`table.unpack` 等 5.2 行为。macOS 默认 `MACOSX_DEPLOYMENT_TARGET=11.0`。已存在的静态库会被直接复用：修改编译选项或切换 debug/release 后，先清理 `3rd/luajit`（macOS 上清理同样需要设置该环境变量）。
+
+**兼容层。** Lua 5.2–5.4 的 C API（`lua_rawlen`、`luaL_len`、`lua_newuserdatauv`/`lua_setiuservalue`、`luaL_buffinitsize`、`lua_geti`/`lua_seti`、`lua_isinteger`、`luaL_tolstring` 等）集中在 `xlua/xlua_compat.h`，内置 Lua 构建下该头文件不生效。另有两项运行时补齐：
+
+- `utf8` 库（`xlua/lua_xutils.c`）：按 Lua 5.4 语义实现 `char`/`codepoint`/`codes`/`len`/`offset`，默认严格解码，可选 `lax`。`utf8.charpattern` 写作 `%z` 形式，因为 5.1 模式不支持内嵌 NUL。
+- 主线程：5.1 没有 `LUA_RIDX_MAINTHREAD`，运行时把主线程记录在注册表，定时器和连接在协程内创建时仍回调到主线程，而不是可能已被回收的协程。
+
+**行为差异。**
+
+- 数字都是 double，整数只在 2^53 内精确；32 位目标（Android armv7/x86）上 `lua_Integer` 为 32 位。
+- `pairs` 遍历顺序与内置 Lua 不同，不要依赖对象键顺序。
+- 计数与行 hook 不会在 JIT 编译后的代码中触发。xdebug 在调试会话的第一个 hook 里清空已编译代码并关闭 JIT；依赖 `debug.sethook` 计数实现取消的代码应另设显式检查点。
+- iOS 上只能解释执行（系统禁止运行时生成机器码）。
 
 > 💡 **业务代码注意**：Lua 5.4 的位运算符 `& | ~ << >>` 在 LuaJIT (5.1) 下会**语法错误**。
 > 想同时兼容两个后端，请改用 `bit` 库（LuaJIT 自带 `bit.band` / `bit.bxor` / `bit.lshift` / ...）。
@@ -240,6 +254,8 @@ lua_State* L = luaL_newstate();
 luaL_openlibs(L);
 #if defined(XLUA_USE_LUAJIT)
     luaJIT_setmode(L, 0, LUAJIT_MODE_ENGINE | LUAJIT_MODE_ON);
+    xlua_open_utf8(L);        // xlua/xlua_compat.h
+    xlua_set_mainthread(L);   // 定时器/连接回调所用的主线程
 #endif
 
 // 注册 Lua 模块
