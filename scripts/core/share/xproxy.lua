@@ -84,7 +84,7 @@ function M.auth_header(proxy)
     return 'Basic ' .. xutils.base64_encode((proxy.user or '') .. ':' .. (proxy.pass or ''))
 end
 
-local function u16be(n) return schar((n >> 8) & 0xff, n & 0xff) end
+local function u16be(n) return schar(math.floor(n / 256) % 256, n % 256) end
 
 local function socks5_greeting(proxy)
     -- Offer no-auth, plus user/pass when creds are configured.

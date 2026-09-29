@@ -19,6 +19,7 @@
 - 本项目文本文件统一为 LF，新增 `.gitattributes`；`3rd/` 下的第三方代码保持上游原样。
 - `tests/lua/xproc_pipe_test.lua` 改为跨平台，新增行请求/响应往返、进程树结束与批处理拒绝用例。
 - 线程上限 `XTHR_MAX` 由 120 调至 512。
+- 核心与 xagent 脚本不再使用 Lua 5.3+ 专有语法，可在 LuaJIT 下加载：`xwebsocket` 帧头改用字节运算，掩码按运行时选用原生 `~` 或 `bit.bxor`；`xproxy`、`xoauth`、`xadmin_auth` 等改用算术运算。
 - LuaJIT 下 xdebug 在调试会话的第一个 hook 中清空已编译代码并关闭 JIT，断点与单步不再被 JIT 代码跳过。
 
 ### 修复

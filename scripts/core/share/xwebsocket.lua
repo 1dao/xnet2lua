@@ -22,10 +22,35 @@ local M = {}
 local xutils = require('xutils')   -- C-backed sha1 + base64 (always linked)
 local xmisc  = dofile('scripts/core/share/xmisc.lua')
 
-local spack   = string.pack
+local spack   = string.pack     -- nil on LuaJIT
 local sunpack = string.unpack
 local schar   = string.char
 local sbyte   = string.byte
+local floor   = math.floor
+local tunpack = table.unpack or unpack
+
+-- LuaJIT has neither bitwise operators nor string.pack. Headers therefore use
+-- byte arithmetic on both runtimes; only masking needs XOR, which comes from
+-- the bit library there and from a native operator compiled at load time
+-- elsewhere (so LuaJIT never parses `~`).
+local bitlib = rawget(_G, 'bit')
+local bxor = bitlib and bitlib.bxor or load('return function(a, b) return a ~ b end')()
+
+-- Big-endian unsigned integers of `width` bytes; frame lengths stay far below
+-- 2^53, so doubles are exact.
+local function uint_be(n, width)
+    local b = {}
+    for i = width, 1, -1 do
+        b[i] = n % 256
+        n = floor(n / 256)
+    end
+    return schar(tunpack(b))
+end
+local function read_uint_be(s, pos, width)
+    local n = 0
+    for i = pos, pos + width - 1 do n = n * 256 + sbyte(s, i) end
+    return n
+end
 
 -- ===========================================================================
 -- Constants
@@ -143,20 +168,21 @@ end
 
 -- ===========================================================================
 -- Frame masking (XOR with a 4-byte key; symmetric, so this both masks and
--- unmasks). Processes 4 bytes at a time via string.pack for speed.
+-- unmasks). Processes 4 bytes at a time via string.pack where available;
+-- LuaJIT takes the byte loop, which its JIT compiles well.
 -- ===========================================================================
 function M.mask(payload, key)
     payload = payload or ''
     if payload == '' then return payload end
     local n = #payload
-    local mk = sunpack('>I4', key)
     local parts = {}
     local pi = 0
     local i = 1
-    while i + 3 <= n do
+    local mk = spack and sunpack('>I4', key)
+    while mk and i + 3 <= n do
         local word = sunpack('>I4', payload, i)
         pi = pi + 1
-        parts[pi] = spack('>I4', word ~ mk)
+        parts[pi] = spack('>I4', bxor(word, mk))
         i = i + 4
     end
     if i <= n then
@@ -167,7 +193,7 @@ function M.mask(payload, key)
         local j = 0
         while i <= n do
             ti = ti + 1
-            tail[ti] = schar(sbyte(payload, i) ~ kb[(j % 4) + 1])
+            tail[ti] = schar(bxor(sbyte(payload, i), kb[(j % 4) + 1]))
             i = i + 1; j = j + 1
         end
         pi = pi + 1
@@ -196,17 +222,17 @@ function M.encode(opcode, payload, opts)
     payload = payload or ''
     opts = opts or {}
     local fin = opts.fin ~= false
-    local b1 = (fin and 0x80 or 0x00) | (opcode & 0x0f)
+    local b1 = (fin and 0x80 or 0x00) + opcode % 16
     local n = #payload
     local mask_bit = opts.mask and 0x80 or 0x00
 
     local header
     if n < 126 then
-        header = spack('>BB', b1, mask_bit | n)
+        header = schar(b1, mask_bit + n)
     elseif n < 65536 then
-        header = spack('>BBI2', b1, mask_bit | 126, n)
+        header = schar(b1, mask_bit + 126) .. uint_be(n, 2)
     else
-        header = spack('>BBI8', b1, mask_bit | 127, n)
+        header = schar(b1, mask_bit + 127) .. uint_be(n, 8)
     end
 
     if opts.mask then
@@ -230,19 +256,19 @@ function M.decode(buf, pos, opts)
 
     local b1 = sbyte(buf, pos)
     local b2 = sbyte(buf, pos + 1)
-    local fin    = (b1 & 0x80) ~= 0
-    local rsv    = b1 & 0x70
-    local opcode = b1 & 0x0f
-    local masked = (b2 & 0x80) ~= 0
-    local len    = b2 & 0x7f
+    local fin    = b1 >= 0x80
+    local rsv    = floor(b1 / 16) % 8 * 16
+    local opcode = b1 % 16
+    local masked = b2 >= 0x80
+    local len    = b2 % 128
     local hdr    = pos + 2
 
     if len == 126 then
         if hdr + 1 > n then return nil, pos, 'incomplete' end
-        len = sunpack('>I2', buf, hdr); hdr = hdr + 2
+        len = read_uint_be(buf, hdr, 2); hdr = hdr + 2
     elseif len == 127 then
         if hdr + 7 > n then return nil, pos, 'incomplete' end
-        len = sunpack('>I8', buf, hdr); hdr = hdr + 8
+        len = read_uint_be(buf, hdr, 8); hdr = hdr + 8
     end
 
     local maxlen = opts.max_frame_size
@@ -275,7 +301,7 @@ function M.pong_frame(payload)  return M.encode(M.OP_PONG, payload or '') end
 function M.close_frame(code, reason)
     local payload = ''
     if code then
-        payload = spack('>I2', code & 0xffff) .. tostring(reason or '')
+        payload = uint_be(code % 65536, 2) .. tostring(reason or '')
     end
     return M.encode(M.OP_CLOSE, payload)
 end
@@ -284,7 +310,7 @@ end
 function M.parse_close(payload)
     payload = payload or ''
     if #payload >= 2 then
-        return sunpack('>I2', payload), payload:sub(3)
+        return read_uint_be(payload, 1, 2), payload:sub(3)
     end
     return nil, ''
 end

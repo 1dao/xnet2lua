@@ -160,7 +160,7 @@ local function socks_handler(user, pass)
                     if #b < 7 + n then break end
                     host = b:sub(6, 5 + n); rest = 6 + n
                 else break end
-                local port = (sbyte(b, rest) << 8) | sbyte(b, rest + 1)
+                local port = sbyte(b, rest) * 256 + sbyte(b, rest + 1)
                 seen.socks_target = host .. ':' .. port
                 s.buf = b:sub(rest + 2)
                 s.phase = 'pipe'

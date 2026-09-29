@@ -171,7 +171,8 @@ local CWD_FILE   = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/cwd'
 
 -- ── color helpers ──────────────────────────────────────────────────────────
 local function unpack_color(v)
-    return { (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF }
+    local floor = math.floor
+    return { floor(v / 0x1000000) % 256, floor(v / 0x10000) % 256, floor(v / 0x100) % 256, v % 256 }
 end
 local function clamp8(x) return math.max(0, math.min(255, math.floor(x + 0.5))) end
 local function shift(c, d) return { clamp8(c[1] + d), clamp8(c[2] + d), clamp8(c[3] + d), c[4] or 255 } end
@@ -266,12 +267,12 @@ local function utf8_to_utf16le(s)
     local out = {}
     for _, cp in utf8.codes(s) do
         if cp < 0x10000 then
-            out[#out + 1] = string.char(cp % 256, cp // 256)
+            out[#out + 1] = string.char(cp % 256, math.floor(cp / 256))
         else
             local v = cp - 0x10000
-            local hi = 0xD800 + v // 0x400
+            local hi = 0xD800 + math.floor(v / 0x400)
             local lo = 0xDC00 + v % 0x400
-            out[#out + 1] = string.char(hi % 256, hi // 256, lo % 256, lo // 256)
+            out[#out + 1] = string.char(hi % 256, math.floor(hi / 256), lo % 256, math.floor(lo / 256))
         end
     end
     return table.concat(out)

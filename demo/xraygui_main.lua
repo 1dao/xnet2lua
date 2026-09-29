@@ -117,7 +117,7 @@ local EMOJI = { cell = 72, cols = 12, count = 132, index = {
 local function emoji_src(key)
     local idx = type(key) == "string" and EMOJI.index[key] or key
     local c, cell = EMOJI.cols, EMOJI.cell
-    return (idx % c) * cell, (idx // c) * cell, cell, cell
+    return (idx % c) * cell, math.floor(idx / c) * cell, cell, cell
 end
 
 -- 在 (x,y) 处画一个 size×size 的彩色 emoji（key 可用名字 "save" 或数字序号）
@@ -147,7 +147,7 @@ end
 -- 游戏背包窗口（模态）：标题栏 + ✖ 关闭 + 物品格子(emoji 当图标) + 右侧详情
 local function draw_backpack()
     local bw, bh = 560, 410
-    local bx, by = (790 - bw) // 2, (730 - bh) // 2   -- 在窗口内居中
+    local bx, by = math.floor((790 - bw) / 2), math.floor((730 - bh) / 2)   -- 在窗口内居中
 
     -- 窗口框（GuiWindowBox = 面板 + 标题栏 + 右上角 ✖；点 ✖ 返回 true）
     if raygui.window(bx, by, bw, bh, "背包 Backpack") then
@@ -160,7 +160,7 @@ local function draw_backpack()
     local gx, gy = bx + 16, by + 44
     for i = 0, cols * rows - 1 do
         local cx = gx + (i % cols) * (ss + gap)
-        local cy = gy + (i // cols) * (ss + gap)
+        local cy = gy + math.floor(i / cols) * (ss + gap)
         if raygui.button(cx, cy, ss, ss, "") then   -- 空文字按钮当格子，点击选中
             bag_selected = i
         end

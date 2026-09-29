@@ -37,7 +37,8 @@ local function ct_equal(a, b)
     if #a ~= #b then return false end
     local diff = 0
     for i = 1, #a do
-        diff = diff | (sbyte(a, i) ~ sbyte(b, i))
+        local d = sbyte(a, i) - sbyte(b, i)
+        diff = diff + d * d
     end
     return diff == 0
 end

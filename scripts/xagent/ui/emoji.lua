@@ -101,7 +101,7 @@ M.MAP = {
 
 -- src(idx) -> sx, sy, sw, sh  (cell rect in the atlas)
 function M.src(idx)
-    return (idx % M.COLS) * M.CELL, (idx // M.COLS) * M.CELL, M.CELL, M.CELL
+    return (idx % M.COLS) * M.CELL, math.floor(idx / M.COLS) * M.CELL, M.CELL, M.CELL
 end
 
 -- tokenize(s) -> { {text=...} | {emoji=idx}, ... }   (pcall-safe vs bad UTF-8)

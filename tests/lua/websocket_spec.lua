@@ -72,7 +72,7 @@ spec.describe('xwebsocket frame codec', function()
     spec.it('round-trips a masked client frame', function()
         local f = ws.encode(ws.OP_BIN, 'binary-data', { mask = true, mask_key = 'ABCD' })
         spec.equal(f:byte(1), 0x82)              -- FIN + binary
-        spec.equal(f:byte(2), 0x80 | 11)         -- mask bit + len 11
+        spec.equal(f:byte(2), 0x80 + 11)         -- mask bit + len 11
         local frame, next_pos = ws.decode(f, 1)
         spec.equal(frame.masked, true)
         spec.equal(frame.opcode, ws.OP_BIN)
