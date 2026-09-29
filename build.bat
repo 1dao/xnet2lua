@@ -214,7 +214,7 @@ for %%F in (%C_UNIT_SOURCES%) do (
 
 REM WITH_HTTPS=1 builds the whole mbedTLS library; WITH_HTTPS=0 still needs the
 REM self-contained hash subset for xutils. Compile each exactly once.
-set "MBEDTLS_CRYPTO_SRC=sha1.c sha256.c sha512.c md5.c platform_util.c"
+set "MBEDTLS_CRYPTO_SRC=sha1.c sha256.c sha512.c md5.c platform_util.c aes.c aesni.c aesce.c padlock.c"
 set "MBEDTLS_OBJECTS="
 if "%WITH_HTTPS%"=="1" (
     for %%F in ("3rd\mbedtls3\library\*.c") do (
@@ -543,7 +543,8 @@ exit /b 0
 :run_lua_script
 set "SCRIPT_PATH=%~1"
 set "SCRIPT_ARG=%SCRIPT_PATH:\=/%"
-echo %GREEN%[INFO]%RESET% ==> %SCRIPT_ARG%
+REM ^> keeps the arrow literal; a bare > would redirect this echo into the script.
+echo %GREEN%[INFO]%RESET% ==^> %SCRIPT_ARG%
 
 if /I "%WITH_HTTP%"=="0" if /I "%SCRIPT_ARG%"=="demo/xhttp_main.lua" (
     echo %GREEN%[INFO]%RESET% Skip %SCRIPT_ARG% because WITH_HTTP=0
