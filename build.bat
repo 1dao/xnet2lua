@@ -147,7 +147,8 @@ if /I "%LUA_BACKEND%"=="luajit" (
 set "XNET_LUA_LIB="
 if /I "%LUA_BACKEND%"=="luajit" (
     if exist "%LUAJIT_DIR%\lua51.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\lua51.lib"
-    if not defined XNET_LUA_LIB if exist "%LUAJIT_DIR%\luajit.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\luajit.lib"
+    REM Not luajit.lib: msvcbuild leaves that behind as the import library of
+    REM luajit.exe, and linking it makes xnet.exe depend on luajit.exe.
     if not defined XNET_LUA_LIB if exist "%LUAJIT_DIR%\libluajit.lib" set "XNET_LUA_LIB=%LUAJIT_DIR%\libluajit.lib"
 
     if not defined XNET_LUA_LIB (
@@ -175,7 +176,6 @@ if /I "%LUA_BACKEND%"=="luajit" (
         echo %RED%[ERROR]%RESET% LuaJIT static lib not found.
         echo %YELLOW%[HINT]%RESET% Expected one of:
         echo   %LUAJIT_DIR%\lua51.lib
-        echo   %LUAJIT_DIR%\luajit.lib
         echo   %LUAJIT_DIR%\libluajit.lib
         exit /b 1
     )

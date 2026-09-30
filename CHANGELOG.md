@@ -32,6 +32,7 @@
 - `build.bat` 运行 Lua 测试时 `==>` 被解析为重定向，每次都会把第一个测试脚本覆盖成一行日志。
 - `build.bat nohttps` 构建缺少 AES 源文件导致链接失败（与 Makefile 的列表对齐）。
 - `demo/xutils_main.lua` 稀疏表 JSON 用例不再依赖表遍历顺序。
+- `build.bat luajit` 重新构建时会链接 `luajit.lib`：那是 msvcbuild 生成的 `luajit.exe` 导入库，并非静态库，链接会失败（或让 xnet.exe 依赖 luajit.exe）。现在只使用 `lua51.lib` / `libluajit.lib`。
 
 ### 构建
 
