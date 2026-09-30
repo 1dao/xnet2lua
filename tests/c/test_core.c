@@ -256,6 +256,49 @@ static void test_xlog_levels_and_files(xTestState* st) {
     xlog_set_level(XLOG_LEVEL_VERBOSE);
 }
 
+/* True when `dir` exists: a file can be created inside it (fopen on a directory
+** itself succeeds on Linux, so it cannot answer this). */
+static int test_dir_exists(const char* dir) {
+    char probe[256];
+    FILE* f;
+    snprintf(probe, sizeof(probe), "%s/.probe", dir);
+    f = fopen(probe, "wb");
+    if (!f) return 0;
+    fclose(f);
+    remove(probe);
+    return 1;
+}
+
+static void test_xlog_level_names_and_console_only(xTestState* st) {
+    const char* dir = "xtest_nolog_dir";
+    const char* log = "xtest_nolog_dir/xtest10_main_001.log";
+
+    xtest_suite("xlog LOG_LEVEL names and console-only logging");
+
+    XTEST_EQ_INT(st, xlog_parse_level("warn"), XLOG_LEVEL_WARN);
+    XTEST_EQ_INT(st, xlog_parse_level("WARN"), XLOG_LEVEL_WARN);
+    XTEST_EQ_INT(st, xlog_parse_level("Dbug"), XLOG_LEVEL_DEBUG);
+    XTEST_EQ_INT(st, xlog_parse_level("errr"), XLOG_LEVEL_ERROR);
+    XTEST_EQ_INT(st, xlog_parse_level("sysm"), XLOG_LEVEL_SYSM);
+    XTEST_EQ_INT(st, xlog_parse_level("2"), XLOG_LEVEL_VERBOSE);
+    XTEST_EQ_INT(st, xlog_parse_level("8"), XLOG_LEVEL_FATAL);
+    XTEST_EQ_INT(st, xlog_parse_level("1"), -1);
+    XTEST_EQ_INT(st, xlog_parse_level("9"), -1);
+    XTEST_EQ_INT(st, xlog_parse_level("loud"), -1);
+    XTEST_EQ_INT(st, xlog_parse_level(""), -1);
+    XTEST_EQ_INT(st, xlog_parse_level(NULL), -1);
+
+    /* With files off, init creates no directory and records create no file. */
+    XTEST_FALSE(st, test_dir_exists(dir));
+    xlog_set_file_enabled(0);
+    xlog_init(dir, "xtest10", 0);
+    xloge("console-only-line");
+    XTEST_FALSE(st, test_dir_exists(dir));
+    XTEST_FALSE(st, test_file_exists(log));
+    xlog_uninit();
+    xlog_set_file_enabled(1);
+}
+
 static void test_xpoll_lifecycle(xTestState* st) {
     xtest_suite("xpoll lifecycle");
 
@@ -288,6 +331,7 @@ int main(void) {
     test_xheapmin_ordering(&st);
     test_xtimer_lifecycle(&st);
     test_xlog_levels_and_files(&st);
+    test_xlog_level_names_and_console_only(&st);
     test_xpoll_lifecycle(&st);
 
     return xtest_summary(&st);

@@ -12,6 +12,7 @@
 - `xutils` 新增 `read_stdin`、`random_bytes`、`realpath`、`replace_file`、`temp_file`；`LOG_STDERR=1` 或 `STDIO=1` 时控制台日志改写到 stderr，stdout 仅保留协议输出。
 - `xscan`：可配置的源码词法扫描器，支持 Lua 长括号、JS 模板与正则、Rust 生命周期与原始字符串。
 - LuaJIT 后端恢复可用：Lua 5.2–5.4 C API 兼容集中在 `xlua/xlua_compat.h`（内置 Lua 构建下不生效），合并 `lua_xutils.c` 原有的零散补丁。LuaJIT 下注册按 Lua 5.4 语义实现的 `utf8` 库，并新增 `tests/lua/utf8_spec.lua` 在两种后端下对照验证。
+- 日志启动参数：`LOG_LEVEL=<级别>`（名称或 2–8）在第一条日志前生效，控制台与文件同样过滤；`LOG_FILE=0` 只输出到控制台，不创建日志目录；`LOG_DIR=<目录>` 替换默认的 `./logs`。默认行为不变。从用户目录启动的工具（如在项目根目录启动的 MCP 服务）可借此不留下文件。
 
 ### 变更
 

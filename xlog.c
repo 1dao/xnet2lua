@@ -79,6 +79,7 @@ static unsigned long long g_max_file_bytes = XLOG_MAX_FILE_BYTES;
 /* Reads of aligned int are atomic on all targets we ship to; volatile blocks
 ** compiler reordering / caching across reads. Writes are infrequent. */
 static volatile int g_min_level = XLOG_LEVEL_VERBOSE;
+static volatile int g_file_enabled = 1;
 static volatile int g_console_enabled = 1;
 static int g_console_stderr = 0;
 void xlog_set_console_stderr(int enabled) { g_console_stderr = enabled != 0; }
@@ -634,6 +635,7 @@ static void xlog_sink_account(xLogSink* s, size_t bytes) {
 static xLogSink* xlog_sink_acquire(void) {
     xLogThreadState* st = &g_thread_log;
     if (!g_configured) xlog_init(NULL, NULL, 1);
+    if (!g_file_enabled) return NULL;
     if (st->own_file) {
         xlog_sink_open(&st->sink);
         if (!st->sink.file) return NULL;
@@ -662,7 +664,7 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
     char base[sizeof(g_shared.base)];
     xlog_copy(g_log_dir, sizeof(g_log_dir), log_dir, "logs");
     xlog_copy(g_process_name, sizeof(g_process_name), process_name, "xnet");
-    xlog_mkdir(g_log_dir);
+    if (g_file_enabled) xlog_mkdir(g_log_dir);
     g_console_enabled = enable_console ? 1 : 0;
     if (g_console_enabled) xlog_enable_vt100();
     g_configured = 1;
@@ -756,6 +758,8 @@ unsigned long long xlog_get_max_file_bytes(void) {
     return g_max_file_bytes;
 }
 
+void xlog_set_file_enabled(int enabled) { g_file_enabled = enabled != 0; }
+
 void xlog_set_level(int min_level) {
     if (min_level < XLOG_LEVEL_VERBOSE) min_level = XLOG_LEVEL_VERBOSE;
     if (min_level > XLOG_LEVEL_FATAL) min_level = XLOG_LEVEL_FATAL;
@@ -840,6 +844,7 @@ void xlog_init(const char* log_dir, const char* process_name, int enable_console
     (void)enable_console;
 }
 void xlog_set_console_stderr(int enabled) { (void)enabled; }
+void xlog_set_file_enabled(int enabled) { (void)enabled; }
 
 void xlog_uninit(void) {}
 void xlog_set_thread(int id, const char* name, const char* thread_label) { (void)id; (void)name; (void)thread_label; }
@@ -906,3 +911,31 @@ void xlog_android_emit(int level, int android_prio, const char* fmt, ...) {
 }
 
 #endif /* __ANDROID__ */
+
+/* Shared by both backends: parse a LOG_LEVEL value. */
+int xlog_parse_level(const char* name) {
+    static const struct { const char* name; int level; } names[] = {
+        { "verbose", XLOG_LEVEL_VERBOSE }, { "verb", XLOG_LEVEL_VERBOSE },
+        { "debug", XLOG_LEVEL_DEBUG }, { "dbug", XLOG_LEVEL_DEBUG },
+        { "info", XLOG_LEVEL_INFO }, { "sysm", XLOG_LEVEL_SYSM },
+        { "warn", XLOG_LEVEL_WARN }, { "error", XLOG_LEVEL_ERROR },
+        { "errr", XLOG_LEVEL_ERROR }, { "fatal", XLOG_LEVEL_FATAL },
+        { "fatl", XLOG_LEVEL_FATAL },
+    };
+    char lower[16];
+    size_t i, n;
+    if (!name || !*name) return -1;
+    n = strlen(name);
+    if (n >= sizeof(lower)) return -1;
+    for (i = 0; i < n; ++i) {
+        char c = name[i];
+        lower[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    lower[n] = '\0';
+    if (n == 1 && lower[0] >= '0' + XLOG_LEVEL_VERBOSE && lower[0] <= '0' + XLOG_LEVEL_FATAL)
+        return lower[0] - '0';
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        if (strcmp(lower, names[i].name) == 0) return names[i].level;
+    }
+    return -1;
+}

@@ -567,7 +567,26 @@ int main(int argc, char** argv) {
     }
 
     xlog_set_console_stderr(xargs_get_bool("LOG_STDERR") || xargs_get_bool("STDIO"));
-    xlog_init("logs", g_process_name ? g_process_name : "xnet", !xdaemon_is_daemon());
+    /* Applied before xlog_init so even the startup lines honour them.
+    ** LOG_LEVEL drops records below a level (name or 2..8), LOG_FILE=0 logs to
+    ** the console only without creating a directory, and LOG_DIR replaces the
+    ** default ./logs. Tools launched from a user's directory (e.g. an MCP
+    ** server started in a project) use these to leave no files behind. */
+    {
+        const char* level = xargs_get("LOG_LEVEL");
+        const char* file = xargs_get("LOG_FILE");
+        if (level && *level) {
+            int parsed = xlog_parse_level(level);
+            if (parsed < 0) fprintf(stderr, "[xnet] ignoring unknown LOG_LEVEL '%s'\n", level);
+            else xlog_set_level(parsed);
+        }
+        if (file && !xargs_get_bool("LOG_FILE")) xlog_set_file_enabled(0);
+    }
+    {
+        const char* log_dir = xargs_get("LOG_DIR");
+        xlog_init(log_dir && *log_dir ? log_dir : "logs", g_process_name ? g_process_name : "xnet",
+                  !xdaemon_is_daemon());
+    }
     /* LOG_MAX_FILE_MB caps each log file; the next sequence number is opened
     ** once a file fills up (xnet_main_001.log -> xnet_main_002.log -> ...). */
     {

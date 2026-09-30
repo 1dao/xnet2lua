@@ -66,6 +66,12 @@ enum {
 void xlog_init(const char* log_dir, const char* process_name, int enable_console);
 void xlog_uninit(void);
 void xlog_set_level(int min_level);
+/* Level name (VERBOSE/VERB, DEBUG/DBUG, INFO, SYSM, WARN, ERROR/ERRR,
+** FATAL/FATL; any case) or number 2..8 -> level, or -1 if unrecognised. */
+int  xlog_parse_level(const char* name);
+/* 0 keeps logging on the console only: no log directory, no files. Set before
+** xlog_init() so the directory is not created either. */
+void xlog_set_file_enabled(int enabled);
 void xlog_set_console_stderr(int enabled);
 int  xlog_get_level(void);
 int  xlog_is_enabled(int level);

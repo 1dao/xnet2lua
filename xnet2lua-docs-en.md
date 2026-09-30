@@ -850,6 +850,15 @@ logs/game1_t012_001.log         -- unnamed thread, falls back to tNNN
 - The sequence starts at `001`; once a file reaches `LOG_MAX_FILE_MB`
   (default 2048, i.e. 2 GiB) logging moves on to `002`, `003`, ... Old files are
   never renamed, and a restart resumes the last file that still has room.
+- `LOG_DIR=<dir>` replaces the default `logs` (relative to the start directory).
+- `LOG_FILE=0` logs to the console only: no log directory, no files. Tools
+  started from a user's directory (such as an MCP server started in a project
+  root) use it to leave nothing behind.
+- `LOG_LEVEL=<level>` drops records below that level on the console and in
+  files alike: `VERBOSE`/`VERB`, `DEBUG`/`DBUG`, `INFO`, `SYSM`, `WARN`,
+  `ERROR`/`ERRR`, `FATAL`/`FATL` (any case) or 2-8. It applies before the first
+  record, so startup lines honour it too; an unknown value is reported and the
+  default (everything) stays.
 
 ### 4.9 Queue Backpressure and Thread Stats
 
