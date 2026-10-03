@@ -94,6 +94,7 @@ LUA_API int luaopen_xcompress(lua_State *L);
 LUA_API int luaopen_xshared(lua_State *L);
 LUA_API int luaopen_xrecord(lua_State *L);
 LUA_API int luaopen_xscan(lua_State *L);
+LUA_API int luaopen_xwatch(lua_State *L);
 #if XNET_WITH_XPROC
 LUA_API int luaopen_xproc(lua_State *L);
 #endif
@@ -225,6 +226,9 @@ static void preload_modules(lua_State* L) {
     lua_pop(L, 1);
 
     luaL_requiref(L, "xscan", luaopen_xscan, 1);
+    lua_pop(L, 1);
+
+    luaL_requiref(L, "xwatch", luaopen_xwatch, 1);
     lua_pop(L, 1);
 #if XNET_WITH_XPROC
     luaL_requiref(L, "xproc", luaopen_xproc, 1);

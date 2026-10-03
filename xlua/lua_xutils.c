@@ -12,7 +12,8 @@
 **   xutils.get_double(key[, default]) -> number | nil    (default: number)
 **   xutils.get_string(key[, default]) -> string | nil    (default: string)
 **   xutils.scan_dir(path)     -> { { path=..., rel=... }, ... } | nil,err
-**   xutils.list_dir(path)     -> { { name=..., dir=... }, ... } | nil,err  (one level)
+**   xutils.list_dir(path[, limit[, with_stat]]) -> { { name=..., dir=... }, ... }, truncated | nil,err
+**                             (one level; with_stat adds type, size, mtime as in stat)
 **   xutils.stat(path)         -> { exists, type, size, mtime } | nil,err (no symlink following)
 **   xutils.mkdir_p(path)      -> true | nil,err
 **   xutils.rmtree(path)       -> true | nil,err
@@ -1239,12 +1240,41 @@ static int l_util_mkdir_p(lua_State *L) {
     return 1;
 }
 
-/* xutils.list_dir(path) -> { { name=..., dir=bool }, ... } | nil, err
+/* Set type/size/mtime on the table at the top, the same fields stat reports. */
+static void push_stat_fields(lua_State *L, const char *kind, lua_Integer size, lua_Integer mtime) {
+    lua_pushstring(L, kind); lua_setfield(L, -2, "type");
+    lua_pushinteger(L, size); lua_setfield(L, -2, "size");
+    lua_pushinteger(L, mtime); lua_setfield(L, -2, "mtime");
+}
+
+#ifdef _WIN32
+static lua_Integer filetime_to_unix(FILETIME ft) {
+    uint64_t ticks = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return (lua_Integer)(ticks / 10000000ULL) - 11644473600LL;
+}
+
+static const char *attr_kind(DWORD attrs) {
+    return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? "link" :
+           (attrs & FILE_ATTRIBUTE_DIRECTORY) ? "directory" : "file";
+}
+#else
+static const char *mode_kind(mode_t m) {
+    return S_ISLNK(m) ? "link" : S_ISDIR(m) ? "directory" : S_ISREG(m) ? "file" : "other";
+}
+#endif
+
+/* xutils.list_dir(path[, limit[, with_stat]]) -> { { name=..., dir=bool }, ... }, truncated | nil, err
 **
 ** ONE level. scan_dir recurses with no depth limit, which makes it unusable on
 ** anything that might contain a git object store; this is the "what is directly
 ** in here" call that a scratch sweep or a repository listing actually wants.
 ** '.' and '..' are omitted.
+**
+** with_stat adds type, size and mtime exactly as stat reports them (links are
+** not followed). Windows reads them from the directory entry itself, so a
+** tree costs one call per directory instead of one stat per file; NTFS may
+** refresh an entry's size and time only once a writer closes the file.
+** Entries that vanish between listing and stat are left out.
 */
 static int l_util_list_dir(lua_State *L) {
     size_t path_len;
@@ -1252,6 +1282,7 @@ static int l_util_list_dir(lua_State *L) {
     luaL_argcheck(L, path_len > 0 && !memchr(path, 0, path_len), 1, "invalid path");
     lua_Integer limit = luaL_optinteger(L, 2, INT_MAX);
     luaL_argcheck(L, limit > 0 && limit <= INT_MAX, 2, "invalid entry limit");
+    int with_stat = lua_toboolean(L, 3);
     int truncated = 0;
     int count = 0;
     lua_newtable(L);
@@ -1277,6 +1308,10 @@ static int l_util_list_dir(lua_State *L) {
         lua_setfield(L, -2, "name");
         lua_pushboolean(L, (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
         lua_setfield(L, -2, "dir");
+        if (with_stat)
+            push_stat_fields(L, attr_kind(fd.dwFileAttributes),
+                             (lua_Integer)(((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow),
+                             filetime_to_unix(fd.ftLastWriteTime));
         lua_rawseti(L, -2, ++count);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
@@ -1295,16 +1330,23 @@ static int l_util_list_dir(lua_State *L) {
         if (count >= limit) { truncated = 1; break; }
 
         int is_dir = 0;
+        struct stat st;
+        int have_st = 0;
+        if (with_stat) {
+            if (fstatat(dirfd(dp), name, &st, AT_SYMLINK_NOFOLLOW) != 0) continue;
+            have_st = 1;
+            is_dir = S_ISDIR(st.st_mode);
+        } else {
 #ifdef DT_DIR
-        if (ent->d_type == DT_DIR)      is_dir = 1;
-        else if (ent->d_type != DT_UNKNOWN) is_dir = 0;
-        else
+            if (ent->d_type == DT_DIR)      is_dir = 1;
+            else if (ent->d_type != DT_UNKNOWN) is_dir = 0;
+            else
 #endif
-        {
-            char *full = path_join_dup(path, name);
-            struct stat st;
-            if (full && lstat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
-            free(full);
+            {
+                char *full = path_join_dup(path, name);
+                if (full && lstat(full, &st) == 0) is_dir = S_ISDIR(st.st_mode);
+                free(full);
+            }
         }
 
         lua_newtable(L);
@@ -1312,6 +1354,8 @@ static int l_util_list_dir(lua_State *L) {
         lua_setfield(L, -2, "name");
         lua_pushboolean(L, is_dir);
         lua_setfield(L, -2, "dir");
+        if (have_st)
+            push_stat_fields(L, mode_kind(st.st_mode), (lua_Integer)st.st_size, (lua_Integer)st.st_mtime);
         lua_rawseti(L, -2, ++count);
     }
     closedir(dp);
@@ -1336,11 +1380,9 @@ static int l_util_stat(lua_State *L) {
         if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) exists = 0;
         else { lua_pushnil(L); lua_pushfstring(L, "cannot stat %s (error %d)", path, (int)e); return 2; }
     } else {
-        kind = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? "link" :
-               (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "directory" : "file";
+        kind = attr_kind(data.dwFileAttributes);
         size = (lua_Integer)(((uint64_t)data.nFileSizeHigh << 32) | data.nFileSizeLow);
-        uint64_t ticks = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32) | data.ftLastWriteTime.dwLowDateTime;
-        mtime = (lua_Integer)(ticks / 10000000ULL) - 11644473600LL;
+        mtime = filetime_to_unix(data.ftLastWriteTime);
     }
 #else
     struct stat st;
@@ -1349,17 +1391,13 @@ static int l_util_stat(lua_State *L) {
         if (e == ENOENT || e == ENOTDIR) exists = 0;
         else { lua_pushnil(L); lua_pushfstring(L, "cannot stat %s: %s", path, strerror(e)); return 2; }
     } else {
-        kind = S_ISLNK(st.st_mode) ? "link" : S_ISDIR(st.st_mode) ? "directory" : S_ISREG(st.st_mode) ? "file" : "other";
+        kind = mode_kind(st.st_mode);
         size = (lua_Integer)st.st_size; mtime = (lua_Integer)st.st_mtime;
     }
 #endif
     lua_newtable(L);
     lua_pushboolean(L, exists); lua_setfield(L, -2, "exists");
-    if (exists) {
-        lua_pushstring(L, kind); lua_setfield(L, -2, "type");
-        lua_pushinteger(L, size); lua_setfield(L, -2, "size");
-        lua_pushinteger(L, mtime); lua_setfield(L, -2, "mtime");
-    }
+    if (exists) push_stat_fields(L, kind, size, mtime);
     return 1;
 }
 

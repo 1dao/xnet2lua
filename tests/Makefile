@@ -134,7 +134,9 @@ LUA_UNIT_SCRIPTS := \
 	tests/lua/xagent_skills_spec.lua \
 	tests/lua/xagent_mcp_spec.lua \
 	tests/lua/xagent_complete_spec.lua \
-	tests/lua/xscan_spec.lua
+	tests/lua/xscan_spec.lua \
+	tests/lua/xutils_filesystem_spec.lua \
+	tests/lua/xwatch_spec.lua
 
 LUA_TEST_CORE_SCRIPTS := \
 	demo/xutils_main.lua \

@@ -21,6 +21,7 @@
 10A. [xcompress 模块——压缩与校验和](#10a-xcompress-模块压缩与校验和)
 10B. [xrecord 模块——通用紧凑记录池](#10b-xrecord-模块通用紧凑记录池)
 10C. [xscan 模块——可配置词法器](#10c-xscan-模块可配置词法器)
+10D. [xwatch 模块——目录树变更通知](#10d-xwatch-模块目录树变更通知)
 11. [配置文件](#11-配置文件)
 12. [线程 ID 常量表](#12-线程-id-常量表)
 13. [完整示例：TCP 服务器](#13-完整示例tcp-服务器)
@@ -1048,6 +1049,7 @@ end
 
 ```lua
 local entries, err = xutils.list_dir("tmp/")   -- 只列一层：{ {name=, dir=}, ... }
+local entries      = xutils.list_dir("src", nil, true)  -- 每项再带 type/size/mtime（同 stat）
 local ok, err      = xutils.mkdir_p("a/b/c")   -- 自动建父目录；已存在算成功
 local ok, err      = xutils.rmtree("a")        -- 递归删除；路径不存在算成功
 ```
@@ -1055,6 +1057,9 @@ local ok, err      = xutils.rmtree("a")        -- 递归删除；路径不存在
 `list_dir` 是 `scan_dir` 的非递归版本——后者不限深度地往下走，因此不能对着任何
 可能含有大目录树的路径使用。`rmtree` 遇到符号链接是删掉它而不是跟进去，并且在
 Windows 上会先清掉只读属性：git 的松散对象是只读的，`DeleteFile` 拒绝这类文件。
+`list_dir` 的第三个参数为 `true` 时，Windows 直接从目录项里取大小和修改时间，
+统计整棵树只需每个目录调用一次，而不是每个文件一次 `stat`；NTFS 可能要等写入方
+关闭文件后才更新目录项里的这两个值。
 
 这三个替换掉的是 `mkdir -p`、`rm -rf` / `rmdir /s /q` 和 `find -delete` / `del /q`：
 一次系统调用起一个进程、每个平台一种拼法、还要把调用方给的路径塞进引号层。
@@ -1949,6 +1954,34 @@ token 种类：`id` `kw` `op` `str` `num` `dir`（预处理行，含 `\` 续行�
 - 不配对的闭括号保持未配对，不会让后续所有配对错位。
 
 lang 对象和 token 表都只属于当前线程的 Lua state，不能跨线程传递。单测见 `tests/lua/xscan_spec.lua`。
+
+---
+
+## 10D. xwatch 模块——目录树变更通知
+
+`xwatch` 监视一整棵目录树，告诉调用方自上次读取以来哪些路径变了，从而不必反复全量扫描。读取是非阻塞的，不需要接入事件循环：
+
+```lua
+local w, err = xwatch.open(root, { skip_hidden = true })   -- 失败返回 nil, err
+local paths, structural, overflow = w:read()     -- 立即返回；w:read(200) 最多等 200ms
+w:close()                                         -- __gc 也会关闭
+```
+
+| 返回值 | 含义 |
+|---|---|
+| `paths` | 变动路径数组，相对 `root`，分隔符为 `/`，可能重复 |
+| `structural` | 有新建、删除或重命名时为 `true`；目录事件只报目录本身，不展开其下文件 |
+| `overflow` | 系统丢了事件，调用方必须全量重扫 |
+
+出错时 `read` 返回 `nil, err`（例如根目录被删除或移走），此后该对象不可再用，关闭后全量重扫。
+
+| 平台 | `xwatch.backend` | 实现与限制 |
+|---|---|---|
+| Windows | `win32` | `ReadDirectoryChangesW` 递归监视；内核缓冲 1 MiB（网络共享 64 KiB），溢出即 `overflow` |
+| Linux / Android | `inotify` | 每个目录一个 watch，新目录出现时自动补上；受 `fs.inotify.max_user_watches` 限制，超限时 `open` 失败。`skip_hidden` 不监视以 `.` 开头的目录（如 `.git`） |
+| macOS | `fsevents` | FSEvents 文件级事件，回调在私有 GCD 队列上；需要链接 CoreServices |
+
+没有后端的平台（如 iOS）上 `xwatch.open` 为 `nil`。`skip_hidden` 只在 inotify 上节省 watch，其他平台仍会报告隐藏路径，调用方需要自行过滤。监视器只属于创建它的线程的 Lua state。单测见 `tests/lua/xwatch_spec.lua`。
 
 ---
 

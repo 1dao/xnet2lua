@@ -133,6 +133,8 @@ else
 	SYS_LDFLAGS += -lpthread -lm
 ifeq ($(shell uname -s),Darwin)
 	SYS_LDFLAGS += -liconv
+	# xwatch uses FSEvents.
+	SYS_LDFLAGS += -framework CoreServices
 	# LuaJIT's own Makefile refuses to build on macOS without a deployment target.
 	LUAJIT_MAKE_ENV := MACOSX_DEPLOYMENT_TARGET=$${MACOSX_DEPLOYMENT_TARGET:-11.0}
 endif
@@ -164,7 +166,7 @@ else
 endif
 XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) $(XNET_CPU_FEATURES_SRC)
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
-XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c xlua/lua_xshared.c xlua/lua_xrecord.c xlua/lua_xscan.c
+XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c xlua/lua_xshared.c xlua/lua_xrecord.c xlua/lua_xscan.c xlua/lua_xwatch.c
 ifeq ($(WITH_XPROC),1)
 	XNET_LUA_SRC += xlua/lua_xproc.c
 endif

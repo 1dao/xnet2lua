@@ -21,6 +21,7 @@ Positioning: A high-performance asynchronous networking framework; Lua bindings 
 10A. xcompress Module — Compression and Checksums
 10B. xrecord Module — Schema-Defined Compact Record Pools
 10C. xscan Module — Configurable Tokenizer
+10D. xwatch Module — Directory Tree Change Notification
 11. Configuration Files  
 12. Thread ID Constants  
 13. Complete Example: TCP Server  
@@ -1071,6 +1072,7 @@ end
 
 ```lua
 local entries, err = xutils.list_dir("tmp/")   -- ONE level: { {name=, dir=}, ... }
+local entries      = xutils.list_dir("src", nil, true)  -- plus type/size/mtime per entry, as stat
 local ok, err      = xutils.mkdir_p("a/b/c")   -- creates parents; existing is ok
 local ok, err      = xutils.rmtree("a")        -- recursive; missing path is ok
 ```
@@ -1079,7 +1081,10 @@ local ok, err      = xutils.rmtree("a")        -- recursive; missing path is ok
 no depth limit and so cannot be pointed at anything that might contain a large
 tree. `rmtree` removes symlinks rather than following them, and clears the
 read-only attribute on Windows — git leaves loose objects read-only, and
-`DeleteFile` refuses those.
+`DeleteFile` refuses those. With `true` as its third argument `list_dir` adds
+`stat`'s fields; Windows reads them from the directory entry, so stat-ing a tree
+costs one call per directory rather than one `stat` per file (NTFS may update an
+entry's size and time only once a writer closes the file).
 
 These replace `mkdir -p`, `rm -rf` / `rmdir /s /q` and `find -delete` / `del /q`:
 a process per syscall, a different spelling per platform, and a caller-supplied
@@ -1998,6 +2003,34 @@ Token kinds: `id` `kw` `op` `str` `num` `dir` (preprocessor line, `\` continuati
 - An unbalanced closing bracket stays unmatched instead of shifting every later pair.
 
 Lang objects and token tables belong to the current thread's Lua state and must not cross threads. Unit specs: `tests/lua/xscan_spec.lua`.
+
+---
+
+## 10D. xwatch Module — Directory Tree Change Notification
+
+`xwatch` watches a whole directory tree and tells the caller which paths changed since the last read, so the tree need not be rescanned. Reads never block unless asked to and need no event loop:
+
+```lua
+local w, err = xwatch.open(root, { skip_hidden = true })   -- nil, err on failure
+local paths, structural, overflow = w:read()     -- returns at once; w:read(200) waits up to 200 ms
+w:close()                                         -- __gc closes it too
+```
+
+| Result | Meaning |
+|---|---|
+| `paths` | Changed paths relative to `root`, `/`-separated; one may repeat |
+| `structural` | `true` when anything was created, removed or renamed; a directory event names only the directory, not the files below it |
+| `overflow` | The OS dropped events; the caller must rescan everything |
+
+On error `read` returns `nil, err` (for example when the root is removed or moved); the watcher is then unusable: close it and rescan.
+
+| Platform | `xwatch.backend` | Implementation and limits |
+|---|---|---|
+| Windows | `win32` | Recursive `ReadDirectoryChangesW`; 1 MiB kernel buffer (64 KiB on network shares); overflowing it reports `overflow` |
+| Linux / Android | `inotify` | One watch per directory, added as directories appear; bounded by `fs.inotify.max_user_watches`, and `open` fails when the tree needs more. `skip_hidden` leaves directories starting with `.` (such as `.git`) unwatched |
+| macOS | `fsevents` | FSEvents file-level events on a private GCD queue; links CoreServices |
+
+Where there is no backend (iOS, for one) `xwatch.open` is `nil`. `skip_hidden` only saves inotify watches; other platforms still report hidden paths, so callers filter them. A watcher belongs to the Lua state of the thread that created it. Unit specs: `tests/lua/xwatch_spec.lua`.
 
 ---
 
