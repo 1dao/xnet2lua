@@ -6,6 +6,7 @@
 **   xutils.json_unpack(text)  -> Lua value
 **   xutils.json_null          -> sentinel for JSON null
 **   xutils.json_array_mt      -> metatable marking a table as a JSON array
+**   xutils.stdout_binary()    -> true | nil,err (disable Windows CRLF translation)
 **   xutils.load_config(path)  -> true | false,err
 **   xutils.get_config(key[, default]) -> value | default | nil
 **   xutils.get_int(key[, default])    -> integer | nil   (default: integer)
@@ -51,6 +52,8 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <io.h>
+#include <fcntl.h>
 #else
 #include <dirent.h>
 #include <sys/stat.h>
@@ -1812,6 +1815,16 @@ static int l_util_temp_file(lua_State *L) {
     return 1;
 }
 
+static int l_util_stdout_binary(lua_State *L) {
+#ifdef _WIN32
+    if (fflush(stdout) != 0 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
+        lua_pushnil(L); lua_pushstring(L, "cannot switch stdout to binary mode"); return 2;
+    }
+#endif
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 /* Poll redirected stdin without blocking the network/protocol event loop.
 ** Returns bytes, empty string when idle, or nil + "eof" / error. */
 static int l_util_read_stdin(lua_State *L) {
@@ -2133,6 +2146,7 @@ static int l_util_to_utf8(lua_State *L) {
 static const luaL_Reg xutils_funcs[] = {
     { "to_utf8", l_util_to_utf8 },
     { "read_stdin",   l_util_read_stdin },
+    { "stdout_binary", l_util_stdout_binary },
     { "random_bytes", l_util_random_bytes },
     { "realpath",     l_util_realpath },
     { "replace_file", l_util_replace_file },
