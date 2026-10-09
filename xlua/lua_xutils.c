@@ -7,6 +7,7 @@
 **   xutils.json_null          -> sentinel for JSON null
 **   xutils.json_array_mt      -> metatable marking a table as a JSON array
 **   xutils.stdout_binary()    -> true | nil,err (disable Windows CRLF translation)
+**   xutils.cpu_count()        -> integer >= 1 (system online logical CPUs; ignores affinity and CPU quotas)
 **   xutils.load_config(path)  -> true | false,err
 **   xutils.get_config(key[, default]) -> value | default | nil
 **   xutils.get_int(key[, default])    -> integer | nil   (default: integer)
@@ -1825,6 +1826,31 @@ static int l_util_stdout_binary(lua_State *L) {
     return 1;
 }
 
+/* System online logical CPU count, at least 1 (also on query failure).
+** Ignores process/thread affinity, container cpusets and CPU quotas.
+** Cloud-server CPU limits are not accounted for; callers should separately
+** check their instance limits, cgroup quotas and cloud-provider restrictions.
+** This is a system capacity hint, not the CPU budget available to the caller.
+** Windows counts all processor groups when targeting Windows 7 or later;
+** the legacy GetSystemInfo fallback reports only the current group. */
+static int l_util_cpu_count(lua_State *L) {
+    long n = 0;
+#ifdef _WIN32
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0601
+    n = (long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+#endif
+    if (n <= 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        n = (long)si.dwNumberOfProcessors;
+    }
+#else
+    n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    lua_pushinteger(L, n > 0 ? (lua_Integer)n : 1);
+    return 1;
+}
+
 /* Poll redirected stdin without blocking the network/protocol event loop.
 ** Returns bytes, empty string when idle, or nil + "eof" / error. */
 static int l_util_read_stdin(lua_State *L) {
@@ -2147,6 +2173,7 @@ static const luaL_Reg xutils_funcs[] = {
     { "to_utf8", l_util_to_utf8 },
     { "read_stdin",   l_util_read_stdin },
     { "stdout_binary", l_util_stdout_binary },
+    { "cpu_count",    l_util_cpu_count },
     { "random_bytes", l_util_random_bytes },
     { "realpath",     l_util_realpath },
     { "replace_file", l_util_replace_file },
