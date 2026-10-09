@@ -28,6 +28,7 @@
 - JSON 空数组经 `json_unpack` / `json_pack` 往返后保持为 `[]`。
 - xtimer 回调在 VM 主协程上执行，而不是在设置定时器的协程上。
 - 关闭的连接释放其 channel，不再泄漏；补充对应测试。
+- xpoll 分发事件时，回调关闭的 fd 若立即被新 socket 复用，且 malloc 把同一地址分给新的登记，旧 fd 余下的事件会落到新 socket 上：失败连接的错误会关掉在其 `on_close` 中打开的监听 socket。登记现在带代数，分发途中按指针和代数一起确认；补充 `tests/lua/xpoll_fd_reuse_test.lua`。Linux（epoll、glibc malloc）上可稳定复现。
 - xscan 正确处理控制条件后的正则、嵌套注释与续行。
 - LuaJIT 下在协程内创建的定时器与连接回调到已回收的协程导致崩溃：5.1 没有 `LUA_RIDX_MAINTHREAD`，运行时现在记录主线程供 `main_lua_state` 使用。
 - `build.bat` 运行 Lua 测试时 `==>` 被解析为重定向，每次都会把第一个测试脚本覆盖成一行日志。

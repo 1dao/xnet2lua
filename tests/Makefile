@@ -152,6 +152,7 @@ LUA_TEST_CORE_SCRIPTS := \
 	demo/xrecord_main.lua \
 	tests/lua/xshared_race_test.lua \
 	tests/lua/conn_close_leak_test.lua \
+	tests/lua/xpoll_fd_reuse_test.lua \
 	tests/lua/timer_coroutine_test.lua
 
 ifeq ($(WITH_XPROC),1)

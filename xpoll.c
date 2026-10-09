@@ -58,6 +58,7 @@ typedef struct xPoolFD {
     SOCKET_T    fd;
     int         mask;         /* active XPOLL_* flags                     */
     int         idx;          /* poll/WSAPoll compact slot, others = -1   */
+    unsigned    gen;          /* registration generation, see _fe_get_same */
     xFileProc   rfileProc;
     xFileProc   wfileProc;
     xFileProc   efileProc;
@@ -87,6 +88,7 @@ struct xPollState {
     int         setsize;      /* current backend buffer capacity          */
     int         nfds;         /* number of currently registered fds       */
     int         maxfd;        /* highest fd value seen                    */
+    unsigned    next_gen;     /* generation of the next xPoolFD created   */
     void       *ud;           /* user data                                */
 
 #if defined(XPOLL_BACKEND_EPOLL)
@@ -336,10 +338,14 @@ static xPoolFD* _fe_get(xPollState *loop, SOCKET_T fd) {
 
 /* During callback dispatch, handlers may delete/recreate the same fd.
  * Ensure we only continue dispatching if the exact same entry is still alive.
+ * The pointer alone is not enough: a handler that closes the fd and registers
+ * a new socket gets the lowest free fd (the same number) and, from malloc, a
+ * new entry at the freed address; the old events (say a failed connect's
+ * error) would then reach the new socket. The generation tells them apart.
  */
-static xPoolFD* _fe_get_same(xPollState *loop, SOCKET_T fd, xPoolFD *expect) {
+static xPoolFD* _fe_get_same(xPollState *loop, SOCKET_T fd, xPoolFD *expect, unsigned gen) {
     xPoolFD *fe = _fe_get(loop, fd);
-    if (!fe || fe != expect || fe->mask == XPOLL_NONE) return NULL;
+    if (!fe || fe != expect || fe->gen != gen || fe->mask == XPOLL_NONE) return NULL;
     return fe;
 }
 
@@ -347,6 +353,7 @@ static xPoolFD* _fe_create(xPollState *loop, SOCKET_T fd) {
     xPoolFD *fe = (xPoolFD*)malloc(sizeof(xPoolFD));
     if (!fe) return NULL;
     _fe_init(fe, fd);
+    fe->gen = ++loop->next_gen;
     if (!xhash_set_int(loop->fd_map, _fd_key(fd), fe)) {
         free(fe);
         return NULL;
@@ -858,17 +865,18 @@ int wait_ms = timeout_ms;
         if (e->events & EPOLLERR)                 mask |= XPOLL_ERROR | XPOLL_CLOSE;
 
         SOCKET_T fd = fe->fd;
+        unsigned gen = fe->gen;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
             fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, sfd, fe);
+        fe = _fe_get_same(loop, sfd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
             fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, sfd, fe);
+        fe = _fe_get_same(loop, sfd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
@@ -917,17 +925,18 @@ int wait_ms = timeout_ms;
         if (ke->flags  & EV_ERROR)       mask |= XPOLL_ERROR;
 
         SOCKET_T fd = fe->fd;
+        unsigned gen = fe->gen;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
             fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, sfd, fe);
+        fe = _fe_get_same(loop, sfd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
             fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, sfd, fe);
+        fe = _fe_get_same(loop, sfd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
@@ -985,17 +994,18 @@ int wait_ms = timeout_ms;
         if (!fe) continue;
 
         SOCKET_T  fd = fe->fd;
+        unsigned  gen = fe->gen;
 
         if ((mask & XPOLL_WRITABLE) && fe->wfileProc)
             fe->wfileProc(fd, XPOLL_WRITABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, fd, fe);
+        fe = _fe_get_same(loop, fd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & XPOLL_READABLE) && fe->rfileProc)
             fe->rfileProc(fd, XPOLL_READABLE, fe->clientData, NULL);
 
-        fe = _fe_get_same(loop, fd, fe);
+        fe = _fe_get_same(loop, fd, fe, gen);
         if (!fe) { num_processed++; continue; }
 
         if ((mask & (XPOLL_ERROR | XPOLL_CLOSE)) && fe->efileProc) {
