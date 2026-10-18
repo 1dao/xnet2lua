@@ -1138,6 +1138,141 @@ static int l_idents(lua_State* L) {
     return 1;
 }
 
+/* Conservative dispatch syntax hints. No binding or scope resolution. Indices
+ * below are zero based; raw bracket matches remain one based. */
+static int xs_eq(const XsRaw* t, int i, const char* s) {
+    size_t n = strlen(s);
+    return i >= 0 && i < t->n && t->e[i] - t->s[i] + 1 == (int)n
+        && memcmp(t->src + t->s[i] - 1, s, n) == 0;
+}
+
+static int xs_id(const XsRaw* t, int i) {
+    return i >= 0 && i < t->n && t->k[i] == K_ID;
+}
+
+static void xs_name(lua_State* L, const XsRaw* t, int i) {
+    lua_pushlstring(L, t->src + t->s[i] - 1, (size_t)(t->e[i] - t->s[i] + 1));
+}
+
+static void xs_set_name(lua_State* L, const XsRaw* t, int table, int i) {
+    xs_name(L, t, i); lua_pushboolean(L, 1); lua_rawset(L, table);
+}
+
+static int xs_has_name(lua_State* L, const XsRaw* t, int table, int i) {
+    xs_name(L, t, i); lua_rawget(L, table);
+    int found = lua_toboolean(L, -1); lua_pop(L, 1); return found;
+}
+
+static void xs_checkpoint(lua_State* L, int i) {
+    if ((i + 1) % 4096 == 0 && lua_isfunction(L, 3)) {
+        lua_pushvalue(L, 3); lua_call(L, 0, 0);
+    }
+}
+
+/* Push a simple assignment key; ignore escaped or nonliteral keys. */
+static int xs_dispatch_key(lua_State* L, const XsRaw* t, int i) {
+    if (xs_id(t, i) && xs_eq(t, i + 1, "=") && !xs_eq(t, i + 2, "function")) {
+        xs_name(L, t, i); return 1;
+    }
+    if (xs_eq(t, i, "[") && t->m[i] == i + 3 && xs_eq(t, i + 3, "=")
+        && !xs_eq(t, i + 4, "function") && t->k[i + 1] == K_STR) {
+        const char* s = t->src + t->s[i + 1] - 1;
+        int n = t->e[i + 1] - t->s[i + 1] + 1;
+        if (n >= 2 && (s[0] == '\'' || s[0] == '"') && s[n - 1] == s[0]
+            && !memchr(s, '\\', (size_t)n)) {
+            lua_pushlstring(L, s + 1, (size_t)n - 2); return 1;
+        }
+    }
+    return 0;
+}
+
+static void xs_record_key(lua_State* L, const XsRaw* t, int keys, int recv, int i) {
+    if (!xs_dispatch_key(L, t, i)) return;
+    int key = lua_gettop(L);
+    xs_name(L, t, recv); lua_rawget(L, keys);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1); lua_newtable(L);
+        xs_name(L, t, recv); lua_pushvalue(L, -2); lua_rawset(L, keys);
+    }
+    lua_pushvalue(L, key); lua_pushboolean(L, 1); lua_rawset(L, -3);
+    lua_pop(L, 2);
+}
+
+/* T:dispatch_hints(is_lua, checkpoint) -> targets, keys, declared, untracked,
+ * or nil for a syntactic negative. Lua attaches existing reference positions. */
+static int l_dispatch_hints(lua_State* L) {
+    XsRaw* t = xs_self(L);
+    int is_lua = lua_toboolean(L, 2), candidate = 0, untracked = 0;
+    lua_settop(L, 3);
+    for (int i = 0; i < t->n; i++) {
+        xs_checkpoint(L, i);
+        if (t->k[i] != K_OP) continue;
+        if ((!is_lua && xs_eq(t, i, "*") && xs_eq(t, i - 1, "("))
+            || (is_lua && xs_eq(t, i, "=") && xs_id(t, i + 1)
+                && (xs_eq(t, i - 1, "]") || (xs_id(t, i - 1)
+                    && (xs_eq(t, i - 2, ".") || xs_eq(t, i - 2, "{")
+                        || xs_eq(t, i - 2, ",") || xs_eq(t, i - 2, ";")))))) {
+            candidate = 1; break;
+        }
+    }
+    if (!candidate) { lua_pushnil(L); return 1; }
+    lua_newtable(L); int declared = lua_gettop(L);
+    lua_newtable(L); int called = lua_gettop(L);
+    for (int i = 0; i < t->n; i++) {
+        xs_checkpoint(L, i);
+        if (is_lua) {
+            if (t->k[i] == K_KW && xs_eq(t, i, "local")) {
+                for (int j = i + 1; xs_id(t, j); j += 2) {
+                    if (xs_eq(t, j + 1, "=") && xs_eq(t, j + 2, "{")) xs_set_name(L, t, declared, j);
+                    if (!xs_eq(t, j + 1, ",")) break;
+                }
+            } else if (xs_id(t, i)) {
+                int tail = -1;
+                if (xs_eq(t, i + 1, ".") && xs_id(t, i + 2)) tail = i + 3;
+                else if (xs_eq(t, i + 1, "[") && t->m[i + 1]) tail = t->m[i + 1];
+                if (xs_eq(t, tail, "(")) xs_set_name(L, t, called, i);
+            }
+        } else if (t->k[i] == K_KW && (xs_eq(t, i, "struct") || xs_eq(t, i, "class"))
+            && xs_id(t, i + 1) && xs_eq(t, i + 2, "{") && t->m[i + 2]) {
+            for (int j = i + 3; j < t->m[i + 2] - 1; j++) {
+                xs_checkpoint(L, j);
+                if (xs_id(t, j) && xs_eq(t, j - 1, "*") && xs_eq(t, j - 2, "(")
+                    && xs_eq(t, j + 1, ")") && xs_eq(t, j + 2, "(")) xs_set_name(L, t, declared, j);
+            }
+        } else if (xs_id(t, i) && (xs_eq(t, i - 1, ".") || xs_eq(t, i - 1, "->"))
+            && (xs_eq(t, i + 1, "(") || (xs_eq(t, i + 1, ")") && xs_eq(t, i + 2, "(")))) {
+            xs_set_name(L, t, called, i);
+        }
+    }
+    candidate = 0; lua_pushnil(L);
+    while (lua_next(L, declared)) {
+        lua_pushvalue(L, -2); lua_rawget(L, called);
+        candidate |= lua_toboolean(L, -1); lua_pop(L, 2);
+    }
+    if (!candidate) { lua_pushnil(L); return 1; }
+    lua_newtable(L); int targets = lua_gettop(L);
+    lua_newtable(L); int keys = lua_gettop(L);
+    for (int i = 0; i < t->n; i++) {
+        xs_checkpoint(L, i);
+        if (!xs_id(t, i)) continue;
+        if (xs_eq(t, i - 1, "=") || (!is_lua && (xs_eq(t, i - 1, "&")
+            || xs_eq(t, i - 1, ",") || xs_eq(t, i - 1, "{")))) xs_set_name(L, t, targets, i);
+        if (!xs_has_name(L, t, declared, i)) continue;
+        if (is_lua) {
+            if (xs_eq(t, i + 1, "[") && t->m[i + 1] && xs_eq(t, t->m[i + 1], "(")) untracked = 1;
+            if (xs_eq(t, i + 1, "=") && xs_eq(t, i + 2, "{") && t->m[i + 2]) {
+                for (int j = i + 3; j < t->m[i + 2] - 1; j++) {
+                    xs_checkpoint(L, j); xs_record_key(L, t, keys, i, j);
+                }
+            } else if (xs_eq(t, i + 1, ".")) xs_record_key(L, t, keys, i, i + 2);
+            else if (xs_eq(t, i + 1, "[")) xs_record_key(L, t, keys, i, i + 1);
+        } else if ((xs_eq(t, i - 1, ".") || xs_eq(t, i - 1, "->"))
+            && xs_eq(t, i + 1, ")") && xs_eq(t, i + 2, "(")) untracked = 1;
+    }
+    lua_pushvalue(L, targets); lua_pushvalue(L, keys); lua_pushvalue(L, declared);
+    lua_pushboolean(L, untracked); return 4;
+}
+
 static const luaL_Reg lang_methods[] = {
     { "tokenize", l_tokenize },
     { NULL, NULL }
@@ -1152,6 +1287,7 @@ static const luaL_Reg token_methods[] = {
     { "is",     l_is },
     { "calls",  l_calls },
     { "idents", l_idents },
+    { "dispatch_hints", l_dispatch_hints },
     { NULL, NULL }
 };
 
