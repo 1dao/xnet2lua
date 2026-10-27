@@ -58,14 +58,16 @@ typedef struct LuaNetListener {
     bool closed;
 } LuaNetListener;
 
-static int g_socket_started = 0;
-
-/* Per-thread stats accumulators (updated on connection close). */
+/* xpoll and xnet.init/uninit belong to each thread. Balance each thread's
+** socket_init/socket_cleanup too: one worker must not tear down Winsock while
+** the main loop and other workers still own live sockets. */
 #ifdef _MSC_VER
+static __declspec(thread) int      g_socket_started = 0;
 static __declspec(thread) int      g_conn_count   = 0;
 static __declspec(thread) uint64_t g_acc_sent     = 0;
 static __declspec(thread) uint64_t g_acc_recv     = 0;
 #else
+static __thread int      g_socket_started = 0;
 static __thread int      g_conn_count   = 0;
 static __thread uint64_t g_acc_sent     = 0;
 static __thread uint64_t g_acc_recv     = 0;
