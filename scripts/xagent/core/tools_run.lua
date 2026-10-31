@@ -24,6 +24,7 @@ end
 function M.run(content_blocks, ctx, on_event)
     local function emit(ev) if on_event then on_event(ev) end end
     local results = {}
+    local function cancelled() return ctx and ctx.should_stop and ctx.should_stop() end
 
     for _, block in ipairs(content_blocks) do
         if block.type == 'tool_use' then
@@ -32,7 +33,9 @@ function M.run(content_blocks, ctx, on_event)
 
             local tool = registry.find(block.name)
             local res
-            if type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
+            if cancelled() then
+                res = { content = 'Error: task cancelled by the user; tool was not executed.', is_error = true }
+            elseif type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
                 -- The streamed tool arguments did not arrive as valid JSON, so we
                 -- never got real fields. Surface the actual parse error (with the
                 -- byte position) so the model can fix its arguments — NOT a
@@ -49,7 +52,12 @@ function M.run(content_blocks, ctx, on_event)
                 res = { content = 'Error: 用户拒绝执行该工具调用（询问模式）', is_error = true }
             else
                 -- auto-allow all tools when "write" mode.
-                local ok, r = pcall(tool.call, input, ctx)
+                local ok, r
+                if cancelled() then
+                    ok, r = true, { content = 'Error: task cancelled by the user; tool was not executed.', is_error = true }
+                else
+                    ok, r = pcall(tool.call, input, ctx)
+                end
                 if ok and type(r) == 'table' then
                     res = r
                 elseif ok then

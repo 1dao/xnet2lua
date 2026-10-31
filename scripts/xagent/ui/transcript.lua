@@ -374,7 +374,7 @@ function View:draw(entries, x, y, w, h)
         local r = row_at(i)
         if r.copy then
             if r.copy == hover_entry and ly >= y - self.line_h then
-                if rg.button(x + pad, ly, 52, self.line_h - 2, '复制') and self.on_copy then
+                if rg.button(x + pad, ly, 28, self.line_h - 2, '#16#') and self.on_copy then
                     self.on_copy(r.copy)
                 end
             end

@@ -32,7 +32,8 @@ raygui.TEXT_ALIGN_RIGHT = 2
 ---@param width integer
 ---@param height integer
 ---@param title string
-function raygui.init(width, height, title) end
+---@param options? {undecorated?: boolean, desktop_maximize?: boolean} desktop_maximize avoids exclusive-fullscreen detection for borderless maximized windows on Windows.
+function raygui.init(width, height, title, options) end
 
 ---Closes the raylib window created by raygui.init().
 function raygui.close() end
@@ -182,5 +183,53 @@ function raygui.set_style(control, property, value) end
 ---@param charset? string
 ---@return boolean ok
 function raygui.load_font(path, fontSize, charset) end
+
+---Loads the platform's UI font; returns false when no suitable font is found.
+---@param font_size integer
+---@param charset? string
+---@return boolean
+function raygui.load_system_font(font_size, charset) end
+
+---@param text string
+---@param font_size? integer
+---@return number width
+---@return number height
+function raygui.measure_text(text, font_size) end
+
+---@param text string
+---@param x number
+---@param y number
+---@param font_size? number
+---@param red? integer
+---@param green? integer
+---@param blue? integer
+---@param alpha? integer
+function raygui.draw_text(text, x, y, font_size, red, green, blue, alpha) end
+
+---@return number x
+---@return number y
+function raygui.window_pos() end
+
+---@param x integer
+---@param y integer
+function raygui.set_window_pos(x, y) end
+
+---@param width integer
+---@param height integer
+function raygui.set_window_size(width, height) end
+
+---@return number x
+---@return number y
+function raygui.mouse_screen() end
+
+function raygui.minimize_window() end
+function raygui.maximize_window() end
+function raygui.restore_window() end
+
+---@return boolean
+function raygui.is_window_maximized() end
+
+---@param cursor integer raylib MouseCursor value
+function raygui.set_mouse_cursor(cursor) end
 
 return raygui

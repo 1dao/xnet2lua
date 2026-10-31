@@ -30,6 +30,8 @@ local fs            = dofile('scripts/core/share/xfs.lua') ---@type xfs
 local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
 local xproxy        = dofile('scripts/core/share/xproxy.lua')
 local api_log       = require('xagent.llm.api_log')
+local user_input    = require('xagent.ui.user_input')
+local surface       = require('xagent.ui.surface')
 
 registry.register(require('xagent.tools.read'))
 registry.register(require('xagent.tools.write'))
@@ -37,12 +39,15 @@ registry.register(require('xagent.tools.edit'))
 registry.register(require('xagent.tools.ls'))
 registry.register(require('xagent.tools.glob'))
 registry.register(require('xagent.tools.grep'))
+
 registry.register(require('xagent.tools.bash'))
 registry.register(require('xagent.tools.multi_edit'))
 registry.register(require('xagent.tools.web_fetch'))
 registry.register(require('xagent.tools.memory_write'))
 registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
+registry.register(require('xagent.tools.ask_user_question'))
+
 
 local skills    = require('xagent.skills')
 local open_url  = require('xagent.ui.open_url')
@@ -67,6 +72,8 @@ end
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local FONT_SIZE = 16
+-- Rasterize above the largest UI heading (26px), then draw at logical sizes.
+local FONT_ATLAS_SIZE = 32
 
 -- Starting per-turn output cap. A bigger cap is free — you only pay for tokens
 -- actually produced — but a TOO-SMALL cap silently breaks big outputs: an
@@ -95,7 +102,7 @@ local function preseed_charset()
     range(0x25A0, 0x25FF)   -- geometric shapes (○ ● ◦ ■ □ ▲ ▶ …)
     range(0x2600, 0x26FF)   -- misc symbols (★ ☆ ☰ ☐ ☑ …; only those in the font load)
     -- specific common symbols outside the ranges above
-    for _, cp in ipairs({ 0x00A0, 0x00B0, 0x00B1, 0x00B7, 0x00D7, 0x00F7,
+    for _, cp in ipairs({ 0x00A0, 0x00B0, 0x00B1, 0x00B7, 0x00D7, 0x00F7, 0x2039, 0x203A,
                           0x00A2, 0x00A3, 0x00A5, 0x00A9, 0x00AE, 0x20AC, 0x2122,
                           0xFE19,            -- ︙ vertical kebab (the font lacks ⋮ U+22EE)
                           0x2713, 0x2714, 0x2705, 0x274C, 0x2714 }) do
@@ -131,10 +138,18 @@ local S = {
     on_copy = nil,             -- copy handler shared by every tab's view
     view_bg = nil,             -- transcript bg from the active theme (new views use it)
     started = false,
-    -- left sidebar: nil | 'history' | 'settings' | 'apilog'
+    -- left sidebar (the ≡ button): nil | 'history' — projects and their sessions
     sidebar = nil,
+    -- right panel (from the ⋮ menu): nil | 'files' | 'model' | 'mcp' | 'apilog' | 'appearance'
+    panel = nil,
     history_items = {},
     history_scroll = 0,        -- pixel scroll offset of the history list
+    history_query = '',        -- history search text (title substring)
+    history_query_edit = false,
+    history_collapsed = false,
+    history_group_open = {},  -- directory key -> explicit expanded/collapsed override
+    files_open = {},           -- dir_key(cwd) -> { [rel_dir] = true } expanded tree nodes
+    files_scroll = 0,          -- pixel scroll of the file tree
     -- API request/response log panel (in-memory, this run only)
     apilog_scroll = 0,         -- pixel scroll of the API-log list
     apilog_selected = nil,     -- the log record whose detail is shown in the main area
@@ -146,7 +161,7 @@ local S = {
     menu_item = nil,           -- history item whose ⋮ menu is open
     menu_y = 0,                -- screen y of that menu
     -- theme
-    theme = 'nord',
+    theme = 'soft',
     header_bg = { 30, 30, 38, 255 },
     sidebar_bg = { 26, 26, 32, 255 },
     picking_dir = false,       -- a folder dialog is currently open
@@ -159,11 +174,11 @@ local S = {
     dir_cache = {},            -- abspath -> immediate children, for the @ picker
 }
 
-local SIDEBAR_W = 290
+local SIDEBAR_W = 300
 local HEADER_H  = 38               -- top bar (title/status/meter/toggles)
-local TABBAR_H  = 32               -- tab strip below the top bar
+local TABBAR_H  = 40               -- tab strip below the top bar
 local TOP       = HEADER_H + TABBAR_H   -- top y of the sidebar / main content
-local THEMES = { 'nord', 'soft', 'candy', 'cyber', 'dark' }
+local THEMES = { 'sand', 'soft', 'candy', 'cyber', 'dark' }
 local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
 -- Last picked working directory, persisted so the NEXT app launch defaults its
 -- initial session to it (mirrors how THEME_FILE persists the color theme).
@@ -171,8 +186,7 @@ local CWD_FILE   = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/cwd'
 
 -- ── color helpers ──────────────────────────────────────────────────────────
 local function unpack_color(v)
-    local floor = math.floor
-    return { floor(v / 0x1000000) % 256, floor(v / 0x10000) % 256, floor(v / 0x100) % 256, v % 256 }
+    return { (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF }
 end
 local function clamp8(x) return math.max(0, math.min(255, math.floor(x + 0.5))) end
 local function shift(c, d) return { clamp8(c[1] + d), clamp8(c[2] + d), clamp8(c[3] + d), c[4] or 255 } end
@@ -233,6 +247,37 @@ local function draw_caret(cx, cy, col, up)
     end
 end
 
+-- Borderless button: its background matches `bg` until hovered / pressed,
+-- when it takes a slightly shifted tint — the toolbar look of the header and
+-- the composer row. raygui has no such style, so the BUTTON colors are swapped
+-- in for this one call and restored after; raygui still owns click and lock
+-- handling (modals freeze it like any other control).
+local FLAT_PROPS
+local function pack_color(c)
+    return (c[1] << 24) | (c[2] << 16) | (c[3] << 8) | (c[4] or 255)
+end
+local function flat_button(x, y, w, h, label, bg, hover_bg)
+    bg = bg or S.view_bg or { 240, 240, 240, 255 }
+    local B = raygui.BUTTON
+    FLAT_PROPS = FLAT_PROPS or {
+        raygui.BORDER_WIDTH,
+        raygui.BASE_COLOR_NORMAL, raygui.BORDER_COLOR_NORMAL,
+        raygui.BASE_COLOR_FOCUSED, raygui.BORDER_COLOR_FOCUSED,
+        raygui.BASE_COLOR_PRESSED, raygui.BORDER_COLOR_PRESSED,
+    }
+    local saved = {}
+    for i, prop in ipairs(FLAT_PROPS) do saved[i] = raygui.get_style(B, prop) end
+    local d = (luma(bg) < 128) and 1 or -1        -- lighten on dark themes, darken on light
+    local base = pack_color(bg)
+    local hover, press = pack_color(shift(bg, 14 * d)), pack_color(shift(bg, 26 * d))
+    if hover_bg then hover, press = pack_color(hover_bg), pack_color(shift(hover_bg, -20)) end
+    local vals = { 0, base, base, hover, hover, press, press }
+    for i, prop in ipairs(FLAT_PROPS) do raygui.set_style(B, prop, vals[i]) end
+    local clicked = raygui.button(x, y, w, h, label)
+    for i, prop in ipairs(FLAT_PROPS) do raygui.set_style(B, prop, saved[i]) end
+    return clicked
+end
+
 -- ── working-directory helpers (history grouping + the editable current dir) ──
 -- Normalized key so "C:\a\b", "c:/a/b/" group together on Windows.
 local function dir_key(d)
@@ -267,12 +312,12 @@ local function utf8_to_utf16le(s)
     local out = {}
     for _, cp in utf8.codes(s) do
         if cp < 0x10000 then
-            out[#out + 1] = string.char(cp % 256, math.floor(cp / 256))
+            out[#out + 1] = string.char(cp % 256, cp // 256)
         else
             local v = cp - 0x10000
-            local hi = 0xD800 + math.floor(v / 0x400)
+            local hi = 0xD800 + v // 0x400
             local lo = 0xDC00 + v % 0x400
-            out[#out + 1] = string.char(hi % 256, math.floor(hi / 256), lo % 256, math.floor(lo / 256))
+            out[#out + 1] = string.char(hi % 256, hi // 256, lo % 256, lo // 256)
         end
     end
     return table.concat(out)
@@ -304,7 +349,7 @@ end
 local function update_thinking(tab)
     -- Waiting for output: busy, nothing streaming yet, not parked on a
     -- permission prompt (that has its own UI).
-    if not (tab.busy and not tab.cur and not tab.pending_confirm) then
+    if not (tab.busy and not tab.cur and not tab.pending_confirm and not tab.pending_input) then
         clear_thinking(tab); return
     end
     local text = 'thinking' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
@@ -327,18 +372,26 @@ local function compact(v)
 end
 
 -- Per-session permission gate handed to the agent (ctx.confirm). In 'write' mode
--- (or for a turn whose session the tab has since replaced) it auto-allows; in
+-- it auto-allows; in
 -- 'ask' mode it parks the agent coroutine on an await until the user clicks
 -- 允许/拒绝. The await lives on the OWNING tab, so a background tab can park its
 -- own confirm (surfaced via a '!' on its tab button) without blocking others.
 -- Runs inside the agent coroutine, so async.await is safe here.
 local function make_confirm(tab, sess)
     return function(req)
+        if sess.cancelled or tab.sess ~= sess then return false end
         if S.mode ~= 'ask' then return true end
-        if tab.sess ~= sess then return true end   -- stale run of a replaced session: don't block
         return async.await(function(resolve)
             tab.pending_confirm = { req = req, resolve = resolve }
         end)
+    end
+end
+
+local function cancel_session(tab)
+    if tab.sess then tab.sess.cancelled = true end
+    user_input.cancel(tab)
+    if tab.pending_confirm then
+        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
     end
 end
 
@@ -412,10 +465,12 @@ local function on_event(tab, ev)
         tab.status = string.format('输出较大，提升上限重试 (%s→%s)',
             tostring(ev.from or '?'), tostring(ev.to or '?'))
     elseif ev.type == 'done' then
-        flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = 'ready'
-        -- This turn's totals over every request it made (tool round-trips too).
+        flush_tail(tab); clear_thinking(tab); tab.busy = false
+        tab.status = ev.stop_reason == 'cancelled' and '已停止' or '完成'
+        -- This turn's totals over every request it made (tool round-trips too);
+        -- the header shows them next to the status until the next turn ends.
         if ev.usage and tokens.total_input_tokens(ev.usage) > 0 then
-            tab.status = 'ready  ·  本轮 ' .. usage_label(ev.usage)
+            tab.last_usage = ev.usage
         end
     elseif ev.type == 'error' then
         flush_tail(tab); clear_thinking(tab); add(tab, 'error', 'ERROR: ' .. tostring(ev.error)); tab.busy = false; tab.status = 'error'
@@ -433,8 +488,11 @@ local function make_on_event(tab, sess)
     end
 end
 
--- Slash commands handled locally (not sent to the model). Returns true if the
--- input was a command (and was consumed).
+-- The desktop UI uses the existing agent prompt without extra MCP instructions.
+local function build_system(cwd)
+    return system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) })
+end
+
 local function handle_slash(text)
     local orig_cmd, rest = text:match('^/(%S+)%s*(.*)$')
     if not orig_cmd then return false end
@@ -535,11 +593,12 @@ end
 local function submit()
     local tab = T()
     if tab.busy or not tab.sess then return end
-    if not tab.cfg or (tab.cfg.auth_type ~= 'chatgpt' and (not tab.cfg.api_key or tab.cfg.api_key == '')) then
+    if not tab.cfg or (not tab.cfg.auth_type and (not tab.cfg.api_key or tab.cfg.api_key == '')) then
         tab.status = '该模型未配置 token'; return
     end
     local text = (tab.input or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if text == '' and #tab.attachments == 0 then return end
+    tab.welcome = false
     if text:sub(1, 1) == '/' and handle_slash(text) then return end
 
     -- With attachments the user turn becomes content BLOCKS: image blocks
@@ -627,6 +686,30 @@ local function sanitize_label(s)
     return s
 end
 
+-- Like sanitize_label, but cut by WIDTH (characters dropped, '…' appended)
+-- until it fits `maxw` pixels in the UI font at `size`, instead of at a fixed
+-- byte count — for text sharing its row with other controls.
+local FIT_MAX_CHARS = 160   -- more than any row can show at the smallest glyph width
+
+local function fit_label(s, maxw, size)
+    s = tostring(s or ''):gsub('[\r\n;]', ' ')
+    local n = utf8.len(s)
+    if not n then s = text.valid_utf8(s); n = utf8.len(s) or #s end
+    -- A session title can be a whole pasted prompt. Measuring it in full —
+    -- once per dropped character, for every row, every frame — froze the
+    -- history list, so long text is pre-cut and the fit is a binary search.
+    local cut = n > FIT_MAX_CHARS
+    if cut then s = s:sub(1, utf8.offset(s, FIT_MAX_CHARS + 1) - 1); n = FIT_MAX_CHARS end
+    if not cut and raygui.measure_text(s, size) <= maxw then return s end
+    local function prefix(k) return s:sub(1, (utf8.offset(s, k + 1) or (#s + 1)) - 1) .. '…' end
+    local lo, hi = 0, n            -- longest prefix whose "prefix…" fits
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        if raygui.measure_text(prefix(mid), size) <= maxw then lo = mid else hi = mid - 1 end
+    end
+    return prefix(lo)
+end
+
 local function refresh_history()   -- reload items; keeps scroll, clears inline modes
     S.history_items = session.list()
     S.renaming = nil
@@ -674,7 +757,7 @@ local function pick_directory()
         local root = IS_WIN and (((T().cwd or ''):match('^%a:') or 'C:') .. '\\') or '/'
         raygui.file_dialog_open(root, 600, 440, true)    -- dirs only
         S.dir_dialog = true
-        T().status = '选择目录…（进入目标目录后点 Select）'
+        T().status = '选择目录…（进入目标目录后点击文件夹确认图标）'
         return
     end
     return pick_directory_ps()
@@ -724,12 +807,19 @@ function pick_directory_ps()
     end
 end
 
--- Toggle a sidebar mode on/off (clicking the active one closes it).
-local function toggle_sidebar(mode)
-    if S.sidebar == mode then S.sidebar = nil; return end
-    if mode == 'history' then refresh_history(); S.history_scroll = 0 end
+-- Toggle the left sidebar (projects + sessions) open/closed.
+local function toggle_sidebar()
+    if S.sidebar then S.sidebar = nil; return end
+    refresh_history(); S.history_scroll = 0
+    S.sidebar = 'history'
+end
+
+-- Open a right-panel page from the ⋮ menu (picking the open one closes it).
+local function toggle_panel(mode)
+    if S.panel == mode then S.panel = nil; return end
     if mode == 'apilog' then S.apilog_scroll = 0; S.apilog_selected = nil end
-    S.sidebar = mode
+    if mode == 'files' then S.files_scroll = 0 end
+    S.panel = mode
 end
 
 -- ── API request/response log panel ─────────────────────────────────────────
@@ -856,20 +946,21 @@ local function load_history_item(it)
     local tab = T()
     local s2 = session.load(it.path, { cfg = tab.cfg })
     if not s2 then tab.status = 'load failed'; return end
-    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    cancel_session(tab)
     s2.tools = registry.to_api_params()
-    s2.system = system_prompt.build({ cwd = s2.cwd, project_md = project_md.load(s2.cwd) })
+    s2.system = build_system(s2.cwd)
     s2.max_tokens = MAX_TOKENS
     s2.confirm = make_confirm(tab, s2)
+    s2.request_user_input = user_input.bind(tab, s2)
     tab.sess = s2
     tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
     tab.entries = rebuild_entries(s2.messages)
+    tab.welcome = false
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                              -- meter restarts on the next turn
     tab.pending_confirm = nil
     S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
     clear_attachments(tab)
-    S.sidebar = nil
     tab.status = 'resumed (' .. #s2.messages .. ' msgs)'
 end
 
@@ -903,22 +994,23 @@ end
 function new_session()
     local tab = T()
     if not tab.cfg then return end
-    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    cancel_session(tab)
     local cwd = tab.cwd or (tab.sess and tab.sess.cwd) or '.'
     tab.sess = session.new({
         cfg = tab.cfg, cwd = cwd, tools = registry.to_api_params(),
-        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        system = build_system(cwd),
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
+    tab.sess.request_user_input = user_input.bind(tab, tab.sess)
     tab.entries = {}
+    tab.welcome = true
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                             -- meter restarts on the next turn
     tab.pending_confirm = nil
     S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
     clear_attachments(tab)
     add(tab, 'system', 'new session · ' .. tab.cfg.model .. ' · ' .. cwd .. '\nEnter 发送 · Ctrl+Enter 换行')
-    S.sidebar = nil
     tab.status = 'new session'
 end
 
@@ -933,7 +1025,7 @@ function new_tab(cfg, cwd)
         id = S.next_tab_id,
         cfg = cfg,
         entries = {}, cur = nil, text_tail = '',
-        input = '', input_edit = true,
+        input = '', input_edit = true, welcome = true,
         busy = false, status = 'ready', budget = nil,
         pending_confirm = nil, attachments = {},
         cwd = cwd,
@@ -946,14 +1038,15 @@ function new_tab(cfg, cwd)
     skills.bootstrap(cwd)   -- align the (global) project skills with this tab's dir
     tab.sess = session.new({
         cfg = cfg, cwd = cwd, tools = registry.to_api_params(),
-        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        system = build_system(cwd),
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
+    tab.sess.request_user_input = user_input.bind(tab, tab.sess)
     S.tabs[#S.tabs + 1] = tab
     S.active = #S.tabs
     S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
-    if cfg.auth_type ~= 'chatgpt' and (not cfg.api_key or cfg.api_key == '') then
+    if not cfg.auth_type and (not cfg.api_key or cfg.api_key == '') then
         add(tab, 'error', '该模型（' .. (cfg.name or cfg.model or '?') ..
             '）未配置 token：在 xagent.local.cfg 设置 XAGENT_AUTH_TOKEN。')
     else
@@ -968,10 +1061,7 @@ function close_tab(i)
     if #S.tabs <= 1 then return end
     local tab = S.tabs[i]
     if not tab then return end
-    if tab.sess then tab.sess.cancelled = true end
-    if tab.pending_confirm then                  -- release a parked confirm so the coroutine unwinds
-        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
-    end
+    cancel_session(tab)
     clear_attachments(tab)
     local was_active = S.active
     table.remove(S.tabs, i)                      -- the view is plain Lua; GC reclaims it
@@ -994,6 +1084,7 @@ end
 -- (transcript bg/text, markdown palette, role colors) by reading the style's
 -- BACKGROUND/TEXT/accent via get_style. One click re-themes the whole window.
 local function apply_theme(name)
+    if name == 'nord' then name = 'sand' end -- migrate the saved theme name
     pcall(function() require('styles.' .. name).apply(raygui) end)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, FONT_SIZE)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
@@ -1026,7 +1117,7 @@ local function apply_theme(name)
 
     S.view_bg = bg
     S.header_bg = base
-    S.sidebar_bg = shift(bg, dark and 8 or -8)
+    S.sidebar_bg = name == 'soft' and { 250, 248, 248, 255 } or shift(bg, dark and 8 or -8)
     for _, tab in ipairs(S.tabs) do
         if tab.view then tab.view.bg = bg; tab.view:invalidate() end
     end
@@ -1080,7 +1171,7 @@ local function slash_items()
     local items = {
         { name = 'compact', desc = '压缩上下文' },
         { name = 'context', desc = '查看上下文用量' },
-        { name = 'mcp',     desc = '查看 MCP 服务器' },
+        { name = 'mcp',     desc = '查看/管理 MCP 服务器（add/remove/reload）' },
         { name = 'new',     desc = '新会话' },
         { name = 'help',    desc = '帮助' },
     }
@@ -1100,7 +1191,7 @@ local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached 
 local function update_completion_menu()
     S.menu = nil
     local tab = T()
-    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model then return end
+    if tab.busy or S.dir_dialog or tab.pending_confirm or tab.pending_input or S.tab_picker or S.add_model then return end
     local menu = complete.compute(tab.input, completion_deps)
     if not menu then S.menu_dismissed_for = nil; return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
@@ -1184,12 +1275,15 @@ end
 -- tab, so the caller re-reads T() afterwards.
 local function draw_tabbar(W)
     local y = HEADER_H
-    local sb = S.sidebar_bg
-    raygui.draw_rectangle(0, y, W, TABBAR_H, sb[1], sb[2], sb[3], sb[4])
+    local bg = S.view_bg or { 240, 240, 240, 255 }
+    raygui.draw_rectangle(0, y, W, TABBAR_H, bg[1], bg[2], bg[3], 255)
+    local tc = (markdown.palette and markdown.palette.text) or { 60, 60, 60, 255 }
+    local line = mix(bg, tc, 0.12)                    -- hairline under the strip
+    raygui.draw_rectangle(0, y + TABBAR_H - 1, W, 1, line[1], line[2], line[3], 255)
 
     local n = #S.tabs
     local plus_w = 30
-    local avail = W - 6 - plus_w - 8
+    local avail = W - 6 - plus_w - 8 - (S.panel and 40 or 0)   -- room for the panel close icon
     local tw = math.max(70, math.min(180, math.floor(avail / math.max(1, n)) - 2))
     local ry, rh = y + 3, TABBAR_H - 5
     local x = 6
@@ -1199,15 +1293,16 @@ local function draw_tabbar(W)
     for i, tab in ipairs(S.tabs) do
         local active = (i == S.active)
         local label = (tab.cfg and tab.cfg.name) or '?'
-        if tab.busy then
-            label = label .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
-        elseif tab.pending_confirm then
+        if tab.pending_confirm or tab.pending_input then
             label = label .. '  !'
+        elseif tab.busy then
+            label = label .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
         end
         local over = my >= ry and my < ry + rh and mx >= x and mx < x + tw
         local closable = (n > 1 and over)            -- show the close affordance on hover
-        local clicked = raygui.button(x, ry, tw, rh, (active and '● ' or '   ') .. sanitize_label(label))
-        if active then raygui.draw_rectangle(x, ry + rh - 2, tw, 2, ac[1], ac[2], ac[3], 255) end
+        local tab_bg = active and mix(bg, ac, 0.10) or bg
+        local clicked = surface.button(raygui, x, ry, tw, rh, '  ' .. fit_label(sanitize_label(label), tw - 38), tab_bg, tc, 8)
+        if active then raygui.draw_rectangle(x + 6, ry + rh - 1, tw - 12, 2, ac[1], ac[2], ac[3], 255) end
         -- The close 'x' is a FRAMELESS icon drawn over the tab's right edge (a
         -- nested button would draw a second border inside the tab and look
         -- misaligned). The single tab button handles the click: over the icon →
@@ -1227,8 +1322,12 @@ local function draw_tabbar(W)
         x = x + tw + 2
     end
 
+    -- the right panel's close button sits in this row, above the panel itself
+    -- (inside the panel it would collide with each page's own header buttons)
+    if S.panel and flat_button(W - 38, ry, 32, rh, '#113#') then S.panel = nil end
+
     S.plus_x = x
-    if raygui.button(x, ry, plus_w, rh, '+') then
+    if flat_button(x, ry, plus_w, rh, '+') then
         if S.profiles and #S.profiles > 1 then
             S.tab_picker = not S.tab_picker
         else
@@ -1286,6 +1385,33 @@ local function reload_profiles()
     end
 end
 
+-- Rebind the ACTIVE tab to another profile (the header's model switcher). The
+-- conversation carries over — only the session's cfg changes, so the next turn
+-- goes to the new model, the same way reload_profiles rebinds an edited profile.
+-- Refused mid-turn: the running request was built for the old model.
+local function switch_tab_model(p)
+    local tab = T()
+    if not p or not tab or tab.cfg == p then return end
+    if tab.busy then tab.status = '运行中，停止后再切换模型'; return end
+    tab.cfg = p
+    if tab.sess then tab.sess.cfg = p end
+    tab.budget = nil            -- the meter's window belongs to the old model; refills next turn
+    if not p.auth_type and (not p.api_key or p.api_key == '') then
+        tab.status = '该模型未配置 token'
+    else
+        tab.status = '已切换到 ' .. (p.name or p.model or '?')
+    end
+end
+
+-- The ⋮ menu: right-panel pages, in the order they are listed.
+local PANEL_MENU = {
+    { mode = 'files',      label = '工作区文件' },
+    { mode = 'model',      label = '模型设置' },
+    { mode = 'mcp',        label = '工具与 MCP' },
+    { mode = 'apilog',     label = 'API 请求记录' },
+    { mode = 'appearance', label = '外观配色' },
+}
+
 -- A dropdown trigger: a button + a caret. Records its anchor while open so the
 -- popup list (drawn on top of everything at frame end) knows where to appear.
 local function dropdown_button(id, x, y, w, h, current)
@@ -1297,13 +1423,31 @@ local function dropdown_button(id, x, y, w, h, current)
     if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
 end
 
+-- Flat variant of dropdown_button (no frame until hovered), for toolbars.
+local function flat_dropdown(id, x, y, w, h, current, bg)
+    local open = (S.dd_open == id)
+    local label = '  ' .. sanitize_label(current or '（无）')
+    local clicked
+    if bg then clicked = surface.button(raygui, x, y, w, h, label, bg, markdown.palette.text, 7)
+    else clicked = flat_button(x, y, w, h, label) end
+    local col = (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
+    draw_caret(x + w - 12, y + h / 2, col, open)
+    if clicked then S.dd_open = open and nil or id end
+    if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
+end
+
 -- Draw the open dropdown's list (theme or model) over the rest of the UI.
 -- `was_open` is S.dd_open as of frame start (before any control could toggle it),
 -- so the click that OPENS the dropdown this frame isn't read as an outside-click.
 local function draw_dropdown_overlays(was_open)
     if not S.dd_open or not S.dd_anchor then S.dd_prev_down = false; return end
     raygui.unlock()                       -- background was locked while a dropdown is open
-    if S.sidebar ~= 'settings' then S.dd_open = nil; return end
+    -- the theme/model pickers live on their sidebar pages; the header's
+    -- per-tab model switcher ('tabmodel') is always on screen
+    if (S.dd_open == 'theme' and S.panel ~= 'appearance')
+        or (S.dd_open == 'model' and S.panel ~= 'model') then
+        S.dd_open = nil; return
+    end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
         S.dd_open = nil; return
     end
@@ -1314,22 +1458,37 @@ local function draw_dropdown_overlays(was_open)
         for i, p in ipairs(S.profiles or {}) do
             items[#items + 1] = { label = p.name or p.model or '?', cur = (i == S.model_sel) }
         end
+    elseif S.dd_open == 'menu' then
+        for _, m in ipairs(PANEL_MENU) do
+            items[#items + 1] = { label = m.label, mode = m.mode, cur = (S.panel == m.mode) }
+        end
+    elseif S.dd_open == 'tabmodel' then
+        local cur = T().cfg
+        for _, p in ipairs(S.profiles or {}) do
+            items[#items + 1] = { label = p.name or p.model or '?', prof = p,
+                cur = (p == cur) or (cur ~= nil and p.key ~= nil and p.key == cur.key) }
+        end
     end
     if #items == 0 then S.dd_open = nil; return end
     local a = S.dd_anchor
     local row_h = FONT_SIZE + 10
-    local px, pw, py = a.x, a.w, a.y + a.h + 2
+    local px, pw, py = a.x, math.max(a.w, 240), a.y + a.h + 2
     local ph = 6 + #items * row_h
+    local sw, sh = raygui.screen_size()
+    if px + pw > sw - 4 then px = math.max(4, sw - 4 - pw) end   -- the ⋮ menu sits at the right edge
+    if py + ph > sh - 4 then py = math.max(4, a.y - ph - 2) end  -- the composer's picker: open upward
     local pb = S.sidebar_bg
     raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 252)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(px, py, 3, ph, ac[1], ac[2], ac[3], 255)
     for i, it in ipairs(items) do
         local ry = py + 3 + (i - 1) * row_h
-        if raygui.button(px + 4, ry, pw - 8, row_h - 3,
-                (it.cur and '● ' or '   ') .. sanitize_label(it.label)) then
+        if flat_button(px + 4, ry, pw - 8, row_h - 3,
+                (it.cur and '● ' or '   ') .. sanitize_label(it.label), pb) then
             if S.dd_open == 'theme' then apply_theme(it.label)
-            elseif S.dd_open == 'model' then S.model_sel = i end
+            elseif S.dd_open == 'model' then S.model_sel = i
+            elseif S.dd_open == 'menu' then toggle_panel(it.mode)
+            elseif S.dd_open == 'tabmodel' then switch_tab_model(it.prof) end
             S.dd_open = nil
         end
     end
@@ -1410,16 +1569,18 @@ local function draw_add_model_modal(W, H)
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
         chatgpt_login.cancel(); S.add_model = nil; return
     end
-    local mw, mh = 520, 444
+    local mw, mh = 520, 480
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
     raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
-    raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
+    raygui.label(mx + 16, my + 12, mw - 80, 24, f.edit
         and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?') .. '（Token 留空=不变）')
         or '新增模型（鉴权方式按协议自动选择）')
+
+    if raygui.button(mx + mw - 48, my + 8, 32, 30, '#113#') then chatgpt_login.cancel(); S.add_model = nil; return end
 
     local pad, lblw = 16, 84
     local fx = mx + pad + lblw + 8
@@ -1479,7 +1640,8 @@ local function draw_add_model_modal(W, H)
         raygui.label(mx + pad + 12, row - 4, mw - 2 * pad - 12, 22, f.err)
     end
 
-    if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
+    if surface.icon_button(raygui, mx + mw - 48, row + 24, 32, 30, 'save', pb,
+        (markdown.palette and markdown.palette.text) or {40,40,40,255}) then
         local url = (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
         local model = (f.model or ''):gsub('^%s+', ''):gsub('%s+$', '')
         local proxy = (f.proxy or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -1506,7 +1668,717 @@ local function draw_add_model_modal(W, H)
             if T() then T().status = '已添加模型' end
         end
     end
-    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then chatgpt_login.cancel(); S.add_model = nil end
+    if S.add_model then
+        surface.tooltip(raygui, mx + mw - 48, row + 24, 32, 30, '保存', pb,
+            (markdown.palette and markdown.palette.text) or {40,40,40,255})
+    end
+end
+
+-- The bundled agent exposes MCP status; configuration still uses its JSON files.
+local function draw_mcp_section(x0, pad, y, H)
+    raygui.label(x0 + pad, y, SIDEBAR_W - 2 * pad, 22, 'MCP 服务器')
+    y = y + 30
+    local conns = mcp_registry.connections()
+    if #conns == 0 then
+        raygui.label(x0 + pad, y, SIDEBAR_W - 2 * pad, 22,
+            S.mcp_status == 'connecting' and '（连接中…）' or '（未配置）')
+    end
+    for _, c in ipairs(conns) do
+        if y + 26 > H - 70 then break end
+        local entry = mcp_registry.get(c.name)
+        raygui.label(x0 + pad, y, SIDEBAR_W - 2 * pad, 22,
+            string.format('%s  [%s]  %d 工具', sanitize_label(c.name), c.status, entry and #entry.tools or 0))
+        y = y + 26
+        if c.error then
+            raygui.label(x0 + pad, y, SIDEBAR_W - 2 * pad, 22, fit_label(sanitize_label(c.error), SIDEBAR_W - 2 * pad))
+            y = y + 26
+        end
+    end
+    raygui.label(x0 + pad, H - 62, SIDEBAR_W - 2 * pad, 22, '~/.xagent/mcp.json 或 .mcp.json')
+    raygui.label(x0 + pad, H - 36, SIDEBAR_W - 2 * pad, 22, '修改配置后重启生效')
+end
+
+-- ── shared drawing bits for the rail / sidebars / composer ──────────────────
+local function accent_col() return (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 } end
+local function text_col() return (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 } end
+local function muted_col() return transcript.role_colors.system or { 140, 140, 140, 255 } end
+
+local function draw_text_col(s, x, y, size, col)
+    raygui.draw_text(s, x, y, size, col[1], col[2], col[3], col[4] or 255)
+end
+
+-- Wheel-scroll a sidebar list: adjusts S[key] when the pointer is over the
+-- list (not while the folder dialog covers it) and clamps it to the content.
+-- Returns whether the pointer is over the list, the wheel delta, and the mouse.
+local function scroll_list(key, x0, top, view_h, content_h, step)
+    local mx, my = raygui.get_mouse()
+    local over = not S.dir_dialog and mx >= x0 and mx <= x0 + SIDEBAR_W
+        and my >= top and my <= top + view_h
+    local d = 0
+    if over then
+        d = raygui.get_wheel()
+        if d ~= 0 then S[key] = S[key] - d * step end
+    end
+    local max_scroll = math.max(0, content_h - view_h)
+    if S[key] > max_scroll then S[key] = max_scroll end
+    if S[key] < 0 then S[key] = 0 end
+    return over, d, mx, my
+end
+
+-- Append an @reference to the active tab's input and focus it. With rel == ''
+-- this leaves a bare '@', which opens the file picker (complete.lua's trigger).
+local function insert_file_ref(rel)
+    local tab = T()
+    local s = tab.input or ''
+    if s ~= '' and not s:match('%s$') then s = s .. ' ' end
+    tab.input = s .. '@' .. rel .. (rel ~= '' and ' ' or '')
+    if raygui.set_textbox_cursor then raygui.set_textbox_cursor(#tab.input) end
+    -- the click that got here may have defocused the box this frame; the
+    -- forced flag re-focuses it after textbox_multi reports its edit state
+    tab.input_edit, tab.input_edit_forced = true, true
+end
+
+-- Request cancellation of the active tab's turn (takes effect at the next turn
+-- boundary). A parked ask-mode confirm is released as a deny so the loop can
+-- reach that boundary instead of hanging on the prompt.
+local function stop_turn(tab)
+    tab.status = '停止中'
+    cancel_session(tab)
+end
+
+-- ── frameless window chrome ─────────────────────────────────────────────────
+-- The window has no OS title bar (init { undecorated = true }), like Claude's
+-- desktop app: the header carries minimize / maximize / close right of ⋮, a
+-- press on empty header space moves the window (double-click maximizes), and
+-- a thin band along the border resizes it. With a raygui build that lacks the
+-- window functions, S.frameless stays false and the OS frame is kept.
+local WINBTN_W = 46                 -- width of each of the three window buttons
+local EDGE = 5                      -- resize band along the window border
+local MIN_W, MIN_H = 480, 360
+local EDGE_CURSOR = { n = 6, s = 6, e = 5, w = 5, nw = 7, se = 7, ne = 8, sw = 8 }
+
+local function toggle_maximize()
+    if raygui.is_window_maximized() then raygui.restore_window() else raygui.maximize_window() end
+end
+
+local function set_cursor(n)
+    if S.win_cursor ~= n then S.win_cursor = n; raygui.set_mouse_cursor(n) end
+end
+
+-- Which border band the pointer is on: '', or a combination of n/s + e/w.
+local function edge_at(mx, my, W, H)
+    local e = ''
+    if my < EDGE then e = 'n' elseif my >= H - EDGE then e = 's' end
+    if mx < EDGE then e = e .. 'w' elseif mx >= W - EDGE then e = e .. 'e' end
+    return e
+end
+
+-- True if (mx, my) is on a header control (recorded by draw_header last frame);
+-- everything else in the header is a drag handle.
+local function over_header_control(mx, my)
+    for _, r in ipairs(S.hdr_hits or {}) do
+        if mx >= r[1] and mx < r[1] + r[3] and my >= r[2] and my < r[2] + r[4] then return true end
+    end
+    return false
+end
+
+-- Runs at the start of each frame, from the raw mouse state. Returns true while
+-- a move/resize is in progress (the caller freezes the rest of the UI). Moves
+-- follow the pointer in SCREEN coordinates (mouse_screen), not window-relative
+-- ones, which lag a frame behind each move and make the window jitter.
+local function window_chrome(W, H)
+    local down = raygui.mouse_down()
+    local maximized = raygui.is_window_maximized()
+    if maximized then S.win_grab = nil end
+    local press = down and not S.win_prev_down
+    S.win_prev_down = down
+    local g = S.win_grab
+    if g then
+        if not down then S.win_grab = nil; return false end
+        local sx, sy = raygui.mouse_screen()
+        local dx, dy = sx - g.sx, sy - g.sy
+        if g.mode == 'move' then
+            raygui.set_window_pos(g.wx + dx, g.wy + dy)
+        else
+            local x, y, w, h = g.wx, g.wy, g.ww, g.wh
+            if g.mode:find('e') then w = math.max(MIN_W, g.ww + dx) end
+            if g.mode:find('s') then h = math.max(MIN_H, g.wh + dy) end
+            if g.mode:find('w') then w = math.max(MIN_W, g.ww - dx); x = g.wx + g.ww - w end
+            if g.mode:find('n') then h = math.max(MIN_H, g.wh - dy); y = g.wy + g.wh - h end
+            raygui.set_window_size(w, h)
+            if x ~= g.wx or y ~= g.wy then raygui.set_window_pos(x, y) end
+        end
+        return true
+    end
+
+    local mx, my = raygui.get_mouse()
+    local edge = maximized and '' or edge_at(mx, my, W, H)
+    set_cursor(EDGE_CURSOR[edge] or 0)
+    if not press then return false end
+
+    local function grab(mode)
+        local sx, sy = raygui.mouse_screen()
+        local wx, wy = raygui.window_pos()
+        S.win_grab = { mode = mode, sx = sx, sy = sy, wx = wx, wy = wy, ww = W, wh = H }
+    end
+    if edge ~= '' then
+        grab(edge); return true
+    end
+    if my < HEADER_H and not over_header_control(mx, my) then
+        if S.win_last_press and S.frame - S.win_last_press < 25 then   -- ~0.4 s at 60 fps
+            S.win_last_press = nil
+            toggle_maximize()
+            return true
+        end
+        S.win_last_press = S.frame
+        if not maximized then grab('move'); return true end   -- a maximized window stays put
+    end
+    return false
+end
+
+-- minimize / maximize-restore / close, hand-drawn icons over flat buttons
+local function draw_window_controls(W)
+    local txt = text_col()
+    local x = W - 3 * WINBTN_W
+    local cy = math.floor(HEADER_H / 2)
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then raygui.minimize_window() end
+    raygui.draw_rectangle(x + 18, cy, 10, 1, txt[1], txt[2], txt[3], 255)
+
+    x = x + WINBTN_W
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then toggle_maximize() end
+    local function box(bx, by, n)
+        raygui.draw_rectangle(bx, by, n, 1, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx, by + n - 1, n, 1, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx, by, 1, n, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx + n - 1, by, 1, n, txt[1], txt[2], txt[3], 255)
+    end
+    if raygui.is_window_maximized() then        -- restore: two overlapping squares
+        box(x + 20, cy - 6, 8)
+        local bg = S.view_bg or { 240, 240, 240, 255 }
+        raygui.draw_rectangle(x + 18, cy - 4, 8, 8, bg[1], bg[2], bg[3], 255)
+        box(x + 18, cy - 4, 8)
+    else
+        box(x + 18, cy - 5, 10)
+    end
+
+    x = x + WINBTN_W
+    local mx, my = raygui.get_mouse()
+    local over = mx >= x and my >= 0 and my < HEADER_H
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '', nil, { 196, 43, 28, 255 }) then S.quit = true end
+    draw_x(x + 15, 0, 16, HEADER_H, over and { 255, 255, 255, 255 } or txt, 5)
+end
+
+-- ── top bar ─────────────────────────────────────────────────────────────────
+-- [≡]  session title  (workspace)   status · usage ........ 12.3k tok ▬▬▬  [⋮]
+-- Flat, on the content background like the conversation below it: ≡ toggles
+-- the projects/sessions sidebar, the workspace chip picks another directory,
+-- ⋮ lists the right-panel pages. (The model picker lives in the composer.)
+
+-- What the header calls the active tab's conversation: its saved/renamed
+-- title, else its first user message, else nil (a fresh session shows no
+-- title — a "new session" placeholder said nothing the empty transcript doesn't).
+local function tab_title(tab)
+    local t = tab.sess and tab.sess.title
+    if not t or t == '' then
+        for _, e in ipairs(tab.entries) do
+            if e.role == 'user' then t = e.text; break end
+        end
+    end
+    return (t and t ~= '') and t or nil
+end
+
+local function dir_name(d)
+    d = tostring(d or ''):gsub('[\\/]+$', '')
+    return d:match('([^\\/]+)$') or d
+end
+
+local function draw_header(W, tab)
+    local bg = S.view_bg or { 240, 240, 240, 255 }
+    raygui.draw_rectangle(0, 0, W, HEADER_H, bg[1], bg[2], bg[3], 255)
+    local txt, muted = text_col(), muted_col()
+
+    -- header controls; the rest of the bar is the window's drag handle
+    local hits = { { 6, 5, 34, 28 } }
+    S.hdr_hits = hits
+
+    -- ≡: three bars over a flat button (the font's ☰ isn't reliable at this size)
+    if flat_button(6, 5, 34, 28, '') then toggle_sidebar() end
+    local lc = S.sidebar and accent_col() or txt
+    for k = 0, 2 do raygui.draw_rectangle(15, 12 + k * 6, 16, 2, lc[1], lc[2], lc[3], 255) end
+
+    -- session title (none yet for a fresh session)
+    local x = 50
+    local t = tab_title(tab)
+    if t then
+        local title = fit_label(t, math.max(80, math.floor(W * 0.32)))
+        draw_text_col(title, 52, 11, FONT_SIZE, txt)
+        x = 52 + raygui.measure_text(title) + 12
+    end
+
+    -- workspace chip: a tinted pill that darkens on hover; click = pick a directory
+    local chip_bg = shift(bg, (luma(bg) < 128) and 16 or -12)
+    local chip = S.picking_dir and '选择中…' or fit_label(dir_name(tab.cwd), 160)
+    local cw = raygui.measure_text(chip) + 22
+    if surface.button(raygui, x, 8, cw, 22, chip, chip_bg, txt, 7) then pick_directory() end
+    hits[#hits + 1] = { x, 8, cw, 22 }
+    x = x + cw + 14
+
+    -- right side: [meter] [⋮] [– □ ×]
+    local wbw = S.frameless and (3 * WINBTN_W + 6) or 0
+    local kx = W - 40 - wbw
+    local right = kx - 8
+    local b = tab.budget
+    if b then
+        -- token count + a thin bar filling toward the window. Green normally,
+        -- amber on 'warning', red on 'error'/'blocking' (compaction imminent /
+        -- just happened).
+        local bw, bh = 72, 6
+        local bx, by = right - bw, 16
+        local kt = ktok(b.estimated) .. ' tok'
+        local ktw = raygui.measure_text(kt, 13)
+        draw_text_col(kt, bx - ktw - 8, 12, 13, muted)
+        local pct = math.min(1, b.percent or 0)
+        local fill = { 110, 170, 120, 255 }
+        if b.state == 'warning' then fill = { 210, 175, 70, 255 }
+        elseif b.state ~= 'normal' then fill = { 215, 95, 85, 255 } end
+        local trk = mix(bg, muted, 0.35)
+        raygui.draw_rectangle(bx, by, bw, bh, trk[1], trk[2], trk[3], 255)
+        raygui.draw_rectangle(bx, by, math.floor(bw * pct), bh, fill[1], fill[2], fill[3], 255)
+        right = bx - ktw - 20
+    end
+
+    -- status (+ this turn's usage once it finished), muted, between the two
+    local status_text = tab.status
+    if tab.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
+        status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
+    elseif tab.last_usage then
+        status_text = status_text .. '  ·  本轮 ' .. usage_label(tab.last_usage)
+    end
+    if right - x > 40 then
+        draw_text_col(fit_label(status_text, right - x, 13), x, 12, 13, muted)
+    end
+
+    -- ⋮: the page menu (drawn by draw_dropdown_overlays like the other lists)
+    local on = S.panel or S.dd_open == 'menu'
+    if flat_button(kx, 5, 34, 28, '') then
+        S.dd_open = (S.dd_open ~= 'menu') and 'menu' or nil
+    end
+    local dc = on and accent_col() or txt
+    for k = 0, 2 do raygui.draw_rectangle(kx + 16, 12 + k * 6, 3, 3, dc[1], dc[2], dc[3], 255) end
+    if S.dd_open == 'menu' then S.dd_anchor = { x = kx, y = 5, w = 34, h = 28 } end
+    hits[#hits + 1] = { kx, 5, 34, 28 }
+
+    if S.frameless then
+        draw_window_controls(W)
+        hits[#hits + 1] = { W - 3 * WINBTN_W, 0, 3 * WINBTN_W, HEADER_H }
+    end
+end
+
+-- ── sidebar pages ───────────────────────────────────────────────────────────
+-- Left sidebar — history: search + group folding, sessions grouped by working
+-- directory, each row showing its title over a muted "time · message count"
+-- line (near-identical titles are otherwise impossible to tell apart).
+-- Preserve the session list's recency order. Folding changes visibility of
+-- sessions, never which projects are present in the history overview.
+local function build_history_groups(items, query, collapsed, open_by_key, key_for_dir)
+    local groups, by_key, shown = {}, {}, 0
+    local q = (query or ''):lower():gsub('^%s+', ''):gsub('%s+$', '')
+    for _, item in ipairs(items) do
+        local dir = item.cwd or '?'
+        local key = key_for_dir(dir)
+        local matches = q == '' or dir:lower():find(q, 1, true)
+            or tostring(item.title or ''):lower():find(q, 1, true)
+        if matches then
+            local group = by_key[key]
+            if not group then
+                local expanded = open_by_key[key]
+                if expanded == nil then expanded = not collapsed or q ~= '' end
+                group = { key = key, dir = dir, items = {}, expanded = expanded }
+                groups[#groups + 1], by_key[key] = group, group
+            end
+            group.items[#group.items + 1] = item
+            shown = shown + 1
+        end
+    end
+    return groups, shown
+end
+
+
+local function draw_history_sidebar(x0, H, tab)
+    -- one header row: 历史会话 · [search…] · fold icon
+    local lw = raygui.measure_text('历史会话') + 12
+    draw_text_col('历史会话', x0 + 10, TOP + 9, FONT_SIZE, text_col())
+    local fold_w = 28
+    local fx = x0 + 10 + lw
+    local fw = SIDEBAR_W - (fx - x0) - fold_w - 14
+    S.history_query, S.history_query_edit = raygui.textbox(fx, TOP + 4, fw, 26,
+        S.history_query, S.history_query_edit)
+    if S.history_query == '' and not S.history_query_edit then
+        draw_text_col('搜索…', fx + 8, TOP + 9, FONT_SIZE, muted_col())
+    end
+
+    -- Folding hides session rows while retaining every project header.
+    local bx = x0 + SIDEBAR_W - 8 - fold_w
+    if flat_button(bx, TOP + 4, fold_w, 26, '', S.sidebar_bg) then
+        S.history_collapsed = not S.history_collapsed
+        S.history_group_open = {}
+        S.history_scroll = 0
+        S.menu_item = nil
+    end
+    do
+        local c = S.history_collapsed and accent_col() or text_col()
+        local n, ix, iy = 11, bx + math.floor((fold_w - 11) / 2), TOP + 4 + math.floor((26 - 11) / 2)
+        raygui.draw_rectangle(ix, iy, n, 1, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix, iy + n - 1, n, 1, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix, iy, 1, n, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix + n - 1, iy, 1, n, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix + 3, iy + 5, 5, 1, c[1], c[2], c[3], 255)             -- minus
+        if S.history_collapsed then
+            raygui.draw_rectangle(ix + 5, iy + 3, 1, 5, c[1], c[2], c[3], 255)         -- plus
+        end
+    end
+
+    -- Search both project paths and conversation titles.
+    local cur_key = dir_key(tab.cwd)
+    local groups, shown = build_history_groups(S.history_items, S.history_query,
+        S.history_collapsed, S.history_group_open, dir_key)
+    -- flatten into rows with their y offsets (headers are shorter than items)
+    local HEAD_H, ITEM_H = 30, FONT_SIZE + 32
+    local rows, y = {}, 0
+    for _, g in ipairs(groups) do
+        rows[#rows + 1] = { header = g, y = y, h = HEAD_H }; y = y + HEAD_H
+        if g.expanded then
+            for _, it in ipairs(g.items) do rows[#rows + 1] = { item = it, y = y, h = ITEM_H }; y = y + ITEM_H end
+        end
+    end
+
+    local list_top = TOP + 38
+    local view_h = H - list_top - 8
+    local over_list, wheel, mx, my = scroll_list('history_scroll', x0, list_top, view_h, y, ITEM_H)
+    if wheel ~= 0 then S.menu_item = nil end
+
+    if shown == 0 then
+        raygui.label(x0 + 10, list_top + 6, SIDEBAR_W - 20, 22,
+            (#S.history_items == 0) and '（暂无会话）' or '（没有匹配的会话）')
+        return
+    end
+
+    local kw = 26                                  -- ⋮ / icon button width
+    local rx, title_w = x0 + 8, SIDEBAR_W - 16     -- FULL width; ⋮ overlays on hover
+    local kx = x0 + SIDEBAR_W - 8 - kw             -- right-edge button
+    local kx2 = kx - kw - 4                        -- second-from-right button
+    local txt, muted = text_col(), muted_col()
+
+    raygui.begin_scissor(x0, list_top, SIDEBAR_W, view_h)
+    for _, row in ipairs(rows) do
+        local ry = list_top + row.y - S.history_scroll
+        if ry + row.h > list_top and ry < list_top + view_h then   -- skip off-screen rows
+            local rh = row.h - 5
+            if row.header then
+                local g = row.header
+                local col = g.key == cur_key and accent_col() or txt
+                local count = tostring(#g.items)
+                local count_w = raygui.measure_text(count, 13)
+                if flat_button(rx, ry, title_w, rh, '', S.sidebar_bg) then
+                    S.history_group_open[g.key] = not g.expanded
+                    S.menu_item = nil
+                end
+                if g.expanded then
+                    draw_caret(rx + 10, ry + rh / 2, col, false)
+                else
+                    for k = 0, 3 do
+                        raygui.draw_rectangle(rx + 8 + k, math.floor(ry + rh / 2) - 3 + k,
+                            1, 7 - 2 * k, col[1], col[2], col[3], 255)
+                    end
+                end
+                draw_text_col(fit_label(dir_tail(g.dir), title_w - count_w - 44), rx + 24, ry + 5, FONT_SIZE, col)
+                draw_text_col(count, rx + title_w - count_w - 10, ry + 6, 13, muted)
+            else
+                local it = row.item
+                if it.id == S.renaming then
+                    S.rename_text, S.rename_edit = raygui.textbox(rx, ry, title_w - 2 * kw - 8, rh, S.rename_text, S.rename_edit)
+                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_rename(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.renaming = nil end
+                elseif it.id == S.confirm_delete then
+                    raygui.label(rx + 4, ry + 4, title_w - 2 * kw - 30, rh - 8, '删除？')
+                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_delete(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.confirm_delete = nil end
+                elseif S.menu_item == it then
+                    -- ⋮ clicked: reveal 修改 / 删除 on this row
+                    local bw = (title_w - kw - 8) / 2
+                    if surface.icon_button(raygui, rx, ry, bw, rh, 'edit', S.sidebar_bg, txt) then start_rename(it) end
+                    if surface.icon_button(raygui, rx + bw + 4, ry, bw, rh, 'delete', S.sidebar_bg, txt) then
+                        S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
+                    end
+                    if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = nil end   -- 再点收起
+                else
+                    -- empty button (hover bg + click) with the two text lines drawn
+                    -- over it; the ⋮ OVERLAYS the right edge on hover, so a click
+                    -- there must not also load the session.
+                    local over_row = over_list and my >= ry and my < ry + rh
+                    local over_kebab = over_row and mx >= kx and mx < kx + kw
+                    local clicked = raygui.button(rx, ry, title_w, rh, '')
+                    local tcol = (tab.sess and tab.sess.id == it.id) and accent_col() or txt
+                    draw_text_col(fit_label(it.title, title_w - 24 - (over_row and kw or 0)),
+                        rx + 10, ry + 5, FONT_SIZE, tcol)
+                    local when = (tonumber(it.created_at) or 0) > 0
+                        and os.date('%m-%d %H:%M', it.created_at) or '—'
+                    draw_text_col(when .. '  ·  ' .. tostring(it.n or 0) .. ' 条',
+                        rx + 10, ry + 9 + FONT_SIZE, 13, muted)
+                    if over_row then
+                        if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = it end
+                    end
+                    if clicked and not over_kebab then load_history_item(it) end
+                end
+            end
+        end
+    end
+    raygui.end_scissor()
+end
+
+-- Files: the active tab's working directory as an expandable tree. Children come
+-- from list_dir_cached — the same per-directory cache the @ picker uses — and a
+-- click on a file drops an @reference into the input (how the model is told to
+-- read it). Expanded nodes are remembered per directory.
+local function draw_files_sidebar(x0, H, tab)
+    raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, '工作区文件')
+    if raygui.button(x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, '#211#') then S.dir_cache = {} end
+    draw_text_col(fit_label(tab.cwd or '.', SIDEBAR_W - 20, 13), x0 + 10, TOP + 36, 13, muted_col())
+    draw_text_col('点击文件插入 @引用 · 点击目录展开', x0 + 10, TOP + 54, 13, muted_col())
+
+    local key = dir_key(tab.cwd)
+    local open = S.files_open[key]
+    if not open then open = {}; S.files_open[key] = open end
+    local rows = {}
+    local function walk(rel, depth)
+        -- directories first (the cached list is plain alphabetical, which is
+        -- what the @ picker wants), each group keeping its alphabetical order
+        local kids = {}
+        for i, name in ipairs(list_dir_cached(rel)) do kids[i] = name end
+        table.sort(kids, function(a, b)
+            local da, db = a:sub(-1) == '/', b:sub(-1) == '/'
+            if da ~= db then return da end
+            return a:lower() < b:lower()
+        end)
+        for _, name in ipairs(kids) do
+            local is_dir = name:sub(-1) == '/'
+            local path = rel .. name
+            rows[#rows + 1] = { path = path, name = is_dir and name:sub(1, -2) or name, dir = is_dir, depth = depth }
+            if is_dir and open[path] and depth < 16 then walk(path, depth + 1) end
+        end
+    end
+    walk('', 0)
+
+    local list_top = TOP + 76
+    local view_h = H - list_top - 8
+    local row_h = FONT_SIZE + 10
+    scroll_list('files_scroll', x0, list_top, view_h, #rows * row_h, row_h * 1.5)
+    if #rows == 0 then
+        raygui.label(x0 + 10, list_top + 6, SIDEBAR_W - 20, 22, '（空目录）')
+        return
+    end
+    -- virtualize: only rows near the viewport; the scissor clips the edges
+    local first = math.max(1, math.floor(S.files_scroll / row_h))
+    local last = math.min(#rows, math.floor((S.files_scroll + view_h) / row_h) + 2)
+    raygui.begin_scissor(x0, list_top, SIDEBAR_W, view_h)
+    for i = first, last do
+        local r = rows[i]
+        local ry = list_top + (i - 1) * row_h - S.files_scroll
+        local ind = math.min(r.depth * 14, SIDEBAR_W - 80)
+        local w = SIDEBAR_W - 16 - ind
+        local row_x, rh = x0 + 8 + ind, row_h - 3
+        if raygui.button(row_x, ry, w, rh, '') then
+            if r.dir then
+                open[r.path] = (not open[r.path]) or nil
+            else
+                insert_file_ref(r.path)
+                tab.status = '已引用 @' .. r.path
+            end
+        end
+        if r.dir then
+            local col = muted_col()
+            if open[r.path] then
+                draw_caret(row_x + 8, ry + rh / 2, col, false)
+            else
+                for k = 0, 3 do
+                    raygui.draw_rectangle(row_x + 6 + k, math.floor(ry + rh / 2) - 3 + k,
+                        1, 7 - 2 * k, col[1], col[2], col[3], 255)
+                end
+            end
+            surface.icon(raygui, row_x + 18, ry + (rh - 20) / 2, 'folder')
+        end
+        draw_text_col(fit_label(r.name, w - 52), row_x + 44, ry + 4, FONT_SIZE, text_col())
+    end
+    raygui.end_scissor()
+end
+
+local function draw_apilog_sidebar(x0, H)
+    raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, 'API 请求记录')
+    if surface.icon_button(raygui, x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, 'delete', S.sidebar_bg, text_col()) then
+        api_log.clear(); S.apilog_selected = nil
+        S.log_detail = nil; S.log_detail_for = nil
+    end
+    raygui.label(x0 + 10, TOP + 34, SIDEBAR_W - 20, 20, '点击条目查看 请求/返回 详情（重启清空）')
+
+    local recs = api_log.list()
+    local n = #recs
+    local list_top = TOP + 60
+    local view_h = H - list_top - 8
+    local row_h = FONT_SIZE + 18
+    scroll_list('apilog_scroll', x0, list_top, view_h, n * row_h, row_h * 1.5)
+
+    if n == 0 then
+        raygui.label(x0 + 10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无请求记录）')
+        return
+    end
+    raygui.begin_scissor(x0, list_top, SIDEBAR_W, view_h)
+    for i = 1, n do
+        local rec = recs[n - i + 1]          -- newest first
+        local ry = list_top + (i - 1) * row_h - S.apilog_scroll
+        if ry + row_h > list_top and ry < list_top + view_h then
+            local icon = (not rec.done) and '○' or (rec.error and '×' or '✓')
+            local lbl
+            if rec.done and not rec.error then
+                local r = tokens.cache_hit_ratio(rec.usage)
+                lbl = string.format('%s #%d %s  %s→%s%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
+                    rec.usage and shorttok(tokens.total_input_tokens(rec.usage)) or '?',
+                    shorttok(rec.usage and rec.usage.output_tokens),
+                    r and string.format('  缓存%d%%', math.floor(r * 100 + 0.5)) or '')
+            elseif rec.error then
+                lbl = string.format('%s #%d %s  失败', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+            else
+                lbl = string.format('%s #%d %s  …', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+            end
+            lbl = (rec == S.apilog_selected and '● ' or '   ') .. lbl
+            if raygui.button(x0 + 8, ry, SIDEBAR_W - 16, row_h - 5, lbl) then select_log(rec) end
+        end
+    end
+    raygui.end_scissor()
+end
+
+-- Model page: pick a profile to inspect / edit / delete, or add one. Which model
+-- a TAB talks to is chosen from the header switcher (or the button at the end).
+local function draw_model_sidebar(x0, H, tab)
+    local pad = 12
+    local my0 = TOP + 6
+    raygui.label(x0 + pad, my0, SIDEBAR_W - 2 * pad, 22, '模型配置')
+    local nprof = #(S.profiles or {})
+    if S.model_sel < 1 then S.model_sel = 1 end
+    if S.model_sel > nprof then S.model_sel = math.max(1, nprof) end
+    local selp = (S.profiles or {})[S.model_sel]
+    local addw = 56
+    local ddw = SIDEBAR_W - 2 * pad - addw - 6
+    dropdown_button('model', x0 + pad, my0 + 24, ddw, 30, selp and (selp.name or selp.model) or '（无）')
+    if raygui.button(x0 + pad + ddw + 6, my0 + 24, addw, 30, '+') then open_add_model() end
+
+    local dy = my0 + 64
+    if selp then
+        local function det(s) raygui.label(x0 + pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
+        det('地址: ' .. sanitize_label(selp.base_url or '?'))
+        det('模型: ' .. sanitize_label(selp.model or '?'))
+        det('协议: ' .. tostring(selp.api_format or 'anthropic'))
+        det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
+        det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
+        det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))
+        det('代理: ' .. (selp.proxy and sanitize_label(xproxy.redact(selp.proxy)) or '直连'))
+        if selp.overridden then det('（已在界面修改，覆盖配置文件）') end
+        dy = dy + 4
+        if surface.icon_button(raygui, x0 + pad, dy, 32, 28, 'edit', S.sidebar_bg, text_col()) then open_edit_model(selp) end
+        if selp.source == 'json' and selp.json_index then
+            if surface.icon_button(raygui, x0 + pad + 40, dy, 32, 28, 'delete', S.sidebar_bg, text_col()) then
+                config.delete_user_model(selp.json_index)
+                reload_profiles()
+            end
+        elseif selp.overridden then
+            if raygui.button(x0 + pad + 96, dy, 120, 28, '恢复配置文件') then
+                config.clear_cfg_override(selp.key)
+                reload_profiles()
+            end
+        end
+        dy = dy + 40
+        if tab.cfg ~= selp and raygui.button(x0 + pad, dy, SIDEBAR_W - 2 * pad, 28, '当前标签改用此模型') then
+            switch_tab_model(selp)
+        end
+    end
+end
+
+local function draw_appearance_sidebar(x0)
+    local pad = 12
+    raygui.label(x0 + pad, TOP + 6, SIDEBAR_W - 2 * pad, 22, '配色方案')
+    dropdown_button('theme', x0 + pad, TOP + 30, SIDEBAR_W - 2 * pad, 30, S.theme)
+end
+
+-- ── composer ────────────────────────────────────────────────────────────────
+-- The input box plus a toolbar row under it, so everything that shapes the next
+-- message sits next to it: [+ 引用文件] [permission mode] hints … [发送 / 停止].
+local INPUT_H, TOOLBAR_H = 78, 40
+
+local function composer_color()
+    if S.theme == 'soft' then return { 255, 255, 255, 255 } end
+    local bg = S.view_bg
+    return mix(bg, text_col(), luma(bg) < 128 and 0.045 or 0.018)
+end
+
+local function draw_welcome(tab, x, y, w, h)
+    local center = x + w / 2
+    local top = y + math.max(12, math.floor(h * 0.32) - 32)
+    local function centered(label, yy, size, col)
+        draw_text_col(label, math.floor(center - raygui.measure_text(label, size) / 2), yy, size, col)
+    end
+    centered('从一个想法开始', top, 26, text_col())
+    centered('读懂项目、修改代码，或一起解决一个问题。', top + 44, 16, muted_col())
+    local choices = {
+        { '理解项目', '请介绍当前项目的结构、主要模块和运行方式。' },
+        { '实现功能', '我想在当前项目中实现一个功能：' },
+        { '排查问题', '帮我排查当前项目中的问题：' },
+    }
+    local gap = 10
+    local bw = math.min(144, math.floor((w - 2 * gap) / 3))
+    local left = math.floor(center - (3 * bw + 2 * gap) / 2)
+    if h > 190 and bw >= 80 then
+        for i, item in ipairs(choices) do
+            if surface.button(raygui, left + (i - 1) * (bw + gap), top + 92, bw, 38,
+                item[1], mix(S.view_bg, accent_col(), 0.065), text_col(), 10) then
+                tab.input, tab.input_edit, tab.input_edit_forced = item[2], true, true
+            end
+        end
+    end
+end
+
+local function draw_composer_toolbar(tab, x, iy, w)
+    local ty, bh = iy + INPUT_H + 4, 30
+    local bg, txt, ac = composer_color(), text_col(), accent_col()
+    if surface.button(raygui, x, ty, 30, bh, '+', bg, txt, 8) then insert_file_ref('') end
+
+    local compact = w < 620
+    local mode_w = compact and 62 or 132
+    local mode_lbl = (S.mode == 'ask') and (compact and '询问' or '询问 · 写前确认')
+        or (compact and '写入' or '写入 · 自动执行')
+    if surface.button(raygui, x + 36, ty, mode_w, bh, mode_lbl, bg, txt, 7) then
+        S.mode = (S.mode == 'ask') and 'write' or 'ask'
+        tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
+    end
+
+    local send_w = 32
+    local sx = x + w - send_w
+    local mname = sanitize_label(tab.cfg and (tab.cfg.name or tab.cfg.model) or '?')
+    local mw = math.min(200, math.max(60, w - mode_w - send_w - 60), raygui.measure_text(mname) + 40)
+    local mx = sx - 10 - mw
+    flat_dropdown('tabmodel', mx, ty, mw, bh, fit_label(mname, mw - 38), bg)
+
+    local hx = x + 36 + mode_w + 12
+    local room = mx - 12 - hx
+    if room > 100 then
+        draw_text_col(fit_label('Enter 发送 · Ctrl+Enter 换行 · Ctrl+V 贴图', room, 13),
+            hx, ty + 8, 13, muted_col())
+    end
+    if tab.busy then
+        if surface.button(raygui, sx, ty, send_w, bh, '', mix(bg, ac, 0.15), txt, 9) then stop_turn(tab) end
+        raygui.draw_rectangle(sx + 11, ty + 10, 10, 10, txt[1], txt[2], txt[3], 255)
+        return false
+    end
+    local ink = luma(ac) > 155 and { 30, 36, 48, 255 } or { 255, 255, 255, 255 }
+    return surface.button(raygui, sx, ty, send_w, bh, '#121#', ac, ink, 9)
 end
 
 local function __init()
@@ -1516,12 +2388,18 @@ local function __init()
     -- which holds its RPC open for as long as the human takes to answer.
     assert(subprocess.setup({ ui_lane = true }))
 
-    raygui.init(960, 700, 'xagent')
-    -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
-    if not raygui.load_system_font(FONT_SIZE, preseed_charset()) and
-       not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
-        raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE)
-    end
+    -- Borderless (custom title bar in the header) when this raygui build can
+    -- move/resize/minimize the window; otherwise keep the OS frame.
+    S.frameless = (raygui.mouse_screen and raygui.set_window_pos and raygui.minimize_window) and true or false
+    raygui.init(960, 700, 'xagent', {
+        undecorated = S.frameless,
+        desktop_maximize = IS_WIN and S.frameless,
+    })
+    -- A larger atlas avoids enlarging 16px bitmaps for headings while keeping
+    -- the existing font metrics and all UI geometry in logical pixels.
+    local charset = preseed_charset()
+    local font_loaded = raygui.load_system_font(FONT_ATLAS_SIZE, charset)
+    if not font_loaded then raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_ATLAS_SIZE, charset) end
 
     -- Color emoji come from the atlas (the font has no emoji glyphs).
     S.emoji_tex = raygui.load_texture('tools/emoji_atlas.png')
@@ -1554,7 +2432,7 @@ local function __init()
     -- Apply the saved (or default) color theme (sets S.view_bg for new tabs).
     local saved = fs.read_file(THEME_FILE)
     saved = saved and saved:gsub('%s+', '')
-    apply_theme((saved and saved ~= '') and saved or 'nord')
+    apply_theme((saved and saved ~= '') and saved or 'soft')
 
     -- Default the first tab's dir to the last picked one (persisted across
     -- launches); fall back to the process cwd if none saved or it's gone.
@@ -1589,18 +2467,11 @@ local function __init()
         -- it isn't wrapped in pcall (yielding across pcall isn't safe on every
         -- Lua backend); a stray error surfaces via the resume check below or, on
         -- a later resume, xasync's resume-error log.
-        local summary = mcp.bootstrap(cwd, { verify = S.profiles[1].verify })
+        local summary = mcp.bootstrap(cwd, { verify = S.profiles[1] and S.profiles[1].verify })
         S.mcp_status = 'ready'
-        if summary.tool_count > 0 then
-            for _, tab in ipairs(S.tabs) do
-                if tab.sess then tab.sess.tools = registry.to_api_params() end
-            end
-            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接，新增 %d 个工具',
-                summary.connected, summary.tool_count))
-        elseif summary.connected > 0 then
-            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接（无工具）', summary.connected))
-        end
-        for _, e in ipairs(summary.errors) do add(T(), 'error', 'MCP: ' .. tostring(e)) end
+        local params = registry.to_api_params()
+        for _, tab in ipairs(S.tabs) do if tab.sess then tab.sess.tools = params end end
+        for _, err in ipairs(summary.errors or {}) do add(T(), 'error', 'MCP: ' .. tostring(err)) end
     end)
     local ok, err = coroutine.resume(boot_co)
     if not ok then S.mcp_status = 'error'; add(T(), 'error', 'MCP 启动失败: ' .. tostring(err)) end
@@ -1608,12 +2479,17 @@ end
 
 local function __update()
     chatgpt_login.tick()
-    if raygui.should_close() then xthread.stop(0); return end
+    if raygui.should_close() or S.quit then xthread.stop(0); return end
     local tab = T()
     if not tab then return end
 
     local W, H = raygui.screen_size()
     raygui.begin()
+
+    -- frameless window: move/resize from the raw mouse before anything draws;
+    -- while it runs the UI is locked so the drag doesn't also press controls
+    local grabbing = S.frameless and window_chrome(W, H)
+    if grabbing then raygui.lock() end
 
     -- Capture the dropdown's open-state BEFORE any control this frame can toggle
     -- it: the click that OPENS a dropdown must not also be read as the outside-
@@ -1623,276 +2499,53 @@ local function __update()
     -- directory dialog open: freeze the UI underneath (raygui controls via
     -- lock; custom-drawn transcript/list wheel via flags). Unlocked again just
     -- before the dialog itself is drawn at the end of the frame.
-    if S.dir_dialog or S.add_model or S.dd_open then raygui.lock() end
-    tab.view.lock_input = (S.dir_dialog or S.add_model or S.dd_open) or nil
+    local modal = S.dir_dialog or S.add_model or S.dd_open
+    if modal then raygui.lock() end
+    tab.view.lock_input = modal or nil
 
-    -- top bar: title/status + context meter + settings + history toggles
+    -- top bar: model switcher · workspace · status/usage · context meter
     S.frame = S.frame + 1
     update_thinking(tab)   -- maintain the transient "thinking…" transcript line
-    local hb = S.header_bg
-    raygui.draw_rectangle(0, 0, W, HEADER_H, hb[1], hb[2], hb[3], hb[4])
-    local status_text = tab.status
-    if tab.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
-        status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
-    end
-    raygui.label(12, 8, W - 406, 24, 'xagent  ·  ' ..
-        (tab.cfg and tab.cfg.model or '?') .. '  ·  ' .. status_text)
-
-    -- tool permission mode toggle (Write = auto-run · Ask = confirm each write)
-    if raygui.button(W - 386, 6, 70, 28, S.mode == 'ask' and 'Ask' or 'Write') then
-        S.mode = (S.mode == 'ask') and 'write' or 'ask'
-        tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
-    end
-
-    -- context-usage meter: token count + a thin bar filling toward the window.
-    -- Green normally, amber on 'warning', red on 'error'/'blocking' (compaction
-    -- imminent / just happened).
-    local b = tab.budget
-    if b then
-        local mw, mx, my, mh = 96, W - 238, 15, 8
-        local kt = b.estimated >= 1000 and string.format('%.1fk', b.estimated / 1000)
-            or tostring(b.estimated)
-        raygui.label(mx - 70, 8, 66, 24, kt .. ' tok')
-        local pct = math.min(1, b.percent or 0)
-        local fill = { 110, 170, 120, 255 }
-        if b.state == 'warning' then fill = { 210, 175, 70, 255 }
-        elseif b.state ~= 'normal' then fill = { 215, 95, 85, 255 } end
-        local trk = mix(S.view_bg or { 40, 40, 40, 255 },
-            transcript.role_colors.system or { 120, 120, 120, 255 }, 0.5)
-        raygui.draw_rectangle(mx, my, mw, mh, trk[1], trk[2], trk[3], 255)
-        raygui.draw_rectangle(mx, my, math.floor(mw * pct), mh, fill[1], fill[2], fill[3], 255)
-    end
-
-    if raygui.button(W - 130, 6, 38, 28, '#141#') then toggle_sidebar('settings') end  -- gear
-    if raygui.button(W - 88, 6, 38, 28, '#139#') then toggle_sidebar('history') end    -- clock
-    if raygui.button(W - 46, 6, 38, 28, '#171#') then toggle_sidebar('apilog') end     -- link-net: API log
+    draw_header(W, tab)
 
     -- tab strip (below the top bar); may switch/create/close the active tab
     draw_tabbar(W)
     tab = T()
 
-    -- left sidebar (inline, default hidden); shifts the main area right
-    local lx = 0
-    if S.sidebar then
+    -- left sidebar (≡: projects + sessions) and right panel (⋮ pages); the
+    -- conversation takes the space between them: lx .. rx
+    local lx, rx = 0, W
+    local sb = S.sidebar_bg
+    -- Keep the composer usable when panels would leave less than 360px.
+    -- Retain the selected pages so resizing wider brings them back.
+    local show_sidebar = S.sidebar and W >= SIDEBAR_W + 360
+    local show_panel = S.panel and W >= (show_sidebar and 2 or 1) * SIDEBAR_W + 360
+    if show_sidebar then
         lx = SIDEBAR_W
-        local sb = S.sidebar_bg
         raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
-        if S.sidebar == 'history' then
-            raygui.label(10, TOP + 6, SIDEBAR_W - 90, 22, '历史会话')
-            if raygui.button(SIDEBAR_W - 78, TOP + 4, 70, 26, '新会话') then new_session() end
-
-            -- this tab's working directory (new sessions start here); clicking it
-            -- opens the NATIVE folder picker (async — the GUI keeps rendering)
-            if raygui.button(8, TOP + 34, SIDEBAR_W - 16, 26,
-                '◇ ' .. sanitize_label(dir_tail(tab.cwd)) ..
-                (S.picking_dir and '  ·  选择中…' or '  ·  点击切换目录')) then
-                pick_directory()
-            end
-
-            -- group sessions by working directory (first appearance ≈ recency)
-            local items = S.history_items
-            local rows, groups = {}, {}
-            for _, it in ipairs(items) do
-                local key = dir_key(it.cwd or '?')
-                local g = groups[key]
-                if not g then
-                    g = { dir = it.cwd or '?', items = {} }
-                    groups[key] = g
-                    rows[#rows + 1] = { header = g }
-                end
-                g.items[#g.items + 1] = it
-            end
-            do  -- flatten: header rows interleaved with their item rows
-                local flat = {}
-                for _, r in ipairs(rows) do
-                    flat[#flat + 1] = r
-                    for _, it in ipairs(r.header.items) do flat[#flat + 1] = { item = it } end
-                end
-                rows = flat
-            end
-
-            local list_top = TOP + 68
-            local view_h = H - list_top - 8
-            local row_h = FONT_SIZE + 16
-            local max_scroll = math.max(0, #rows * row_h - view_h)
-
-            -- natural pixel scroll (only when the pointer is over the list;
-            -- suppressed while the directory dialog overlays the UI)
-            local mx, my = raygui.get_mouse()
-            local over_list = not S.dir_dialog and mx >= 0 and mx <= SIDEBAR_W
-                and my >= list_top and my <= list_top + view_h
-            if over_list then
-                local d = raygui.get_wheel()
-                if d ~= 0 then S.history_scroll = S.history_scroll - d * row_h * 1.5; S.menu_item = nil end
-            end
-            if S.history_scroll > max_scroll then S.history_scroll = max_scroll end
-            if S.history_scroll < 0 then S.history_scroll = 0 end
-
-            if #items == 0 then
-                raygui.label(10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无会话）')
-            else
-                local kw = 26                              -- ⋮ / icon button width
-                local title_w = SIDEBAR_W - 16             -- FULL width; ⋮ overlays on hover
-                local kx = SIDEBAR_W - 8 - kw              -- right-edge button
-                local kx2 = SIDEBAR_W - 8 - 2 * kw - 4     -- second-from-right button
-                -- virtualize: only rows near the viewport; the scissor clips the edges.
-                local first = math.max(1, math.floor(S.history_scroll / row_h) - 2)
-                local last  = math.min(#rows, math.floor((S.history_scroll + view_h) / row_h) + 3)
-
-                raygui.begin_scissor(0, list_top, SIDEBAR_W, view_h)
-                for i = first, last do
-                    local row = rows[i]
-                    local ry = list_top + (i - 1) * row_h - S.history_scroll
-                    if ry + row_h > list_top and ry < list_top + view_h then   -- skip fully off-screen
-                        local rh = row_h - 5
-                        if row.header then
-                            -- directory group header; click switches this tab's dir
-                            local cur = dir_key(row.header.dir) == dir_key(tab.cwd)
-                            if raygui.button(8, ry, title_w, rh,
-                                -- ◆ not ▸: NotoSansSC lacks U+25B8 (renders '?');
-                                -- GB2312 geometric shapes (●◆◇○) are always present
-                                (cur and '● ' or '◆ ') .. sanitize_label(dir_tail(row.header.dir))) then
-                                apply_cwd(row.header.dir)
-                            end
-                        else
-                            local it = row.item
-                            if it.id == S.renaming then
-                                S.rename_text, S.rename_edit = raygui.textbox(8, ry, title_w - 2 * kw - 8, rh, S.rename_text, S.rename_edit)
-                                if raygui.button(kx2, ry, kw, rh, '#112#') then do_rename(it) end        -- ✓ 保存
-                                if raygui.button(kx, ry, kw, rh, '#113#') then S.renaming = nil end       -- ✗ 取消
-                            elseif it.id == S.confirm_delete then
-                                raygui.label(12, ry + 4, title_w - 2 * kw - 30, rh, '删除？')
-                                if raygui.button(kx2, ry, kw, rh, '#112#') then do_delete(it) end         -- ✓ 确认删除
-                                if raygui.button(kx, ry, kw, rh, '#113#') then S.confirm_delete = nil end  -- ✗ 取消
-                            elseif S.menu_item == it then
-                                -- ⋮ clicked: reveal 修改 / 删除 on this row
-                                local bw = (title_w - kw - 8) / 2
-                                if raygui.button(8, ry, bw, rh, '修改') then start_rename(it) end
-                                if raygui.button(8 + bw + 4, ry, bw, rh, '删除') then
-                                    S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
-                                end
-                                if kebab_button(kx, ry, kw, rh, markdown.palette.text) then S.menu_item = nil end   -- 再点收起
-                            else
-                                -- full-width title; the ⋮ OVERLAYS its right edge on hover,
-                                -- so a click there must not also load the session.
-                                local over_row = over_list and my >= ry and my < ry + rh
-                                local over_kebab = over_row and mx >= kx and mx < kx + kw
-                                local clicked = raygui.button(8, ry, title_w, rh, '   ○  ' .. sanitize_label(it.title))
-                                if over_row then
-                                    if kebab_button(kx, ry, kw, rh, markdown.palette.text) then S.menu_item = it end
-                                end
-                                if clicked and not over_kebab then load_history_item(it) end
-                            end
-                        end
-                    end
-                end
-                raygui.end_scissor()
-            end
-        elseif S.sidebar == 'apilog' then
-            raygui.label(10, TOP + 6, SIDEBAR_W - 90, 22, 'API 记录')
-            if raygui.button(SIDEBAR_W - 78, TOP + 4, 70, 26, '清空') then
-                api_log.clear(); S.apilog_selected = nil
-                S.log_detail = nil; S.log_detail_for = nil
-            end
-            raygui.label(10, TOP + 34, SIDEBAR_W - 20, 20, '点击条目查看 请求/返回 详情（重启清空）')
-
-            local recs = api_log.list()
-            local n = #recs
-            local list_top = TOP + 60
-            local view_h = H - list_top - 8
-            local row_h = FONT_SIZE + 18
-            local max_scroll = math.max(0, n * row_h - view_h)
-
-            local mx, my = raygui.get_mouse()
-            local over = not S.dir_dialog and mx >= 0 and mx <= SIDEBAR_W
-                and my >= list_top and my <= list_top + view_h
-            if over then
-                local d = raygui.get_wheel()
-                if d ~= 0 then S.apilog_scroll = S.apilog_scroll - d * row_h * 1.5 end
-            end
-            if S.apilog_scroll > max_scroll then S.apilog_scroll = max_scroll end
-            if S.apilog_scroll < 0 then S.apilog_scroll = 0 end
-
-            if n == 0 then
-                raygui.label(10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无请求记录）')
-            else
-                raygui.begin_scissor(0, list_top, SIDEBAR_W, view_h)
-                for i = 1, n do
-                    local rec = recs[n - i + 1]          -- newest first
-                    local ry = list_top + (i - 1) * row_h - S.apilog_scroll
-                    if ry + row_h > list_top and ry < list_top + view_h then
-                        local icon = (not rec.done) and '○' or (rec.error and '×' or '✓')
-                        local lbl
-                        if rec.done and not rec.error then
-                            local r = tokens.cache_hit_ratio(rec.usage)
-                            lbl = string.format('%s #%d %s  %s→%s%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
-                                rec.usage and shorttok(tokens.total_input_tokens(rec.usage)) or '?',
-                                shorttok(rec.usage and rec.usage.output_tokens),
-                                r and string.format('  缓存%d%%', math.floor(r * 100 + 0.5)) or '')
-                        elseif rec.error then
-                            lbl = string.format('%s #%d %s  失败', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
-                        else
-                            lbl = string.format('%s #%d %s  …', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
-                        end
-                        lbl = (rec == S.apilog_selected and '● ' or '   ') .. lbl
-                        if raygui.button(8, ry, SIDEBAR_W - 16, row_h - 5, lbl) then select_log(rec) end
-                    end
-                end
-                raygui.end_scissor()
-            end
-        else -- settings
-            local pad = 12
-            -- 配色方案 dropdown
-            raygui.label(pad, TOP + 6, SIDEBAR_W - 2 * pad, 22, '配色方案')
-            dropdown_button('theme', pad, TOP + 30, SIDEBAR_W - 2 * pad, 30, S.theme)
-
-            -- 模型 dropdown + 添加 按钮（添加打开表单，可填 URL/Token）
-            local my0 = TOP + 74
-            raygui.label(pad, my0, SIDEBAR_W - 2 * pad, 22, '模型')
-            local nprof = #(S.profiles or {})
-            if S.model_sel < 1 then S.model_sel = 1 end
-            if S.model_sel > nprof then S.model_sel = math.max(1, nprof) end
-            local selp = (S.profiles or {})[S.model_sel]
-            local addw = 56
-            local ddw = SIDEBAR_W - 2 * pad - addw - 6
-            dropdown_button('model', pad, my0 + 24, ddw, 30, selp and (selp.name or selp.model) or '（无）')
-            if raygui.button(pad + ddw + 6, my0 + 24, addw, 30, '添加') then open_add_model() end
-
-            -- selected model details (+ delete for user-added ones)
-            local dy = my0 + 64
-            if selp then
-                local function det(s) raygui.label(pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
-                det('地址: ' .. sanitize_label(selp.base_url or '?'))
-                det('模型: ' .. sanitize_label(selp.model or '?'))
-                det('协议: ' .. tostring(selp.api_format or 'anthropic'))
-                det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
-                det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
-                det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))
-                det('代理: ' .. (selp.proxy and sanitize_label(xproxy.redact(selp.proxy)) or '直连'))
-                if selp.overridden then det('（已在界面修改，覆盖配置文件）') end
-                dy = dy + 4
-                if raygui.button(pad, dy, 88, 28, '编辑') then open_edit_model(selp) end
-                if selp.source == 'json' and selp.json_index then
-                    if raygui.button(pad + 96, dy, 120, 28, '删除此模型') then
-                        config.delete_user_model(selp.json_index)
-                        reload_profiles()
-                    end
-                elseif selp.overridden then
-                    if raygui.button(pad + 96, dy, 120, 28, '恢复配置文件') then
-                        config.clear_cfg_override(selp.key)
-                        reload_profiles()
-                    end
-                end
-            end
-        end
+        draw_history_sidebar(0, H, tab)
+    end
+    if show_panel then
+        local x0 = W - SIDEBAR_W
+        rx = x0
+        raygui.draw_rectangle(x0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
+        if S.panel == 'files' then draw_files_sidebar(x0, H, tab)
+        elseif S.panel == 'model' then draw_model_sidebar(x0, H, tab)
+        elseif S.panel == 'mcp' then draw_mcp_section(x0, 12, TOP + 6, H)
+        elseif S.panel == 'apilog' then draw_apilog_sidebar(x0, H)
+        elseif S.panel == 'appearance' then draw_appearance_sidebar(x0) end
     end
 
     -- transcript (right of the sidebar); attachments shrink it a bit more
-    local input_h = 96
+    local answering = tab.pending_input ~= nil
+    local comp_h = INPUT_H + TOOLBAR_H + 36
     local att_h = (#tab.attachments > 0) and 58 or 0
-    local tx, ty = lx + 8, TOP + 4
-    local tw, th = W - lx - 16, H - ty - input_h - att_h - 12
-    if S.sidebar == 'apilog' and S.apilog_selected then
+    local question_h = answering and math.min(user_input.height(tab, rx - lx - 16,
+        function(s) return raygui.measure_text(s, 16) end), H - TOP - comp_h - att_h - 24) or 0
+    local content_pad = math.min(48, math.max(20, math.floor((rx - lx) * 0.04)))
+    local tx, ty = lx + content_pad, TOP + 16
+    local tw, th = rx - lx - 2 * content_pad, math.max(0, H - ty - comp_h - question_h - att_h - 12 - (answering and 10 or 0))
+    if th > 24 and S.panel == 'apilog' and S.apilog_selected then
         local rec = S.apilog_selected
         -- rebuild the detail if the record finished since it was first shown
         if S.log_detail_for ~= rec or S.log_detail_done ~= rec.done then
@@ -1901,13 +2554,18 @@ local function __update()
             S.log_detail_done = rec.done
         end
         S.log_view:draw(S.log_detail, tx, ty, tw, th)
-    else
-        tab.view:draw(tab.entries, tx, ty, tw, th)
+    elseif th > 24 then
+        local fresh = tab.welcome and not tab.busy
+        for _, entry in ipairs(tab.entries) do
+            if entry.role ~= 'system' then fresh = false; break end
+        end
+        if fresh and th > 150 then draw_welcome(tab, tx, ty, tw, th)
+        else tab.view:draw(tab.entries, tx, ty, tw, th) end
     end
 
     -- attachment strip: pasted images as thumbnails, each with a ✗ to remove
     if att_h > 0 then
-        local ax, ay, thumb = lx + 8, H - input_h - att_h - 2, 48
+        local ax, ay, thumb = lx + 32, H - comp_h - att_h - 2, 48
         local remove_i
         for i, a in ipairs(tab.attachments) do
             local tw2 = math.max(24, math.min(96, math.floor(thumb * a.w / a.h + 0.5)))
@@ -1922,21 +2580,46 @@ local function __update()
         end
     end
 
-    -- input: Enter sends, Ctrl+Enter inserts a newline (no Send button).
-    -- textbox_multi reads raw keys (not raygui-locked), so its edit mode is
-    -- forced off while the directory dialog is open.
-    local iy = H - input_h - 4
-    local submitted, new_edit
-    tab.input, new_edit, submitted = raygui.textbox_multi(
-        lx + 8, iy, W - lx - 16, input_h, tab.input,
-        (not S.dir_dialog and not S.add_model and not S.dd_open) and tab.input_edit or false, true)
+    -- input: Enter sends, Ctrl+Enter inserts a newline; the toolbar under it
+    -- has the send/stop button. textbox_multi reads raw keys (not raygui-
+    -- locked), so its edit mode is forced off while the directory dialog is open.
+    local iy = H - comp_h + 12
+    local composer_x, composer_w = lx + 32, rx - lx - 64
+    local card_bg = composer_color()
+    local edge = mix(S.view_bg, tab.input_edit and accent_col() or text_col(), tab.input_edit and 0.48 or 0.16)
+    surface.rounded(raygui, composer_x - 12, iy - 12, composer_w + 24, INPUT_H + TOOLBAR_H + 24, 16, edge)
+    surface.rounded(raygui, composer_x - 11, iy - 11, composer_w + 22, INPUT_H + TOOLBAR_H + 22, 15, card_bg)
+    if answering then
+        local colors = {
+            bg = S.sidebar_bg, text = text_col(),
+            accent = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 },
+        }
+        user_input.draw(tab, raygui, lx + 8, iy - question_h - att_h - 10, rx - lx - 16, question_h,
+            colors, modal or grabbing, stop_turn)
+    end
+    local new_input, submitted, new_edit
+    new_input, new_edit, submitted = surface.editor(raygui, card_bg,
+        composer_x, iy, composer_w, INPUT_H, tab.input,
+        (not modal and not answering) and tab.input_edit or false, true)
+    -- The card owns keyboard input while waiting. Keep the original
+    -- composer and its draft visible without letting a second editor consume keys.
+    if not answering then tab.input = new_input end
+    if tab.input == '' then   -- placeholder (the caret sits just left of it)
+        draw_text_col(fit_label('问点什么，或描述一个任务…   / 命令 · @ 引用文件', composer_w - 20),
+            composer_x + 8, iy + 10, FONT_SIZE, muted_col())
+    end
+    local send_clicked = draw_composer_toolbar(tab, composer_x, iy, composer_w)
 
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
 
-    if not S.dir_dialog then
-        tab.input_edit = new_edit
-        if submitted then
+    if not S.dir_dialog and not answering then
+        -- the toolbar's '+' / a file-tree click may have just focused the box
+        tab.input_edit = new_edit or tab.input_edit_forced
+        tab.input_edit_forced = nil
+        if send_clicked then
+            submit()
+        elseif submitted then
             if S.menu then
                 -- Enter inserts the highlighted candidate — except when the user
                 -- already typed a full slash command verbatim, then just run it.
@@ -1954,31 +2637,16 @@ local function __update()
 
     -- popup is drawn above the input box (after focus handling, so a row click
     -- can re-focus the box); only shows while a / or @ token is present
-    draw_completion_menu(lx, iy, W)
+    draw_completion_menu(lx + 12, iy - 12, rx - 12)
     -- the "+" new-tab model picker (anchored under the tab bar)
     draw_tab_picker(W, H)
-
-    -- while running: a stop square overlays the input's top-right corner
-    -- (clicking requests cancellation at the next turn boundary)
-    if tab.busy then
-        local sb = 26
-        if stop_button(W - 14 - sb, iy + 6, sb, sb, { 215, 95, 85, 255 }) then
-            if tab.sess then tab.sess.cancelled = true end
-            -- release a parked confirm (as a deny) so the loop can reach its
-            -- next cancellation boundary instead of hanging on the prompt
-            if tab.pending_confirm then
-                local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
-            end
-            tab.status = '停止中'
-        end
-    end
 
     -- "ask" mode: a state-changing tool is parked awaiting the user's decision
     -- (for the ACTIVE tab; a background tab shows '!' on its tab button instead).
     -- A strip above the input shows the tool + args with 允许 / 拒绝.
     if tab.pending_confirm then
         local pc = tab.pending_confirm
-        local bx, bw, bh = lx + 8, W - lx - 16, 86
+        local bx, bw, bh = lx + 8, rx - lx - 16, 86
         local by = iy - bh - 6
         local pb = S.sidebar_bg
         raygui.draw_rectangle(bx, by, bw, bh, pb[1], pb[2], pb[3], 255)
@@ -2000,7 +2668,7 @@ local function __update()
     -- Ctrl+V with an image on the clipboard (flag set inside textbox_multi):
     -- grab it as PNG, make a thumbnail texture, queue as an attachment.
     local png, pw, ph = raygui.take_pasted_image()
-    if png then
+    if png and not answering then
         local tex = raygui.load_texture_mem(png)
         tab.attachments[#tab.attachments + 1] = { png = png, w = pw, h = ph, tex = tex }
         tab.status = '已附加图片 ' .. pw .. '×' .. ph
@@ -2033,10 +2701,12 @@ local function __update()
     -- open dropdown list: topmost overlay; unlocks the background it was drawn over.
     draw_dropdown_overlays(dd_open_at_start)
 
+    if grabbing then raygui.unlock() end
     raygui.finish()
 end
 
 local function __uninit()
+    for _, tab in ipairs(S.tabs) do cancel_session(tab) end
     chatgpt_login.cancel()
     -- Join the process workers while this state is still alive (see xproc.shutdown).
     subprocess.shutdown()
