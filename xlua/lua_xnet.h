@@ -31,6 +31,10 @@
 #define XNET_WITH_HTTPS 0
 #endif
 
+#ifndef XNET_WITH_UDP
+#define XNET_WITH_UDP 0
+#endif
+
 #ifndef lua_absindex
 #define lua_absindex(L, i) \
     (((i) > 0 || (i) <= LUA_REGISTRYINDEX) ? (i) : lua_gettop(L) + (i) + 1)
@@ -117,6 +121,13 @@ int l_xnet_attach_tls(lua_State* L);
 int l_xnet_connect_tls(lua_State* L);
 int l_xnet_connect_tls_fd(lua_State* L);
 void lua_xnet_tls_register(lua_State* L);
+#endif
+
+#if XNET_WITH_UDP
+int l_xnet_udp_bind(lua_State* L);
+void lua_xnet_udp_register(lua_State* L);
+/* NULL closes all UDP objects on this thread; otherwise only this Lua state. */
+void lua_xnet_udp_cleanup(lua_State* L);
 #endif
 
 #endif /* LUA_XNET_H */

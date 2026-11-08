@@ -63,9 +63,38 @@ jobs:
             test_target: test
             coverage: false
             lua_backend: luajit
+          - os: ubuntu-latest
+            name: udp-debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            with_udp: 1
+            test_target: test
+            coverage: false
+          - os: macos-latest
+            name: udp-debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            with_udp: 1
+            test_target: test
+            coverage: false
+          - os: ubuntu-latest
+            name: udp-luajit-debug-nohttps-norpmalloc
+            cc: gcc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            with_udp: 1
+            test_target: unit
+            coverage: false
+            lua_backend: luajit
 
     env:
       LUA_BACKEND: ${{ matrix.lua_backend || 'minilua' }}
+      WITH_UDP: ${{ matrix.with_udp || '0' }}
 
     steps:
       - name: Checkout
@@ -100,6 +129,15 @@ jobs:
             with_https: 1
             with_rpmalloc: 1
             test_target: unit
+          - name: udp-debug-nohttps-norpmalloc
+            build_mode: debug
+            with_https: 0
+            with_rpmalloc: 0
+            with_udp: 1
+            test_target: test
+
+    env:
+      WITH_UDP: ${{ matrix.with_udp || '0' }}
 
     defaults:
       run:

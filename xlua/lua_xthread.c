@@ -51,6 +51,7 @@
 #endif
 
 #include "xthread.h"
+#include "lua_xnet.h"
 #include "xlog.h"
 #include "xtimer.h"      /* transitively pulls xmacro.h via xheapmin.h */
 #include "lua_xdebug.h"
@@ -1298,9 +1299,22 @@ static void lua_thread_on_cleanup(xThread* thr) {
     }
 
     /* Auto-cleanup. Always reclaim xtimer if still up (idempotent and harmless).
-    ** Only tear down xpoll if the runner brought it up - otherwise the script
-    ** owns it via xnet.init. */
+    ** Default builds leave explicitly initialized xpoll to the script;
+    ** UDP-enabled builds also reclaim it at this final worker exit. */
+#if XNET_WITH_UDP
+    if (td->L) lua_xnet_udp_cleanup(td->L);
+#endif
     if (xtimer_inited()) xtimer_uninit();
+#if XNET_WITH_UDP
+    /* A worker's Lua state is about to disappear. If it explicitly initialized
+    ** xnet but omitted uninit, reclaim its poll after closing the UDP objects.
+    ** Do not release Winsock here: xnet.init's process-wide startup may belong
+    ** to the main thread and still serve other threads' TCP/TLS sockets. */
+    if (!td->auto_xpoll && xpoll_inited()) {
+        xthread_wakeup_uninit();
+        xpoll_uninit();
+    }
+#endif
     if (td->auto_xpoll) {
         xthread_wakeup_uninit();
         xpoll_uninit();

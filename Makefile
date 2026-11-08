@@ -45,6 +45,12 @@ WITH_HTTP ?= 1
 WITH_HTTPS ?= 1
 WITH_XDEBUG ?= 0
 WITH_XPROC ?= 0
+WITH_UDP ?= 0
+ifneq ($(WITH_UDP),0)
+ifneq ($(WITH_UDP),1)
+    $(error WITH_UDP must be 0 or 1)
+endif
+endif
 # WITH_MPSCQ=1: lock-free MPSC thread queues (-DXTHREAD_MPSCQ); backpressure
 #   becomes a soft limit that can briefly overshoot.
 WITH_MPSCQ ?= 0
@@ -66,7 +72,7 @@ LUAJIT_INC ?= $(LUAJIT_DIR)/src
 LUAJIT_LIB ?= $(LUAJIT_DIR)/src/libluajit.a
 BUILD_MODE ?= release
 
-BASE_CFLAGS := -Wall -Wextra -I. -MMD -MP
+BASE_CFLAGS := -Wall -Wextra -I. -MMD -MP -DXNET_WITH_UDP=$(WITH_UDP)
 SANITIZE_CFLAGS :=
 SANITIZE_LDFLAGS :=
 PROGRAM_SUFFIX :=
@@ -112,6 +118,9 @@ else
     TARGET_LIB := lib$(LIB_NAME).a
 endif
 CORE_SRCS := xargs.c xpoll.c xsock.c xchannel.c xthread.c xtimer.c xdaemon.c xlog.c xshared.c xrecord.c
+ifeq ($(WITH_UDP),1)
+	CORE_SRCS += xudp.c
+endif
 ifeq ($(WITH_XPROC),1)
 	CORE_SRCS += xproc.c
 endif
@@ -167,6 +176,9 @@ endif
 XNET_DEFLATE_SRC := $(wildcard 3rd/libdeflate/lib/*.c) $(XNET_CPU_FEATURES_SRC)
 XNET_UTIL_SRC := 3rd/yyjson.c xlua/lua_xutils.c xframe_aead.c $(XNET_DEFLATE_SRC)
 XNET_LUA_SRC := xlua/lua_xthread.c xlua/lua_xnet.c xlua/lua_xnet_tls.c xlua/lua_cmsgpack.c xlua/lua_xtimer.c xlua/lua_xcompress.c xlua/lua_xshared.c xlua/lua_xrecord.c xlua/lua_xscan.c xlua/lua_xwatch.c
+ifeq ($(WITH_UDP),1)
+	XNET_LUA_SRC += xlua/lua_xnet_udp.c
+endif
 ifeq ($(WITH_XPROC),1)
 	XNET_LUA_SRC += xlua/lua_xproc.c
 endif
@@ -243,7 +255,7 @@ XDEBUG_DAP_SRCS := tools/xdebug_dap.c xsock.c xpoll.c xlog.c
 XDEBUG_DAP_TARGET := tools/xdebug_dap$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 TEST_TARGETS := matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all
-TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTPS="$(WITH_HTTPS)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_XPROC="$(WITH_XPROC)" WITH_MPSCQ="$(WITH_MPSCQ)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
+TEST_MAKE := $(MAKE) -C tests ROOT=.. CC="$(CC)" BUILD_MODE="$(BUILD_MODE)" SANITIZE="$(SANITIZE)" WITH_HTTP="$(WITH_HTTP)" WITH_HTTPS="$(WITH_HTTPS)" WITH_UDP="$(WITH_UDP)" WITH_RPMALLOC="$(WITH_RPMALLOC)" WITH_XDEBUG="$(WITH_XDEBUG)" WITH_XPROC="$(WITH_XPROC)" WITH_MPSCQ="$(WITH_MPSCQ)" WITH_IO_URING="$(WITH_IO_URING)" LUA_BACKEND="$(LUA_BACKEND)" LUAJIT_DIR="$(LUAJIT_DIR)" LUAJIT_INC="$(LUAJIT_INC)" LUAJIT_LIB="$(LUAJIT_LIB)"
 ASAN_BUILD_ARGS := BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0
 
 xdebug_dap: $(XDEBUG_DAP_TARGET)
@@ -253,6 +265,20 @@ $(XDEBUG_DAP_TARGET): $(XDEBUG_DAP_SRCS)
 	$(CC) -Wall -Wextra -I. -MMD -MP -DXMACRO_USE_RPMALLOC=0 $(SANITIZE_CFLAGS) -o $@ $(XDEBUG_DAP_SRCS) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS)
 
 .PHONY: all xnet xdebug_dap asan asan-test asan-unit asan-run-lua clean $(TEST_TARGETS) run-lua
+
+# Keep configuration outside the disposable object directory. A changed macro
+# must invalidate both core objects and the runner, including when switching
+# back to a configuration that was built previously.
+CONFIG_STAMP := $(BIN_DIR)/.xnet-config$(PROGRAM_SUFFIX)
+CONFIG_VALUE := $(OS)|$(XNET_HOST_ARCH)|$(CC)|$(CFLAGS)|$(BUILD_MODE)|$(SANITIZE)|$(WITH_UDP)|$(WITH_HTTP)|$(WITH_HTTPS)|$(WITH_XDEBUG)|$(WITH_XPROC)|$(WITH_MPSCQ)|$(WITH_RPMALLOC)|$(WITH_IO_URING)|$(LUA_BACKEND)|$(LUAJIT_INC)|$(LUAJIT_LIB)
+.PHONY: FORCE_CONFIG
+FORCE_CONFIG:
+$(CONFIG_STAMP): FORCE_CONFIG | $(BIN_DIR)
+	@echo '$(CONFIG_VALUE)' > $@.tmp
+	@cmp -s $@.tmp $@ || $(MV) $@.tmp $@
+	@$(RM) $@.tmp
+
+$(CORE_OBJS): $(CONFIG_STAMP)
 
 # Intermediate build artifacts removed after a successful build, leaving only the
 # binaries (+ libxnet.a): the core object dir, the windres object, and the
@@ -281,7 +307,8 @@ asan-run-lua:
 	fi
 	ASAN_OPTIONS="$(ASAN_OPTIONS)" $(MAKE) -B run-lua $(ASAN_BUILD_ARGS) SCRIPT="$(SCRIPT)"
 
-$(TARGET_LIB): $(CORE_OBJS)
+$(TARGET_LIB): $(CORE_OBJS) $(CONFIG_STAMP)
+	$(RM) $(TARGET_LIB)
 	$(AR) $(ARFLAGS) $@ $(CORE_OBJS)
 
 $(OBJ_DIR)/%.o: %.c | $(OBJ_DIR)
@@ -292,7 +319,7 @@ $(XNET_RES_OBJ): xlua/xnet.rc | $(BIN_DIR)
 	$(WINDRES) xlua/xnet.rc $(XNET_RES_OBJ)
 endif
 
-$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) $(XNET_RES_OBJ) | $(BIN_DIR)
+$(XNET_TARGET): xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(XNET_LUA_LIB) $(XNET_RES_OBJ) $(CONFIG_STAMP) | $(BIN_DIR)
 	$(RM) $(XNET_BUILD)
 	$(CC) $(CFLAGS) $(XNET_CFLAGS) $(XNET_DEFS) -o $(XNET_BUILD) xlua/xnet_main.c $(XNET_LUA_SRC) $(XNET_DEBUG_SRC) $(XNET_UTIL_SRC) $(XNET_HTTPS_SRC) $(XNET_CRYPTO_SRC) $(RPMALLOC_SRC) $(TARGET_LIB) $(XNET_LUA_LIB) $(XNET_RES_OBJ) $(SANITIZE_LDFLAGS) $(SYS_LDFLAGS) $(XNET_EXTRA_LDFLAGS)
 	$(MV) $(XNET_BUILD) $(XNET_TARGET)

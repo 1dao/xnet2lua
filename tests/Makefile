@@ -1,7 +1,11 @@
 ROOT ?= ..
+.DEFAULT_GOAL := matrix
 CC ?= gcc
 BUILD_MODE ?= release
 WITH_HTTPS ?= 1
+WITH_HTTP ?= 1
+WITH_UDP ?= 0
+export XNET_TEST_WITH_UDP := $(WITH_UDP)
 WITH_RPMALLOC ?= 1
 WITH_XDEBUG ?= 0
 WITH_IO_URING ?= 0
@@ -19,7 +23,7 @@ LUAJIT_INC ?= $(LUAJIT_DIR)/src
 LUAJIT_LIB ?= $(LUAJIT_DIR)/src/libluajit.a
 GCOV ?= gcov
 
-BASE_CFLAGS := -Wall -Wextra -I$(ROOT) -MMD -MP
+BASE_CFLAGS := -Wall -Wextra -I$(ROOT) -MMD -MP -DXNET_WITH_UDP=$(WITH_UDP)
 SANITIZE_CFLAGS :=
 SANITIZE_LDFLAGS :=
 PROGRAM_SUFFIX :=
@@ -99,11 +103,14 @@ XTHREAD_TEST_RUNNER := bin/xthread_test$(PROGRAM_SUFFIX)$(EXE_EXT)
 
 C_UNIT_LOCAL_SRCS := c/test_core.c
 C_UNIT_ROOT_SRCS := xargs.c xtimer.c xpoll.c xlog.c
+ifeq ($(WITH_UDP),1)
+	C_UNIT_ROOT_SRCS += xudp.c
+endif
 C_UNIT_SRCS := $(C_UNIT_LOCAL_SRCS) $(addprefix $(ROOT)/,$(C_UNIT_ROOT_SRCS))
 C_UNIT_BUILD := $(BIN_DIR)/test_core$(PROGRAM_SUFFIX)_build$(EXE_EXT)
 C_UNIT_TARGET := $(BIN_DIR)/test_core$(PROGRAM_SUFFIX)$(EXE_EXT)
 C_UNIT_RUNNER := bin/test_core$(PROGRAM_SUFFIX)$(EXE_EXT)
-C_UNIT_CFLAGS := -Wall -Wextra -I$(ROOT) -MMD -MP -DXMACRO_USE_RPMALLOC=0 $(SANITIZE_CFLAGS)
+C_UNIT_CFLAGS := -Wall -Wextra -I$(ROOT) -MMD -MP -DXMACRO_USE_RPMALLOC=0 -DXNET_WITH_UDP=$(WITH_UDP) $(SANITIZE_CFLAGS)
 ifeq ($(WITH_IO_URING),1)
 ifneq ($(OS),Windows_NT)
 	C_UNIT_CFLAGS += -DXPOLL_USE_IO_URING
@@ -119,6 +126,7 @@ C_UNIT_COVERAGE_CFLAGS := $(C_UNIT_CFLAGS) -O0 -g --coverage
 C_UNIT_COVERAGE_LDFLAGS := $(SYS_LDFLAGS) --coverage
 
 LUA_UNIT_SCRIPTS := \
+	tests/lua/udp_spec.lua \
 	tests/lua/http_codec_spec.lua \
 	tests/lua/http_client_spec.lua \
 	tests/lua/websocket_spec.lua \
@@ -155,6 +163,10 @@ LUA_TEST_CORE_SCRIPTS := \
 	tests/lua/xpoll_fd_reuse_test.lua \
 	tests/lua/timer_coroutine_test.lua
 
+ifeq ($(WITH_UDP),1)
+LUA_TEST_CORE_SCRIPTS += demo/xudp_main.lua
+endif
+
 ifeq ($(WITH_XPROC),1)
 LUA_TEST_CORE_SCRIPTS += tests/lua/xproc_pipe_test.lua
 endif
@@ -170,7 +182,9 @@ ROOT_BUILD_ARGS := \
 	CC="$(CC)" \
 	BUILD_MODE="$(BUILD_MODE)" \
 	SANITIZE="$(SANITIZE)" \
+	WITH_HTTP="$(WITH_HTTP)" \
 	WITH_HTTPS="$(WITH_HTTPS)" \
+	WITH_UDP="$(WITH_UDP)" \
 	WITH_RPMALLOC="$(WITH_RPMALLOC)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
 	WITH_XPROC="$(WITH_XPROC)" \
@@ -184,6 +198,7 @@ SELF_ARGS := \
 	ROOT="$(ROOT)" \
 	CC="$(CC)" \
 	SANITIZE="$(SANITIZE)" \
+	WITH_UDP="$(WITH_UDP)" \
 	WITH_XDEBUG="$(WITH_XDEBUG)" \
 	WITH_XPROC="$(WITH_XPROC)" \
 	WITH_IO_URING="$(WITH_IO_URING)" \
@@ -193,6 +208,17 @@ SELF_ARGS := \
 	LUAJIT_LIB="$(LUAJIT_LIB)"
 
 ASAN_BUILD_ARGS := BUILD_MODE=debug SANITIZE=asan WITH_RPMALLOC=0
+
+CONFIG_STAMP := $(BIN_DIR)/.tests-config$(PROGRAM_SUFFIX)
+CONFIG_VALUE := $(OS)|$(CC)|$(CFLAGS)|$(BUILD_MODE)|$(SANITIZE)|$(WITH_UDP)|$(WITH_HTTPS)|$(WITH_RPMALLOC)|$(WITH_XPROC)|$(WITH_MPSCQ)|$(WITH_IO_URING)
+.PHONY: FORCE_CONFIG
+FORCE_CONFIG:
+$(CONFIG_STAMP): FORCE_CONFIG | $(BIN_DIR)
+	@echo '$(CONFIG_VALUE)' > $@.tmp
+	@cmp -s $@.tmp $@ || $(MV) $@.tmp $@
+	@$(RM) $@.tmp
+
+$(C_UNIT_TARGET) $(XTHREAD_TEST_TARGET) $(C_UNIT_COVERAGE_OBJS): $(CONFIG_STAMP)
 
 .PHONY: matrix ci-fast ci-feature coverage coverage-c test unit unit-c unit-lua test-c xthread_test test-lua-core test-lua-external test-lua-all asan-test asan-unit asan-run-lua run-lua xnet clean
 

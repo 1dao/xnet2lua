@@ -16,6 +16,7 @@ set "WITH_HTTPS=1"
 set "WITH_IO_URING=0"
 set "WITH_XDEBUG=0"
 set "WITH_XPROC=1"
+set "WITH_UDP=0"
 set "WITH_MPSCQ=0"
 set "WITH_RPMALLOC=1"
 set "WITH_ASAN=0"
@@ -34,6 +35,8 @@ for %%A in (%*) do (
     if /I "!ARG!"=="noxdebug" set "WITH_XDEBUG=0"
     if /I "!ARG!"=="xproc" set "WITH_XPROC=1"
     if /I "!ARG!"=="noxproc" set "WITH_XPROC=0"
+    if /I "!ARG!"=="udp" set "WITH_UDP=1"
+    if /I "!ARG!"=="noudp" set "WITH_UDP=0"
     if /I "!ARG!"=="mpscq" set "WITH_MPSCQ=1"
     if /I "!ARG!"=="nompscq" set "WITH_MPSCQ=0"
     if /I "!ARG!"=="norpmalloc" set "WITH_RPMALLOC=0"
@@ -76,7 +79,7 @@ if "%WITH_IO_URING%"=="1" (
 )
 
 echo %GREEN%[INFO]%RESET% Root build with MSVC (all-source compile)...
-echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% xdebug=%WITH_XDEBUG% xproc=%WITH_XPROC% mpscq=%WITH_MPSCQ% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
+echo %GREEN%[INFO]%RESET% target=%TARGET% mode=%BUILD_MODE% lua=%LUA_BACKEND% http=%WITH_HTTP% https=%WITH_HTTPS% udp=%WITH_UDP% xdebug=%WITH_XDEBUG% xproc=%WITH_XPROC% mpscq=%WITH_MPSCQ% rpmalloc=%WITH_RPMALLOC% asan=%WITH_ASAN%
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -119,14 +122,21 @@ if "%WITH_XDEBUG%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xlua\lua_xdebug.c"
 if "%WITH_XPROC%"=="1" set "XNET_SOURCES=%XNET_SOURCES% xproc.c xlua\lua_xproc.c"
 set "THREAD_SOURCES=demo\xthread_test.c"
 set "C_UNIT_SOURCES=tests\c\test_core.c xargs.c xtimer.c xpoll.c xlog.c"
+if "%WITH_UDP%"=="1" (
+    set "COMMON_SOURCES=!COMMON_SOURCES! xudp.c"
+    set "XNET_SOURCES=!XNET_SOURCES! xlua\lua_xnet_udp.c"
+    set "C_UNIT_SOURCES=!C_UNIT_SOURCES! xudp.c"
+)
 set "LUAJIT_DIR=3rd\luajit\src"
 set "LUAJIT_INC=3rd\luajit\src"
 
-set "LUA_UNIT_SCRIPTS=tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua tests/lua/utf8_spec.lua tests/lua/xutils_filesystem_spec.lua tests/lua/xwatch_spec.lua"
+set "LUA_UNIT_SCRIPTS=tests/lua/udp_spec.lua tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua tests/lua/utf8_spec.lua tests/lua/xutils_filesystem_spec.lua tests/lua/xwatch_spec.lua"
+set "XNET_TEST_WITH_UDP=%WITH_UDP%"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua tests/lua/conn_close_leak_test.lua tests/lua/timer_coroutine_test.lua"
+if "%WITH_UDP%"=="1" set "LUA_TEST_CORE_SCRIPTS=!LUA_TEST_CORE_SCRIPTS! demo/xudp_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"
 
-set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_XDEBUG=%WITH_XDEBUG% /DXNET_WITH_XPROC=%WITH_XPROC%"
+set "DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXNET_WITH_HTTP=%WITH_HTTP% /DXNET_WITH_HTTPS=%WITH_HTTPS% /DXNET_WITH_UDP=%WITH_UDP% /DXNET_WITH_XDEBUG=%WITH_XDEBUG% /DXNET_WITH_XPROC=%WITH_XPROC%"
 REM mpscq: lock-free MPSC thread queues (backpressure becomes a soft limit).
 if "%WITH_MPSCQ%"=="1" set "DEFS=%DEFS% /DXTHREAD_MPSCQ"
 if "%WITH_RPMALLOC%"=="1" (
@@ -449,7 +459,7 @@ if "%NEED_BUILD_THREAD%"=="1" (
 )
 
 if "%NEED_BUILD_UNIT%"=="1" (
-    set "UNIT_DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXMACRO_USE_RPMALLOC=0"
+    set "UNIT_DEFS=/DWIN32_LEAN_AND_MEAN /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00 /D_CRT_SECURE_NO_WARNINGS /DXMACRO_USE_RPMALLOC=0 /DXNET_WITH_UDP=%WITH_UDP%"
     set "UNIT_CFLAGS=/nologo /TC /W3 /utf-8 /std:c11 /experimental:c11atomics /wd4005 /wd4100 /wd4206 /wd4244 /wd4267 /wd4334 /wd4706 /wd4996 !UNIT_DEFS! /I."
     if /I "%BUILD_MODE%"=="debug" (
         set "UNIT_CFLAGS=!UNIT_CFLAGS! /Od /Zi /MDd /DDEBUG"

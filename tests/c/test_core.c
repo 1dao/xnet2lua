@@ -9,6 +9,7 @@
 #include "xlog.h"
 #include "xpoll.h"
 #include "xtimer.h"
+#include "xudp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -323,6 +324,127 @@ static void test_xpoll_lifecycle(xTestState* st) {
     XTEST_FALSE(st, xpoll_inited());
 }
 
+#if XNET_WITH_UDP
+typedef struct UdpTestContext {
+    int count;
+    size_t lengths[16];
+    char last[16];
+    xUdpAddress source;
+    int destroy_on_receive;
+} UdpTestContext;
+
+static void udp_test_receive(xUdp* udp, const char* data, size_t len,
+                             const xUdpAddress* from, void* ud) {
+    UdpTestContext* ctx = (UdpTestContext*)ud;
+    if (ctx->count < 16) ctx->lengths[ctx->count] = len;
+    ++ctx->count;
+    memcpy(ctx->last, data, len < sizeof(ctx->last) ? len : sizeof(ctx->last));
+    ctx->source = *from;
+    if (ctx->destroy_on_receive) xudp_destroy(udp);
+}
+
+static void test_xudp(xTestState* st) {
+    char err[XSOCK_ERR_LEN];
+    xUdpConfig cfg = {0};
+    UdpTestContext ctx = {0}, destroyed = {0};
+    xUdpAddress receiver_addr, sender_addr, other_addr;
+    xUdpStats stats;
+    xUdp *receiver = NULL, *sender = NULL, *other = NULL, *temporary;
+    const char binary[] = {'a', '\0', 'b'};
+    int native_error = -1;
+    xtest_suite("optional UDP datagrams and lifetime");
+    XTEST_EQ_INT(st, socket_init(), 0);
+    XTEST_NULL(st, xudp_bind("127.0.0.1", 0, NULL, err)); /* no poll yet */
+    XTEST_EQ_INT(st, xpoll_init(), 0);
+    XTEST_EQ_INT(st, xudp_live_count(), 0);
+    XTEST_EQ_INT(st, xudp_socket_count(), 0);
+    XTEST_NULL(st, xudp_bind("bad-address", 0, NULL, err));
+    XTEST_NULL(st, xudp_bind("127.0.0.1", 65536, NULL, err));
+    cfg.max_datagram = XUDP_MAX_DATAGRAM + 1;
+    XTEST_NULL(st, xudp_bind(NULL, 0, &cfg, err));
+    cfg.max_datagram = 8;
+    cfg.recv_budget = 2;
+    cfg.on_datagram = udp_test_receive;
+    cfg.userdata = &ctx;
+    receiver = xudp_bind("127.0.0.1", 0, &cfg, err);
+    sender = xudp_bind("127.0.0.1", 0, NULL, err);
+    other = xudp_bind("127.0.0.1", 0, NULL, err);
+    XTEST_TRUE(st, receiver && sender && other);
+    if (!receiver || !sender || !other) goto cleanup;
+    XTEST_EQ_INT(st, xudp_sockname(receiver, &receiver_addr), XUDP_OK);
+    XTEST_EQ_INT(st, xudp_sockname(sender, &sender_addr), XUDP_OK);
+    XTEST_EQ_INT(st, xudp_sockname(other, &other_addr), XUDP_OK);
+    XTEST_EQ_STR(st, receiver_addr.ip, "127.0.0.1");
+    XTEST_TRUE(st, receiver_addr.port > 0 && sender_addr.port != receiver_addr.port);
+    XTEST_NULL(st, xudp_bind(receiver_addr.ip, receiver_addr.port, NULL, err));
+    XTEST_EQ_INT(st, xpoll_fd_count(), 3);
+    XTEST_EQ_INT(st, xudp_sendto(sender, binary, sizeof(binary), &receiver_addr, &native_error), XUDP_OK);
+    XTEST_EQ_INT(st, native_error, 0);
+    XTEST_EQ_INT(st, xudp_sendto(sender, NULL, 0, &receiver_addr, NULL), XUDP_OK);
+    /* Four queued datagrams, one readiness callback must read two and yield. */
+    XTEST_EQ_INT(st, xudp_sendto(sender, "123456789012", 12, &receiver_addr, NULL), XUDP_OK);
+    XTEST_EQ_INT(st, xudp_sendto(other, "end", 3, &receiver_addr, NULL), XUDP_OK);
+    xpoll_poll(100);
+    XTEST_EQ_INT(st, ctx.count, 2);
+    XTEST_EQ_INT(st, ctx.lengths[0], sizeof(binary));
+    XTEST_EQ_INT(st, ctx.lengths[1], 0);
+    for (int i = 0; i < 50 && ctx.count < 3; ++i) xpoll_poll(10);
+    XTEST_EQ_INT(st, ctx.count, 3);
+    XTEST_EQ_INT(st, ctx.lengths[2], 3);
+    XTEST_TRUE(st, memcmp(ctx.last, "end", 3) == 0);
+    XTEST_EQ_INT(st, ctx.source.port, other_addr.port);
+    xudp_get_stats(receiver, &stats);
+    XTEST_EQ_INT(st, stats.dropped_oversize, 1);
+    XTEST_TRUE(st, stats.budget_yields >= 1);
+    XTEST_EQ_INT(st, stats.datagrams_received, 3);
+    XTEST_EQ_INT(st, stats.bytes_received, 6);
+    XTEST_EQ_INT(st, xudp_sendto(receiver, "123456789", 9, &sender_addr, NULL), XUDP_TOO_LARGE);
+    XTEST_EQ_INT(st, xudp_address("::1", 1, &sender_addr), XUDP_INVALID_ADDRESS);
+    /* Destination failure must not kill this shared socket. Send to a port
+     * just released by us, then receive a valid packet on the same socket. */
+    temporary = xudp_bind("127.0.0.1", 0, NULL, err);
+    XTEST_TRUE(st, temporary != NULL);
+    if (temporary) {
+        xUdpAddress unused;
+        xudp_sockname(temporary, &unused);
+        xudp_destroy(temporary);
+        xudp_sendto(receiver, "probe", 5, &unused, NULL);
+        for (int i = 0; i < 4; ++i) xpoll_poll(10);
+        XTEST_FALSE(st, xudp_is_closed(receiver));
+        XTEST_EQ_INT(st, xudp_sendto(sender, "alive", 5, &receiver_addr, NULL), XUDP_OK);
+        for (int i = 0; i < 50 && ctx.count < 4; ++i) xpoll_poll(10);
+        XTEST_EQ_INT(st, ctx.count, 4);
+    }
+    /* Dispatch holds a reference, allowing owner destruction in a callback. */
+    cfg.userdata = &destroyed;
+    destroyed.destroy_on_receive = 1;
+    temporary = xudp_bind("127.0.0.1", 0, &cfg, err);
+    XTEST_TRUE(st, temporary != NULL);
+    if (temporary) {
+        xUdpAddress address;
+        xudp_sockname(temporary, &address);
+        xudp_sendto(sender, "bye", 3, &address, NULL);
+        for (int i = 0; i < 50 && !destroyed.count; ++i) xpoll_poll(10);
+        XTEST_EQ_INT(st, destroyed.count, 1);
+        if (!destroyed.count) xudp_destroy(temporary);
+        XTEST_EQ_INT(st, xudp_live_count(), 3);
+    }
+    xudp_close(receiver);
+    xudp_close(receiver);
+    XTEST_TRUE(st, xudp_is_closed(receiver));
+    XTEST_EQ_INT(st, xudp_socket_count(), 2);
+    XTEST_EQ_INT(st, xudp_live_count(), 3);
+    XTEST_EQ_INT(st, xudp_sendto(receiver, "", 0, &receiver_addr, NULL), XUDP_CLOSED);
+cleanup:
+    xudp_destroy(receiver); xudp_destroy(sender); xudp_destroy(other);
+    XTEST_EQ_INT(st, xudp_socket_count(), 0);
+    XTEST_EQ_INT(st, xudp_live_count(), 0);
+    XTEST_EQ_INT(st, xpoll_fd_count(), 0);
+    xpoll_uninit();
+    socket_cleanup();
+}
+#endif
+
 int main(void) {
     xTestState st = XTEST_STATE_INIT;
 
@@ -333,6 +455,9 @@ int main(void) {
     test_xlog_levels_and_files(&st);
     test_xlog_level_names_and_console_only(&st);
     test_xpoll_lifecycle(&st);
+#if XNET_WITH_UDP
+    test_xudp(&st);
+#endif
 
     return xtest_summary(&st);
 }

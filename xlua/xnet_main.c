@@ -35,6 +35,9 @@
 #endif
 
 #include <stdbool.h>
+#if XNET_WITH_UDP
+void lua_xnet_udp_cleanup(lua_State* L);
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -504,6 +507,9 @@ static void main_uninit(MainLuaData* data) {
 
     /* Auto-cleanup any subsystem the script started but forgot to tear down.
     ** Each *_uninit is internally idempotent. */
+#if XNET_WITH_UDP
+    if (data->L) lua_xnet_udp_cleanup(data->L);
+#endif
     if (xtimer_inited()) xtimer_uninit();
     if (xpoll_inited()) {
         xthread_wakeup_uninit();

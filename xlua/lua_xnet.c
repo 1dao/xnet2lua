@@ -25,6 +25,9 @@
 #include "xlog.h"
 #include "xframe_aead.h"
 #include "lua_xnet.h"
+#if XNET_WITH_UDP
+#include "xudp.h"
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -813,6 +816,9 @@ static int l_xnet_init(lua_State* L) {
 
 static int l_xnet_uninit(lua_State* L) {
     (void)L;
+#if XNET_WITH_UDP
+    lua_xnet_udp_cleanup(NULL);
+#endif
     if (xthread_current()) xthread_wakeup_uninit();
     xpoll_uninit();
     if (g_socket_started) {
@@ -859,6 +865,13 @@ static int l_xnet_get_stats(lua_State* L) {
     int qmax = xthread_get_queue_max(cur_id);
     lua_pushinteger(L, qmax < 0 ? 0 : qmax);
     lua_setfield(L, -2, "queue_max");
+
+#if XNET_WITH_UDP
+    lua_pushinteger(L, xudp_socket_count());
+    lua_setfield(L, -2, "udp_count");
+    lua_pushinteger(L, xudp_live_count());
+    lua_setfield(L, -2, "udp_object_count");
+#endif
 
     return 1;
 }
@@ -1072,6 +1085,9 @@ static const luaL_Reg listener_methods[] = {
 };
 
 static const luaL_Reg xnet_funcs[] = {
+#if XNET_WITH_UDP
+    { "udp_bind", l_xnet_udp_bind },
+#endif
     { "init",      l_xnet_init },
     { "uninit",    l_xnet_uninit },
     { "poll",      l_xnet_poll },
@@ -1113,6 +1129,10 @@ LUALIB_API int luaopen_xnet(lua_State* L) {
 
 #if XNET_WITH_HTTPS
     lua_xnet_tls_register(L);
+#endif
+
+#if XNET_WITH_UDP
+    lua_xnet_udp_register(L);
 #endif
 
     luaL_newlib(L, xnet_funcs);
