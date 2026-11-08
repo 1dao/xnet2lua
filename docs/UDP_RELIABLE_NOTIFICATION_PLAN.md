@@ -539,7 +539,7 @@ Pong 只保证约定意义上的客户端接收，不保证客户端崩溃后仍
 | 事项 | 已确认范围及本次实现 |
 | --- | --- |
 | 语言 | 先 Lua，暂不考虑 xjs，也不要求先提取公共 C 协议状态机；C 数据报层仍与语言无关 |
-| 线程归属 | 主线程持有共享 UDP socket，按逻辑会话将完整数据报及来源地址投递业务线程。业务线程返回报文，主线程 `sendto` 后回报实际发送结果；不会为玩家创建 accepted fd。demo 使用一个 worker，业务可维护会话到 worker 的分配表 |
+| 线程归属 | 主线程持有共享 UDP socket，按逻辑会话将完整数据报及来源地址投递业务线程。业务线程返回报文，主线程 `sendto` 后回报实际发送结果；不会为玩家创建 accepted fd。demo 使用两个 worker，主线程在首个合法 HELLO 时轮询分配会话，并记录固定归属；后续数据报、发送报文及发送回执均按归属表路由 |
 | 凭证与地址 | 先用内存中预设的会话 token 和 `HELLO/HELLO_OK`。首个有效报文固定地址，后续地址变化明确拒绝，不自动切网或回退；demo 的固定 token 仅用于 loopback 模拟 |
 | 恢复承诺 | 不包含服务器崩溃、客户端重启恢复；不接入 Redis 或持久化。新逻辑会话需新身份及安全上下文，不能复用旧 ID/nonce 空间 |
 | wire format 与编号 | 提供可替换 `pack/unpack`；默认 v1 JSON 数据报，通知内部是完整消息字符串列表。Ping/RPC ID 为 1..2147483647 的规范十进制字符串；包序号、实体代次、运动版本及采样序号为同范围内的整数（实体版本可从 0 开始），到上限不回绕 |
@@ -731,7 +731,11 @@ build.bat udp run-lua demo/xudp_protocol_main.lua
 make run-lua WITH_UDP=1 SCRIPT=demo/xudp_protocol_main.lua
 ```
 
-该 demo 实际创建共享服务端 UDP socket 与一个模拟客户端，worker 198 持有协议/业务状态，通过 xthread 转发数据报和实际发送回执。模拟丢弃首次 RPC_REQUEST、PING 和 PONG；验证技能只执行一次、资源从 100 扣到 90，RPC #2 在 #1 的结果返回后才发起，查询/Notify/Pong 在异步业务期间继续工作，MOVE v12 先到后跳过可靠暂停 v11，最终空闲 Ping/Pong 完成。demo 显式 `allow_insecure=true`、固定本地 token，仅测试功能；不作为安全部署示例。
+该 demo 创建 **1 个共享服务端 UDP socket、2 个工作线程（198/199）、4 个模拟客户端会话**。主线程校验本地模拟凭证和来源地址，首个合法 HELLO 到达后轮询分配 worker；发送 `open_session` 后再转交完整数据报，后续重试及控制包保持相同归属。每个 worker 管理多个独立 `Session`，无 UDP socket；回包由主线程发送，实际发送回执返回该会话的所属 worker。
+
+默认每个 worker 分到 2 个会话。所有会话都使用相同的 RPC #1/#2 及实体名 player，结果另外携带会话标识和 worker ID 供断言校验；每个客户端使用不同技能消耗（11..14），各自只执行一次、余额分别为 89/88/87/86，以发现状态串线。每个会话独立模拟首次 RPC_REQUEST、PING 和 PONG 丢失，并验证 RPC 串行缓存、查询、Notify、MOVE v12 与旧暂停 v11 过滤和空闲心跳。结束时校验分配均衡、会话归属不变、worker 会话表与主线程一致，以及所有 UDP fd 注册恢复基线。`WORKERS` 和 `CLIENT_COUNT` 常量位于 demo 顶部。
+
+模拟客户端自身各有一个 UDP socket，因此主线程 UDP 总数为 5；服务端始终只有一个共享 UDP socket，创建逻辑会话不增加服务端 UDP fd。demo 显式 `allow_insecure=true`、预设本地 token，仅测试功能；不作为安全部署示例。
 
 ### 15.6 第三阶段验证
 
@@ -739,8 +743,9 @@ make run-lua WITH_UDP=1 SCRIPT=demo/xudp_protocol_main.lua
 - [x] 新增确定性会话/RPC/MOVE 用例已达 17 组，覆盖串行缓存、结果先于确认、重复/冲突请求、缓存过期不重执行、待发送确认合并、在途内容不可变、查询合并、队列满及未知/超时不放行下一 RPC、主线程发送回执、完整解析后确认、业务队列背压、实体代次及过期暂停。
 - [x] 安全/压缩回调用例使用明确标为测试专用的可逆映射验证接口顺序、认证失败不解压、解压上限、方向及每次重发的新包序号；不等于验证真实密码算法。
 - [x] Windows MinGW 及 Linux ASan/LeakSanitizer 的最新 17 组会话单元用例、真实 UDP/worker 功能模拟均通过；旧通知 10 组复测通过。
-- [x] Windows MSVC LuaJIT 的 16 组会话用例及实际 UDP/worker demo 通过；随后收尾加入的编码前大小校验由 Windows MinGW 和 Linux ASan 最新 17 组用例覆盖。
+- [x] Windows MSVC LuaJIT 的 16 组会话用例及最初的单 worker demo 通过；随后收尾加入的编码前大小校验由 Windows MinGW 和 Linux ASan 最新 17 组用例覆盖。
 - [x] 默认关闭的完整 `make test` 通过，87 项 C 断言、19 个 Lua 单元文件及核心集成测试通过；UDP 专属模块/接口不可用，静态库无 UDP 成员和符号。本地默认产物恢复 UDP 关闭。
 - [x] UDP 启用和关闭时现有 TLS 流控各 7 项通过。
+- [x] 多 worker 修正：Windows MinGW 连续 5 次、Linux ASan/LeakSanitizer 运行通过，均为 2 个 worker 各持有 2 个独立会话；验证固定归属、跨会话 RPC ID 隔离、回包及发送回执归属、丢包重试与资源释放。默认关闭 runner 明确跳过，未改变默认构建产物；本次未重跑多 worker 的 LuaJIT/macOS 验收。
 
 尚未交付：真实密码套件/密钥建立、实际登录系统、新路径认证与切网恢复、跨入口转发/归属迁移、游戏完整技能系统及生产压测；崩溃/重启持久化和 xjs 首版不纳入。
