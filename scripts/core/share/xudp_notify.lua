@@ -62,20 +62,46 @@ end
 
 -- Message strings are immutable and owned by the queue after success. Capacity
 -- includes queued AND in-flight messages until matching Pong releases them.
-function Sender:enqueue(message)
+function Sender:enqueue(message, key)
     assert(not self.busy, 'UDP notification hook reentry')
     assert(type(message) == 'string', 'encoded message string required')
     if self.expired then return false, self.expired end
+    if key ~= nil then assert(id_valid(key), 'nonempty queue key required') end
     if #message > self.cfg.max_message_bytes then return false, 'too_large' end
+    if key then
+        for _, entry in ipairs(self.pending) do
+            if entry.key == key then
+                local bytes = self.held_bytes - #entry.data + #message
+                if bytes > self.cfg.max_bytes then return false, 'queue_full' end
+                entry.data, self.held_bytes = message, bytes
+                return true, 'replaced'
+            end
+        end
+        if self.current and self.current.keys[key] == message then return true, 'in_flight' end
+    end
     if self.held_messages >= self.cfg.max_messages or
         self.held_bytes + #message > self.cfg.max_bytes then
         self.counters.queue_full = self.counters.queue_full + 1
         return false, 'queue_full'
     end
-    self.pending[#self.pending + 1] = message
+    self.pending[#self.pending + 1] = {data = message, key = key}
     self.held_messages = self.held_messages + 1
     self.held_bytes = self.held_bytes + #message
     return true
+end
+
+-- Keyed replacement affects pending messages only; packed content is immutable.
+function Sender:remove_pending(key)
+    assert(not self.busy, 'UDP notification hook reentry')
+    for i, entry in ipairs(self.pending) do
+        if entry.key == key then
+            table.remove(self.pending, i)
+            self.held_messages = self.held_messages - 1
+            self.held_bytes = self.held_bytes - #entry.data
+            return true
+        end
+    end
+    return false
 end
 
 function Sender:_alive()
@@ -105,7 +131,7 @@ function Sender:step(now)
         -- Reserve the ID even on pack failure; never reuse it for different data.
         self.last_id = id
         local candidate = {}
-        for i, message in ipairs(self.pending) do candidate[i] = message end
+        for i, entry in ipairs(self.pending) do candidate[i] = entry.data end
         local packed, body, count = call(self, self.pack, id, candidate, self.cfg.max_batch_bytes)
         if not packed or type(body) ~= 'string' or #body > self.cfg.max_batch_bytes or
             type(count) ~= 'number' or count % 1 ~= 0 or count < 0 or
@@ -114,13 +140,18 @@ function Sender:step(now)
             self.next_pack = now + self.cfg.send_retry_ms
             return false, 'pack_failed'
         end
-        local bytes = 0
-        for _ = 1, count do bytes = bytes + #table.remove(self.pending, 1) end
+        local bytes, keys = 0, {}
+        for _ = 1, count do
+            local entry = table.remove(self.pending, 1)
+            bytes = bytes + #entry.data
+            if entry.key then keys[entry.key] = entry.data end
+        end
         current = {id = id, body = body, count = count, bytes = bytes,
             deadline = now + self.cfg.round_timeout_ms, attempts = 0,
-            sent = 0, retry_delay = self.cfg.retry_ms, next_retry = now}
+            sent = 0, keys = keys, retry_delay = self.cfg.retry_ms, next_retry = now}
         self.current, self.next_pack = current, nil
     end
+    if current.transmitting then return true, 'transmitting' end
     if now < current.next_retry then return true, 'waiting' end
     if current.attempts >= self.cfg.max_attempts then
         self.expired = 'attempt_limit'
@@ -128,11 +159,19 @@ function Sender:step(now)
     end
     current.attempts = current.attempts + 1
     -- Re-encrypting the same logical body is the transport hook's job.
-    local called, sent, reason = call(self, self.send_ping, current.id, current.body)
-    if not called or sent ~= true then
+    current.transmitting = true
+    local called, sent, reason = call(self, self.send_ping, current.id, current.body, current.attempts)
+    if called and sent == nil and reason == 'pending' then return true, 'transmitting' end
+    return self:_sent(current, called and sent == true, now,
+        called and (reason or 'send_failed') or 'send_failed')
+end
+
+function Sender:_sent(current, sent, now, reason)
+    current.transmitting = false
+    if not sent then
         self.counters.send_failures = self.counters.send_failures + 1
         current.next_retry = now + self.cfg.send_retry_ms
-        return false, called and (reason or 'send_failed') or 'send_failed'
+        return false, reason or 'send_failed'
     end
     if current.sent > 0 then self.counters.retries = self.counters.retries + 1 end
     current.sent = current.sent + 1
@@ -141,6 +180,18 @@ function Sender:step(now)
     current.next_retry = now + current.retry_delay
     current.retry_delay = math.min(self.cfg.retry_max_ms, current.retry_delay * 2)
     return true, 'sent'
+end
+
+-- An owning I/O thread reports actual socket acceptance for an async send.
+-- A stale receipt must not affect a newer attempt/round or heartbeat deadline.
+function Sender:send_result(id, attempt, success, now)
+    clock(self, now)
+    if not self:_alive() then return false, self.expired end
+    local c = self.current
+    if not c or c.id ~= id or c.attempts ~= attempt or not c.transmitting then
+        return false, 'stale_send_result'
+    end
+    return self:_sent(c, success == true, now)
 end
 
 function Sender:ack(id, now)
