@@ -733,7 +733,7 @@ make run-lua WITH_UDP=1 SCRIPT=demo/xudp_protocol_main.lua
 
 该 demo 创建 **1 个共享服务端 UDP socket、2 个工作线程（198/199）、4 个模拟客户端会话**。主线程校验本地模拟凭证和来源地址，首个合法 HELLO 到达后轮询分配 worker；发送 `open_session` 后再转交完整数据报，后续重试及控制包保持相同归属。每个 worker 管理多个独立 `Session`，无 UDP socket；回包由主线程发送，实际发送回执返回该会话的所属 worker。
 
-默认每个 worker 分到 2 个会话。所有会话都使用相同的 RPC #1/#2 及实体名 player，结果另外携带会话标识和 worker ID 供断言校验；每个客户端使用不同技能消耗（11..14），各自只执行一次、余额分别为 89/88/87/86，以发现状态串线。每个会话独立模拟首次 RPC_REQUEST、PING 和 PONG 丢失，并验证 RPC 串行缓存、查询、Notify、MOVE v12 与旧暂停 v11 过滤和空闲心跳。结束时校验分配均衡、会话归属不变、worker 会话表与主线程一致，以及所有 UDP fd 注册恢复基线。`WORKERS` 和 `CLIENT_COUNT` 常量位于 demo 顶部。
+默认每个 worker 分到 2 个会话。所有会话都使用相同的 RPC #1/#2 及实体名 player，结果另外携带会话标识和 worker ID 供断言校验；每个客户端使用不同技能消耗（11..14），各自只执行一次、余额分别为 89/88/87/86，以发现状态串线。每个会话独立模拟首次 RPC_REQUEST、PING 和 PONG 丢失，并验证 RPC 串行缓存、查询、Notify、MOVE v12 与旧暂停 v11 过滤和空闲心跳。结束时校验分配均衡、会话归属不变、worker 会话表与主线程一致，以及所有 UDP fd 注册恢复基线。主线程配置包含 `WORKERS` 和 `CLIENT_COUNT`；线程角色直接按 `xthread.current_id() ~= xthread.MAIN` 判断，非主线程均运行 worker 分支。Lua 的 `xthread.MAIN` 对应 C 的 `XTHR_MAIN`。worker 回报、回包也使用该常量定位主线程；配置列表仅决定主线程创建和分配哪些 worker，不参与角色判断。
 
 模拟客户端自身各有一个 UDP socket，因此主线程 UDP 总数为 5；服务端始终只有一个共享 UDP socket，创建逻辑会话不增加服务端 UDP fd。demo 显式 `allow_insecure=true`、预设本地 token，仅测试功能；不作为安全部署示例。
 

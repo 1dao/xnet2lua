@@ -2,6 +2,7 @@
 -- Or: make run-lua WITH_UDP=1 SCRIPT=demo/xudp_protocol_main.lua
 -- One server UDP socket, multiple workers, multiple logical sessions per worker.
 -- Main assigns a worker on the first admitted HELLO and keeps that ownership.
+-- xthread.MAIN identifies main; every other thread runs the worker branch.
 -- Loopback simulation: fixed demo tokens, explicit plaintext mode, no recovery.
 local xnet = require('xnet')
 if not xnet.udp_bind then
@@ -13,9 +14,6 @@ end
 local Session = dofile('scripts/core/share/xudp_session.lua')
 local router = dofile('scripts/core/share/xrouter.lua')
 local json = require('xutils')
-local WORKERS, CLIENT_COUNT, HOST = {198,199}, 4, '127.0.0.1'
-local worker_set = {}
-for _,worker in ipairs(WORKERS) do worker_set[worker]=true end
 local function now() return xtimer.now_ms() end
 local function packet(data)
     if data:sub(1,1)~='R' then return {} end -- this demo explicitly uses plaintext JSON
@@ -24,7 +22,7 @@ local function packet(data)
 end
 
 local current_worker=xthread.current_id()
-if worker_set[current_worker] then
+if current_worker ~= xthread.MAIN then
     local sessions,next_status={},0
     local function state(version,payload)
         return {entity='player',generation=1,motion=version,sequence=1,payload=payload}
@@ -41,7 +39,7 @@ if worker_set[current_worker] then
             send=function(data,ip,port,kind,context)
                 local empty=kind=='PING' and record.server.notifications.current.count==0
                 if empty then record.empty_pings=record.empty_pings+1 end
-                local ok=xthread.post(1,'udp_out',current_worker,token,data,ip,port,kind,context)
+                local ok=xthread.post(xthread.MAIN,'udp_out',current_worker,token,data,ip,port,kind,context)
                 if not ok then return false,'route_full' end
                 if kind=='PING' then
                     print(string.format('[WORKER %d/%s] PING #%s attempt=%d empty=%s',
@@ -88,7 +86,7 @@ if worker_set[current_worker] then
     return {
         __init=function()
             xtimer.init(16)
-            assert(xthread.post(1,'worker_ready',current_worker))
+            assert(xthread.post(xthread.MAIN,'worker_ready',current_worker))
         end,
         __update=function()
             local t=now()
@@ -100,7 +98,7 @@ if worker_set[current_worker] then
                 record.server:step(t)
                 if report then
                     local status=record.server:status()
-                    assert(xthread.post(1,'worker_status',current_worker,token,record.casts,
+                    assert(xthread.post(xthread.MAIN,'worker_status',current_worker,token,record.casts,
                         record.mana,record.empty_pings,record.received,count,
                         status.notifications.current_id==nil and status.notifications.pending==0))
                 end
@@ -112,6 +110,7 @@ if worker_set[current_worker] then
     }
 end
 
+local WORKERS, CLIENT_COUNT, HOST = {198,199}, 4, '127.0.0.1'
 local socket,baseline
 local clients,by_session,routes,started,ready,assignment_counts={},{},{},{},{},{}
 local done,launched,next_worker=false,false,0
@@ -165,7 +164,7 @@ router.register('udp_out',function(worker,token,data,ip,port,kind,context)
     if not accepted then finish(false,'server sendto failed: '..tostring(reason)) end
 end)
 router.register('worker_ready',function(worker)
-    assert(worker_set[worker] and not ready[worker])
+    assert(started[worker] and not ready[worker])
     ready[worker]=true
     for _,id in ipairs(WORKERS) do if not ready[id] then return end end
     assert(not launched);launched=true
