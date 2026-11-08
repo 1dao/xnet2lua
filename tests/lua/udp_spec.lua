@@ -37,6 +37,7 @@ spec.describe('UDP build isolation', function()
             spec.equal(xnet.udp_bind, nil)
             spec.equal(xnet.get_stats().udp_count, nil)
             spec.equal(debug.getregistry()['xnet.udp'], nil)
+            spec.equal(pcall(dofile, 'scripts/core/share/xudp_notify.lua'), false)
         end
     end)
 end)

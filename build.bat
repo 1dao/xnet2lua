@@ -132,6 +132,7 @@ set "LUAJIT_INC=3rd\luajit\src"
 
 set "LUA_UNIT_SCRIPTS=tests/lua/udp_spec.lua tests/lua/http_codec_spec.lua tests/lua/xscan_spec.lua tests/lua/utf8_spec.lua tests/lua/xutils_filesystem_spec.lua tests/lua/xwatch_spec.lua"
 set "XNET_TEST_WITH_UDP=%WITH_UDP%"
+if "%WITH_UDP%"=="1" set "LUA_UNIT_SCRIPTS=!LUA_UNIT_SCRIPTS! tests/lua/udp_notify_spec.lua"
 set "LUA_TEST_CORE_SCRIPTS=demo/xutils_main.lua demo/xtimer_main.lua demo/xtimerx_test.lua demo/xlua_main.lua demo/xnet_main.lua demo/xrouter_test.lua demo/xhttp_router_test.lua demo/xhttp_main.lua demo/xrecord_main.lua tests/lua/conn_close_leak_test.lua tests/lua/timer_coroutine_test.lua"
 if "%WITH_UDP%"=="1" set "LUA_TEST_CORE_SCRIPTS=!LUA_TEST_CORE_SCRIPTS! demo/xudp_main.lua"
 set "LUA_TEST_EXTERNAL_SCRIPTS=demo/xhttps_main.lua demo/xredis_main.lua demo/xmysql_main.lua demo/xnats_main.lua"

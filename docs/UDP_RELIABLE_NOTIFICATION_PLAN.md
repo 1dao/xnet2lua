@@ -1,7 +1,7 @@
 # UDP 与可靠通知功能规划
 
 日期：2026-11-08
-状态：实施中。第 1 阶段实现完成并通过本地验收；第 2 阶段及后续协议尚待实施。逐阶段进度、实际接口及未定决策见第 15 节。
+状态：实施中。第 1 阶段实现完成并通过本地验收；第 2 阶段已完成独立通知机制，完整 wire format 和安全封装尚未交付。逐阶段进度、实际接口及未定决策见第 15 节。
 
 ## 1. 目标与边界
 
@@ -85,7 +85,7 @@ make test WITH_UDP=1
 
 ### 4.1 首版建议
 
-C 层已增加独立的 `xudp.c/.h`，Lua 侧已增加独立绑定实现，现有绑定文件只做条件接入。公共脚本通知及 RPC 生命周期将在后续阶段实施，公共安全路径和业务策略仍待定案。
+C 层已增加独立的 `xudp.c/.h`，Lua 侧已增加独立绑定实现，现有绑定文件只做条件接入。公共脚本层已实现与 wire format 无关的通知机制；完整可靠通知协议及 RPC 生命周期仍待公共安全路径及业务策略定案，不能视为已完成游戏业务接入。
 
 脚本框架不是某个业务脚本的私有实现，但它会依赖相应语言运行时。纯 JS runner 若首版也要使用该协议，需要提供 JS 框架实现，或提前采用公共 C 协议模块；不能默认依赖 Lua。
 
@@ -632,7 +632,25 @@ assert(u:is_closed())
 
 ### 15.2 后续阶段
 
-第 2 阶段尚待实施：公共编码、安全封装及独立通知状态机；第 3 阶段的 MOVE/RPC、第 4 阶段的认证恢复、第 5 阶段的归属迁移与持久化、第 6 阶段的多语言接入仍按第 10、12 节推进。
+| 阶段 | 当前进度 | 后续边界 |
+| --- | --- | --- |
+| 2 | 已实现独立通知状态机及确定性收发端测试；完整阶段未完成 | wire format、公共认证压缩路径及真实协议客户端未完成，不发送裸业务作为替代 |
+| 3 | 待实施 | MOVE 及 RPC 依赖消息格式、编号、容量/保留策略和业务接入点 |
+| 4 | 待实施 | 需要登录凭证体系、密钥建立及新路径验证方案 |
+| 5 | 待实施 | 需要实际入口路由、归属协调及崩溃恢复范围 |
+| 6 | 待实施 | 当前树没有 xjs 绑定，需要确认交付分支与同期范围 |
+
+第 2 阶段已完成的独立部分为 `scripts/core/share/xudp_notify.lua`：
+
+- `new_sender(options)` 提供 `enqueue/step/ack/valid_receive/status`；只有一个不可变的当前编码体，队列及在途数据共同占用条数/字节容量。打包失败不移出队列；按预算只取完整消息，空 Ping 不改成有业务内容的同一轮。
+- `step(now)` 使用调用者提供的单调毫秒时间；本地失败设置有界下次尝试，成功发送才顺延空闲心跳，重发退避且轮次总期限和最大尝试数不重置。过期后保留数据供上层选择后续策略。
+- `ack(id, now)` 只释放实际发出过的匹配轮次；队列非空立即尝试下一轮。迟到/重复 Pong 不释放新数据或更新失联时刻。
+- `new_receiver(options)` 提供 `receive/take`；先完整解析并取得不可变消息的队列所有权，再调用 Pong hook。业务从 `take()` 取出后自行串行执行；重复/旧轮次不重复交付，但再次确认。解析失败或队列满不确认。
+- 所有容量、重试、心跳和期限参数必须显式提供，尚未将示例值写成产品默认值。编号由 `next_id/compare_ids` 注入，暂不决定跨语言字段宽度；编号不可重复或回退。
+- `pack/decode/send_ping/send_pong` 是待接公共编码及安全传输的明确接口，不内置 wire format 或裸发路径。`send_ping` 接收的是不可变逻辑编码/压缩内容，每次实际发送必须由将来的传输层分配新安全序号并认证加密。接收方法只能在认证、防重放及有界解压之后调用；`valid_receive` 不能用于重复/过期控制包。
+- 模块显式加载时检查 UDP 支持，不创建 socket 或定时器。测试使用声明为测试专用的字符串编码及编号，仅验证纯机制；未据此完成认证/压缩或真实协议客户端验收。
+
+实现前复核本地 ENet 的确认匹配、报文所有权、超时及指数退避路径；未加入 ENet 构建或运行依赖。
 
 ### 15.3 未定架构决策（明确保留）
 
@@ -652,13 +670,13 @@ assert(u:is_closed())
 
 | 验证 | 实际结果 |
 | --- | --- |
-| Windows MinGW，`make test WITH_UDP=1`，默认 HTTPS/rpmalloc | 通过：135 项 C 断言、19 个 Lua 单元测试文件及原有线程/核心集成测试；退出清理修正后复测通过 |
-| Windows MinGW，`make test WITH_UDP=0`，默认 HTTPS/rpmalloc | 通过：87 项原有 C 断言、19 个 Lua 单元测试文件及原有线程/核心集成测试；UDP 接口、统计字段、metatable 均不可用 |
-| Windows MinGW，`WITH_UDP=1 WITH_HTTP=0 WITH_HTTPS=0 WITH_RPMALLOC=0` | 独立构建、UDP 绑定测试通过，无新增 HTTP/TLS 依赖 |
-| Windows MSVC，`build.bat udp nohttp nohttps norpmalloc` | C 断言 135 项通过；runner 构建及 6 组 UDP 绑定测试通过 |
-| Windows MSVC LuaJIT，`build.bat udp luajit nohttp nohttps norpmalloc xnet` | runner 构建及 6 组绑定测试通过；使用已有 LuaJIT 静态库，未修改第三方库 |
+| Windows MinGW，`make test WITH_UDP=1`，默认 HTTPS/rpmalloc | 通过：135 项 C 断言、20 个 Lua 单元测试文件及原有线程/核心集成测试；退出清理修正后复测通过 |
+| Windows MinGW，`make test WITH_UDP=0`，默认 HTTPS/rpmalloc | 通过：87 项原有 C 断言、19 个 Lua 单元测试文件及原有线程/核心集成测试；UDP 接口、统计字段、metatable 和协议模块均不可用 |
+| Windows MinGW，`WITH_UDP=1 WITH_HTTP=0 WITH_HTTPS=0 WITH_RPMALLOC=0` | 独立构建、UDP 绑定及通知机制测试通过，无新增 HTTP/TLS 依赖 |
+| Windows MSVC，`build.bat udp nohttp nohttps norpmalloc` | C 断言 135 项通过；runner 构建及 6 组 UDP 绑定、10 组通知机制测试通过 |
+| Windows MSVC LuaJIT，`build.bat udp luajit nohttp nohttps norpmalloc xnet` | runner 构建及 6 组绑定、10 组通知机制测试通过；使用已有 LuaJIT 静态库，未修改第三方库 |
 | Linux epoll，UDP C 测试 | 135 项断言通过 |
-| Linux ASan，`WITH_IO_URING=1 WITH_HTTP=0 WITH_HTTPS=0 WITH_RPMALLOC=0 WITH_UDP=1` | C 断言 135 项通过；修正 worker 退出清理后，6 组绑定测试通过，ASan/LeakSanitizer 无报错；UDP 使用就绪收包路径 |
+| Linux ASan，`WITH_IO_URING=1 WITH_HTTP=0 WITH_HTTPS=0 WITH_RPMALLOC=0 WITH_UDP=1` | C 断言 135 项通过；修正 worker 退出清理后，6 组绑定和 10 组通知机制测试通过，ASan/LeakSanitizer 无报错；UDP 使用就绪收包路径 |
 | 现有 TLS 流控回归 `tests/lua/tls_flow_test.lua` | UDP 启用和关闭时各 7 项检查通过，覆盖大包接收、文件发送及接收上限 |
 | 新 C 层及 Lua C 绑定，MinGW `-Wall -Wextra -Werror -fsyntax-only` | 通过 |
 | `demo/xudp_main.lua`，Windows MinGW / Linux ASan | 两个平台均完成 2 个客户端各 3 包的回显，包含二进制与空包，关闭后 fd 注册恢复基线；默认关闭 runner 显式跳过。Windows 使用独立构建目录，原默认关闭产物不变 |
@@ -667,4 +685,4 @@ CI 已增加 Linux/macOS/Windows 的 UDP 启用项及 Linux LuaJIT 启用项，�
 
 Make/MSVC 测试入口设置 `XNET_TEST_WITH_UDP`，绑定测试将实际接口状态与预期构建开关直接比较，防止把“关闭构建误用旧的启用 runner”当作正常通过。
 
-尚未验证：真实跨网/NAT/网络扰动与压测、完整通知协议、安全及压缩封装、MOVE/RPC/技能业务、认证恢复、迁移及持久化。这些仍属于后续阶段。
+尚未验证：真实跨网/NAT/网络扰动与压测、安全及压缩封装、MOVE/RPC/技能业务、认证恢复、迁移及持久化。这些仍属于后续阶段。

@@ -164,6 +164,7 @@ LUA_TEST_CORE_SCRIPTS := \
 	tests/lua/timer_coroutine_test.lua
 
 ifeq ($(WITH_UDP),1)
+LUA_UNIT_SCRIPTS += tests/lua/udp_notify_spec.lua
 LUA_TEST_CORE_SCRIPTS += demo/xudp_main.lua
 endif
 
