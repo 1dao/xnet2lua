@@ -70,6 +70,10 @@ int xudp_sockname(const xUdp*, xUdpAddress* out);
  * Queued datagrams stay in the finite kernel buffer until resumed. */
 void xudp_pause_read(xUdp*);
 int xudp_resume_read(xUdp*);
+/* One-shot writable wakeup for an owner-driven send retry. No send is queued.
+ * The watch removes itself before xpoll_poll returns; rearm after WOULD_BLOCK.
+ * Pass false to cancel (for example after a successful retry or session reset). */
+int xudp_wait_writable(xUdp*, bool enabled);
 SOCKET_T xudp_fd(const xUdp*);
 void xudp_close(xUdp*);         /* idempotent; immediately unregisters/closes fd */
 bool xudp_is_closed(const xUdp*);

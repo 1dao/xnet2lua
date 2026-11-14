@@ -22,6 +22,7 @@ struct xUdp {
     unsigned refs;
     bool receiving;
     bool read_paused;
+    bool write_waiting;
     xUdpConfig config;
     xUdpStats stats;
     char* buffer;
@@ -189,6 +190,26 @@ void xudp_pause_read(xUdp* udp) {
     if (xudp_is_closed(udp) || udp->read_paused) return;
     udp->read_paused = true;
     xpoll_del_event(udp->fd, XPOLL_READABLE);
+}
+
+static void udp_write_event(SOCKET_T fd, int mask, void* data, xPollRequest* req) {
+    xUdp* udp = data;
+    (void)mask;
+    (void)req;
+    if (udp->fd != fd) return;
+    /* The owner retries after poll returns, never inside the DTLS callback. */
+    xudp_wait_writable(udp, false);
+}
+
+int xudp_wait_writable(xUdp* udp, bool enabled) {
+    if (xudp_is_closed(udp)) return XUDP_CLOSED;
+    if (enabled == udp->write_waiting) return XUDP_OK;
+    if (enabled) {
+        if (xpoll_add_event(udp->fd, XPOLL_WRITABLE, NULL, udp_write_event,
+                           NULL, udp) != 0) return XUDP_SYSTEM_ERROR;
+    } else xpoll_del_event(udp->fd, XPOLL_WRITABLE);
+    udp->write_waiting = enabled;
+    return XUDP_OK;
 }
 
 int xudp_resume_read(xUdp* udp) {
