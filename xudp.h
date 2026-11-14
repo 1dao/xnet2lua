@@ -35,6 +35,9 @@ typedef struct xUdpStats {
     uint64_t datagrams_received, bytes_received;
     uint64_t dropped_oversize, receive_errors, send_errors, send_would_block;
     uint64_t receive_calls, budget_yields;
+    uint64_t read_events, write_events, read_pauses, read_resumes;
+    int64_t read_event_age_ms, write_event_age_ms; /* -1: never observed */
+    bool read_paused, write_waiting; /* current owner-thread state */
     int last_error;             /* native errno/WSA error; zero initially */
 } xUdpStats;
 

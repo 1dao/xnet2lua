@@ -3,6 +3,9 @@
 #if XNET_WITH_UDP
 #include "xpoll.h"
 #include <limits.h>
+#ifndef _WIN32
+#include <time.h>
+#endif
 #ifdef _WIN32
 #include <mswsock.h>
 #ifndef SIO_UDP_CONNRESET
@@ -25,11 +28,20 @@ struct xUdp {
     bool write_waiting;
     xUdpConfig config;
     xUdpStats stats;
+    uint64_t last_read_event_ms, last_write_event_ms;
     char* buffer;
 };
 
 static XUDP_TLS int g_udp_live;
 static XUDP_TLS int g_udp_sockets;
+static uint64_t udp_now_ms(void) {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+#endif
+}
 
 static void udp_release(xUdp* udp) {
     if (--udp->refs) return;
@@ -112,6 +124,7 @@ static void udp_read_event(SOCKET_T fd, int mask, void* data, xPollRequest* req)
     (void)mask;
     (void)req;
     if (udp->receiving || udp->read_paused || udp->fd != fd) return;
+    ++udp->stats.read_events; udp->last_read_event_ms=udp_now_ms();
     ++udp->refs; /* callbacks may release the owner reference */
     udp->receiving = true;
     for (attempts = 0; attempts < udp->config.recv_budget; ++attempts) {
@@ -189,6 +202,7 @@ static void udp_error_event(SOCKET_T fd, int mask, void* data, xPollRequest* req
 void xudp_pause_read(xUdp* udp) {
     if (xudp_is_closed(udp) || udp->read_paused) return;
     udp->read_paused = true;
+    ++udp->stats.read_pauses;
     xpoll_del_event(udp->fd, XPOLL_READABLE);
 }
 
@@ -198,6 +212,7 @@ static void udp_write_event(SOCKET_T fd, int mask, void* data, xPollRequest* req
     (void)req;
     if (udp->fd != fd) return;
     /* The owner retries after poll returns, never inside the DTLS callback. */
+    ++udp->stats.write_events; udp->last_write_event_ms=udp_now_ms();
     xudp_wait_writable(udp, false);
 }
 
@@ -218,6 +233,7 @@ int xudp_resume_read(xUdp* udp) {
     if (xpoll_add_event(udp->fd, XPOLL_READABLE | XPOLL_ERROR, udp_read_event, NULL,
                        udp_error_event, udp) != 0) return XUDP_SYSTEM_ERROR;
     udp->read_paused = false;
+    ++udp->stats.read_resumes;
     return XUDP_OK;
 }
 
@@ -347,7 +363,15 @@ int xudp_sockname(const xUdp* udp, xUdpAddress* out) {
 SOCKET_T xudp_fd(const xUdp* udp) { return udp ? udp->fd : INVALID_SOCKET_VAL; }
 bool xudp_is_closed(const xUdp* udp) { return !udp || udp->fd == INVALID_SOCKET_VAL; }
 void xudp_get_stats(const xUdp* udp, xUdpStats* out) {
-    if (out) { if (udp) *out = udp->stats; else memset(out, 0, sizeof(*out)); }
+    if (!out) return;
+    memset(out,0,sizeof(*out));
+    out->read_event_age_ms=out->write_event_age_ms=-1;
+    if (!udp) return;
+    *out=udp->stats;
+    out->read_paused=udp->read_paused; out->write_waiting=udp->write_waiting;
+    uint64_t now=udp_now_ms();
+    out->read_event_age_ms=udp->stats.read_events ? (int64_t)(now-udp->last_read_event_ms) : -1;
+    out->write_event_age_ms=udp->stats.write_events ? (int64_t)(now-udp->last_write_event_ms) : -1;
 }
 void xudp_destroy(xUdp* udp) {
     if (!udp) return;
