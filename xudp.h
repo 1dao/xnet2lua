@@ -66,6 +66,10 @@ xUdp* xudp_bind(const char* host, int port, const xUdpConfig* config,
 int xudp_sendto(xUdp*, const void* data, size_t len, const xUdpAddress*,
                 int* system_error);
 int xudp_sockname(const xUdp*, xUdpAddress* out);
+/* Owner thread only; pausing inside on_datagram stops this receive pass too.
+ * Queued datagrams stay in the finite kernel buffer until resumed. */
+void xudp_pause_read(xUdp*);
+int xudp_resume_read(xUdp*);
 SOCKET_T xudp_fd(const xUdp*);
 void xudp_close(xUdp*);         /* idempotent; immediately unregisters/closes fd */
 bool xudp_is_closed(const xUdp*);

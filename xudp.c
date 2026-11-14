@@ -21,6 +21,7 @@ struct xUdp {
     SOCKET_T fd;
     unsigned refs;
     bool receiving;
+    bool read_paused;
     xUdpConfig config;
     xUdpStats stats;
     char* buffer;
@@ -109,7 +110,7 @@ static void udp_read_event(SOCKET_T fd, int mask, void* data, xPollRequest* req)
     unsigned attempts;
     (void)mask;
     (void)req;
-    if (udp->receiving || udp->fd != fd) return;
+    if (udp->receiving || udp->read_paused || udp->fd != fd) return;
     ++udp->refs; /* callbacks may release the owner reference */
     udp->receiving = true;
     for (attempts = 0; attempts < udp->config.recv_budget; ++attempts) {
@@ -120,7 +121,7 @@ static void udp_read_event(SOCKET_T fd, int mask, void* data, xPollRequest* req)
         socklen_t from_len = sizeof(from);
 #endif
         int n, error;
-        if (udp->fd == INVALID_SOCKET_VAL) break;
+        if (udp->fd == INVALID_SOCKET_VAL || udp->read_paused) break;
         ++udp->stats.receive_calls;
         /* One extra byte detects truncation on POSIX recvfrom without relying
          * on Linux-specific MSG_TRUNC behavior. Winsock returns WSAEMSGSIZE. */
@@ -184,6 +185,21 @@ static void udp_error_event(SOCKET_T fd, int mask, void* data, xPollRequest* req
     udp_release(udp);
 }
 
+void xudp_pause_read(xUdp* udp) {
+    if (xudp_is_closed(udp) || udp->read_paused) return;
+    udp->read_paused = true;
+    xpoll_del_event(udp->fd, XPOLL_READABLE);
+}
+
+int xudp_resume_read(xUdp* udp) {
+    if (xudp_is_closed(udp)) return XUDP_CLOSED;
+    if (!udp->read_paused) return XUDP_OK;
+    if (xpoll_add_event(udp->fd, XPOLL_READABLE | XPOLL_ERROR, udp_read_event, NULL,
+                       udp_error_event, udp) != 0) return XUDP_SYSTEM_ERROR;
+    udp->read_paused = false;
+    return XUDP_OK;
+}
+
 xUdp* xudp_bind(const char* host, int port, const xUdpConfig* config,
                 char error[XSOCK_ERR_LEN]) {
     xUdpConfig cfg = {0};
@@ -231,7 +247,9 @@ xUdp* xudp_bind(const char* host, int port, const xUdpConfig* config,
     udp->fd = fd;
     udp->refs = 1;
     udp->config = cfg;
-    if (xpoll_add_event(fd, XPOLL_READABLE, udp_read_event, NULL,
+    /* Keep error monitoring while reads are paused, including when this is
+     * the only fd (WSAPoll rejects an empty descriptor set). */
+    if (xpoll_add_event(fd, XPOLL_READABLE | XPOLL_ERROR, udp_read_event, NULL,
                         udp_error_event, udp) != 0) {
         free(udp->buffer);
         free(udp);
