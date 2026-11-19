@@ -1782,11 +1782,30 @@ static int l_util_replace_file(lua_State *L) {
     luaL_argcheck(L, ns && !memchr(src, 0, ns), 1, "invalid path");
     luaL_argcheck(L, nd && !memchr(dst, 0, nd), 2, "invalid path");
 #ifdef _WIN32
-    int ok = MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    DWORD error;
+    for (int attempt = 0;; ++attempt) {
+        if (MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            break;
+        }
+        error = GetLastError();
+        /* A reader can briefly hold either file without FILE_SHARE_DELETE.
+         * Windows can report that as access denied when replacing the target. */
+        if (attempt == 5 ||
+            (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION &&
+             error != ERROR_ACCESS_DENIED)) {
+            lua_pushnil(L);
+            lua_pushfstring(L, "atomic file replacement failed (Windows error %d)", (int)error);
+            return 2;
+        }
+        Sleep(10u << attempt);
+    }
 #else
-    int ok = rename(src, dst) == 0;
+    if (rename(src, dst) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, "atomic file replacement failed");
+        return 2;
+    }
 #endif
-    if (!ok) { lua_pushnil(L); lua_pushstring(L, "atomic file replacement failed"); return 2; }
     lua_pushboolean(L, 1);
     return 1;
 }
